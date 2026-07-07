@@ -83,7 +83,7 @@ assert T <= MATMUL_T_TILE
 def mtp_local_logits(
     mtp_hidden: pl.Tensor[[B, S, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_SHARD, D], pl.BF16],
-    candidate_logits: pl.Out[pl.Tensor[[T, VOCAB_SHARD], pl.FP32]],
+    candidate_logits: pl.Tensor[[T, VOCAB_SHARD], pl.FP32],
 ) -> pl.Tensor[[T, VOCAB_SHARD], pl.FP32]:
     hidden_flat = pl.reshape(mtp_hidden, [T, D])
     hidden_pad = pl.create_tensor([MATMUL_T_TILE, D], dtype=pl.BF16)
@@ -127,7 +127,7 @@ def mtp_local_logits(
 def mtp_shared_head_norm(
     mtp_hidden: pl.Tensor[[B, S, D], pl.BF16],
     shared_head_norm_w: pl.Tensor[[D], pl.FP32],
-    normed_hidden: pl.Out[pl.Tensor[[B, S, D], pl.BF16]],
+    normed_hidden: pl.Tensor[[B, S, D], pl.BF16],
 ) -> pl.Tensor[[B, S, D], pl.BF16]:
     hidden_flat = pl.reshape(mtp_hidden, [T, D])
     normed_flat = pl.reshape(normed_hidden, [T, D])
@@ -179,7 +179,7 @@ def mtp_decoder_layer_tail(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -209,7 +209,7 @@ def mtp_decoder_layer_tail(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    pre_hc_hidden: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -293,7 +293,7 @@ def mtp_compute_logits_tail(
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     shared_head_norm_w: pl.Tensor[[D], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB_SHARD, D], pl.BF16],
-    candidate_logits: pl.Out[pl.Tensor[[T, VOCAB_SHARD], pl.FP32]],
+    candidate_logits: pl.Tensor[[T, VOCAB_SHARD], pl.FP32],
 ) -> pl.Tensor[[T, VOCAB_SHARD], pl.FP32]:
     dense_hidden_flat = pl.create_tensor([T, D], dtype=pl.BF16)
     dense_hidden_flat = hc_head(
