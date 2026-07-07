@@ -329,6 +329,8 @@ def update_mtp_state_after_step(
             spec_tokens[b, 0] = selected_tokens[b]
         else:
             spec_tokens[b, accepted] = selected_tokens[b]
+            if accepted + 1 < width:
+                spec_tokens[b, accepted + 1:] = 0
     return MTPState(
         spec_tokens=spec_tokens,
         accepted_num=accepted_num,
@@ -462,6 +464,18 @@ def validate_mtp_input_full_chain(candidate_logits: TensorLike | None = None) ->
     )
     logits_state = update_mtp_state_after_step(logits_state, logits=logits)
     assert logits_state.spec_tokens.tolist() == [[33, 7], [8, 0]]
+
+    stale_tail_state = MTPState(
+        spec_tokens=torch.tensor([[31, 32, 33], [41, 42, 43]], dtype=torch.int64),
+        accepted_num=torch.tensor([0, 1], dtype=torch.int32),
+        kv_len=torch.tensor([10, 11], dtype=torch.int64),
+        is_prefill=False,
+    )
+    stale_tail_state = update_mtp_state_after_step(
+        stale_tail_state,
+        sampled_tokens=torch.tensor([91, 92], dtype=torch.int64),
+    )
+    assert stale_tail_state.spec_tokens.tolist() == [[91, 0, 0], [41, 92, 0]]
 
     if candidate_logits is not None:
         final_token_indices = torch.tensor([2, 4], dtype=torch.int64, device=candidate_logits.device)
