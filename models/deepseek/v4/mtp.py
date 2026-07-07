@@ -21,6 +21,7 @@ The pre-hc hidden layout follows the current MTP projection/prefill contract:
 """
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE
 from decode_attention_swa import (
@@ -38,12 +39,17 @@ from decode_attention_swa import (
 )
 from hc_head import hc_head
 from moe import (
+    AUX_PAD,
+    IDX_PAD,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
+    N_RANKS,
+    N_ROUTES,
+    RECV_MAX,
     TOPK as MOE_TOPK,
     VOCAB as MOE_VOCAB,
-    moe_ep1,
+    moe,
 )
 
 
@@ -56,6 +62,8 @@ D_INV = 1.0 / D
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
+MTP_LAYER_ID = M.num_hidden_layers
+MTP_MOE_EPOCH = 1
 
 T_TILE = 8
 MATMUL_T_TILE = 16
@@ -171,7 +179,7 @@ def mtp_decoder_layer_tail(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    kv_cache: pl.InOut[pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -202,6 +210,15 @@ def mtp_decoder_layer_tail(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     pre_hc_hidden: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     x_attn = attention_swa(
@@ -230,7 +247,7 @@ def mtp_decoder_layer_tail(
         wo_b_scale,
         x_attn,
     )
-    pre_hc_hidden = moe_ep1(
+    pre_hc_hidden = moe(
         x_attn,
         hc_ffn_fn,
         hc_ffn_scale,
@@ -253,7 +270,17 @@ def mtp_decoder_layer_tail(
         shared_w2,
         shared_w2_scale,
         pre_hc_hidden,
-        pl.const(0, pl.INT32),
+        recv_meta,
+        recv_x,
+        recv_aux,
+        recv_route,
+        arrived,
+        routed_y_buf,
+        combine_arrived,
+        pl.cast(MTP_LAYER_ID, pl.INT32),
+        num_tokens,
+        my_rank,
+        pl.cast(MTP_MOE_EPOCH, pl.INT32),
     )
     return pre_hc_hidden
 
