@@ -184,7 +184,9 @@ def build_main_decode_input_ids_for_mtp(
     q_len = int(next_n) + 1
     windows = torch.empty([batch, q_len], dtype=current_tokens.dtype, device=current_tokens.device)
     for b in range(batch):
-        available = torch.cat([current_tokens[b:b + 1], spec_tokens[b]], dim=0)
+        accepted = int(accepted_num[b].item())
+        accepted_prefix = spec_tokens[b, :accepted]
+        available = torch.cat([accepted_prefix, current_tokens[b:b + 1]], dim=0)
         if available.numel() < q_len:
             pad_token = available[-1] if available.numel() > 0 else current_tokens[b]
             pad = torch.full(
@@ -331,9 +333,10 @@ def update_mtp_state_after_step(
             spec_tokens[b, accepted] = selected_tokens[b]
             if accepted + 1 < width:
                 spec_tokens[b, accepted + 1:] = 0
+    next_accepted_num = torch.zeros([batch], dtype=torch.int32, device=spec_tokens.device)
     return MTPState(
         spec_tokens=spec_tokens,
-        accepted_num=accepted_num,
+        accepted_num=next_accepted_num,
         kv_len=_as_1d_i64(state.kv_len).to(device=spec_tokens.device) + 1,
         is_prefill=False,
         step_index=int(state.step_index) + 1,
@@ -391,7 +394,7 @@ def validate_mtp_input_full_chain(candidate_logits: TensorLike | None = None) ->
         torch.tensor([7, 9], dtype=torch.int64),
         next_n=2,
     )
-    assert decode_inputs.input_ids.tolist() == [10, 11, 12, 20, 21, 22]
+    assert decode_inputs.input_ids.tolist() == [10, 10, 10, 21, 20, 20]
     assert decode_inputs.position_ids.tolist() == [5, 6, 7, 7, 8, 9]
     assert decode_inputs.kv_len.tolist() == [10, 12]
 
@@ -403,7 +406,7 @@ def validate_mtp_input_full_chain(candidate_logits: TensorLike | None = None) ->
         next_n=2,
         pad_to=5,
     )
-    assert padded_decode_inputs.input_ids.tolist() == [10, 11, 12, 0, 0]
+    assert padded_decode_inputs.input_ids.tolist() == [10, 10, 10, 0, 0]
     assert padded_decode_inputs.position_ids.tolist() == [5, 6, 7, 0, 0]
 
     full_accept_inputs = build_main_decode_input_ids_for_mtp(
@@ -413,7 +416,7 @@ def validate_mtp_input_full_chain(candidate_logits: TensorLike | None = None) ->
         torch.tensor([12], dtype=torch.int64),
         next_n=2,
     )
-    assert full_accept_inputs.input_ids.tolist() == [30, 31, 32]
+    assert full_accept_inputs.input_ids.tolist() == [31, 32, 30]
     try:
         build_main_decode_input_ids_for_mtp(
             torch.tensor([30], dtype=torch.int64),
@@ -449,7 +452,8 @@ def validate_mtp_input_full_chain(candidate_logits: TensorLike | None = None) ->
         state,
         sampled_tokens=torch.tensor([77, 88], dtype=torch.int64),
     )
-    assert state.spec_tokens.tolist() == [[33, 77], [44, 88]]
+    assert state.spec_tokens.tolist() == [[33, 77], [88, 0]]
+    assert state.accepted_num.tolist() == [0, 0]
     assert state.kv_len.tolist() == [9, 10]
     assert state.step_index == 1
 
@@ -464,6 +468,7 @@ def validate_mtp_input_full_chain(candidate_logits: TensorLike | None = None) ->
     )
     logits_state = update_mtp_state_after_step(logits_state, logits=logits)
     assert logits_state.spec_tokens.tolist() == [[33, 7], [8, 0]]
+    assert logits_state.accepted_num.tolist() == [0, 0]
 
     stale_tail_state = MTPState(
         spec_tokens=torch.tensor([[31, 32, 33], [41, 42, 43]], dtype=torch.int64),
@@ -476,6 +481,7 @@ def validate_mtp_input_full_chain(candidate_logits: TensorLike | None = None) ->
         sampled_tokens=torch.tensor([91, 92], dtype=torch.int64),
     )
     assert stale_tail_state.spec_tokens.tolist() == [[91, 0, 0], [41, 92, 0]]
+    assert stale_tail_state.accepted_num.tolist() == [0, 0]
 
     if candidate_logits is not None:
         final_token_indices = torch.tensor([2, 4], dtype=torch.int64, device=candidate_logits.device)
