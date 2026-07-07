@@ -17,10 +17,11 @@ SWA-only MTP attention path. It wires the decode-time MTP layer as:
         -> MoE/FFN tail
         -> next pre-hc_head hidden
 
-The input named ``prev_pre_hc_hidden`` is intentionally flat ``[T, HC_DIM]``:
-it is the target model's or previous draft step's pre-``hc_head`` residual,
-not the post-``hc_head`` dense hidden state. The returned ``next_pre_hc_hidden``
-has the same flat contract so serving can feed it into the next MTP draft step.
+The input named ``prev_pre_hc_hidden`` uses the token-major HC-lane layout
+``[T, HC_MULT, D]`` from ``mtp_projection.py``. It is the target model's or
+previous draft step's pre-``hc_head`` residual, not the post-``hc_head`` dense
+hidden state. The returned ``next_pre_hc_hidden`` has the same contract so
+serving can feed it into the next MTP draft step.
 """
 
 import pypto.language as pl
@@ -52,23 +53,24 @@ from moe import (
 from mtp import (
     B,
     D,
-    D_CHUNK,
     HC_DIM,
     HC_MULT,
     MIX_HC,
     S,
     T,
-    build_projection_tensor_specs,
-    golden_mtp_projection,
     mtp_decoder_layer_tail,
-    mtp_projection_impl,
+)
+from mtp_projection import (
+    build_tensor_specs as build_mtp_projection_tensor_specs,
+    golden_mtp_projection,
+    mtp_projection,
 )
 
 
 @pl.jit
 def mtp_decode_layer(
-    hidden_states: pl.Tensor[[B, S, D], pl.BF16],
-    prev_pre_hc_hidden: pl.Tensor[[T, HC_DIM], pl.BF16],
+    hidden_states: pl.Tensor[[T, D], pl.BF16],
+    prev_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     position_ids: pl.Tensor[[T], pl.INT32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
@@ -119,13 +121,12 @@ def mtp_decode_layer(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    next_pre_hc_hidden: pl.Out[pl.Tensor[[T, HC_DIM], pl.BF16]],
-) -> pl.Tensor[[T, HC_DIM], pl.BF16]:
+    next_pre_hc_hidden: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    projected_hidden = mtp_projection_impl(
+    projected_hidden = mtp_projection(
         hidden_states,
         prev_pre_hc_hidden,
-        position_ids,
         enorm_w,
         hnorm_w,
         e_proj_w,
@@ -136,8 +137,7 @@ def mtp_decode_layer(
         h_proj_smooth,
         projected_hidden,
     )
-    next_pre_hc_stack = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    next_pre_hc_stack = mtp_decoder_layer_tail(
+    next_pre_hc_hidden = mtp_decoder_layer_tail(
         projected_hidden,
         hc_attn_fn,
         hc_attn_scale,
@@ -181,13 +181,8 @@ def mtp_decode_layer(
         shared_w3_scale,
         shared_w2,
         shared_w2_scale,
-        next_pre_hc_stack,
+        next_pre_hc_hidden,
     )
-    next_pre_hc_flat = pl.reshape(next_pre_hc_hidden, [T, HC_DIM])
-    next_pre_hc_stack_flat = pl.reshape(next_pre_hc_stack, [T, HC_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_decode_layer_flatten"):
-        for k0 in pl.pipeline(0, HC_DIM, D_CHUNK, stage=2):
-            next_pre_hc_flat[:, k0:k0 + D_CHUNK] = next_pre_hc_stack_flat[:, k0:k0 + D_CHUNK]
     return next_pre_hc_hidden
 
 
@@ -206,7 +201,7 @@ def golden_mtp_decode_layer(tensors):
     tensors["x_next"] = torch.empty(T, HC_MULT, D, dtype=torch.bfloat16)
     golden_moe_ep1(tensors)
 
-    next_pre_hc = tensors["x_next"].flatten(1)
+    next_pre_hc = tensors["x_next"]
     tensors["next_pre_hc_hidden"][:] = next_pre_hc
 
     step1_tensors = dict(tensors)
@@ -251,7 +246,7 @@ def build_tensor_specs():
     specs = []
     _extend_specs(
         specs,
-        build_projection_tensor_specs(),
+        build_mtp_projection_tensor_specs(batch=B, seq=S),
         {"projected_hidden"},
         rename={"prev_hidden_states": "prev_pre_hc_hidden"},
     )
@@ -283,7 +278,7 @@ def build_tensor_specs():
             "layer_id",
         },
     )
-    specs.append(TensorSpec("next_pre_hc_hidden", [T, HC_DIM], torch.bfloat16, is_output=True))
+    specs.append(TensorSpec("next_pre_hc_hidden", [T, HC_MULT, D], torch.bfloat16, is_output=True))
     return specs
 
 
