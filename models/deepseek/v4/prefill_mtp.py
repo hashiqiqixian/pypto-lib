@@ -150,7 +150,6 @@ def mtp_prefill_fwd(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
-    nt: pl.Scalar[pl.INT32] = num_tokens
     projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
@@ -170,7 +169,7 @@ def mtp_prefill_fwd(
         kv_cache, ori_block_table, ori_slot_mapping,
         position_ids,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        x_attn, nt,
+        x_attn,
     )
 
     moe(
@@ -184,7 +183,7 @@ def mtp_prefill_fwd(
         pre_hc_hidden_out,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         routed_y_buf, combine_arrived,
-        pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+        pl.cast(MTP_LAYER_ID, pl.INT32), my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
     )
 
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)

@@ -170,19 +170,7 @@ def prefill_attention_csa(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-    num_tokens: pl.Scalar[pl.INT32],
 ):
-    # Transitional caller boundary; all Attention children see the sliced
-    # physical token shape and derive their own loop bounds from dimension 0.
-    token_count = pl.cast(num_tokens, pl.INDEX)
-    x_hc = pl.slice(x_hc, [token_count, HC_MULT, D], [0, 0, 0])
-    ori_slot_mapping = pl.slice(ori_slot_mapping, [token_count], [0])
-    position_ids = pl.slice(position_ids, [token_count], [0])
-    cmp_slot_mapping = pl.slice(cmp_slot_mapping, [token_count], [0])
-    idx_slot_mapping = pl.slice(idx_slot_mapping, [token_count], [0])
-    state_slot_mapping = pl.slice(state_slot_mapping, [token_count], [0])
-    inner_state_slot_mapping = pl.slice(inner_state_slot_mapping, [token_count], [0])
-    x_out = pl.slice(x_out, [token_count, HC_MULT, D], [0, 0, 0])
     num_tokens = pl.tensor.dim(x_hc, 0)
     x_mixed = pl.create_tensor([num_tokens, D], dtype=pl.BF16)
     post = pl.create_tensor([num_tokens, HC_MULT], dtype=pl.FP32)
@@ -374,7 +362,6 @@ def prefill_attention_csa_test(
         state_slot_mapping, inner_state_slot_mapping,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out,
-        pl.cast(pl.tensor.dim(x_hc, 0), pl.INT32),
     )
     return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, idx_kv_scale, inner_kv_state, inner_score_state, x_out
 

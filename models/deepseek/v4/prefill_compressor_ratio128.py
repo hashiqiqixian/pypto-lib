@@ -98,28 +98,31 @@ def prefill_compressor_ratio128(
 
     for proj_idx in pl.spmd(PACKED_C128_PROJ_BLOCKS, name_hint="prefill_hca_c128_kv_score_proj"):
         o0 = proj_idx * OUT_TILE
-        kv_acc = pl.create_tensor([matmul_tokens, OUT_TILE], dtype=pl.FP32)
-        score_acc = pl.create_tensor([matmul_tokens, OUT_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, K_BLOCKS, stage=2):
-            k0 = kb * K_TILE
-            x_tile = pl.slice(
-                x_flat,
-                [matmul_tokens, K_TILE],
-                [0, k0],
-                valid_shape=[num_tokens, K_TILE],
-            )
-            # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load (K-contiguous
-            # long bursts) instead of ND2NZ (strided short bursts). Matches ratio4/CSA/decode-HCA.
-            wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-            wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-            if k0 == 0:
-                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
-                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
-            else:
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
-        kv_proj_scratch[0:matmul_tokens, o0 : o0 + OUT_TILE] = kv_acc
-        score_proj_scratch[0:matmul_tokens, o0 : o0 + OUT_TILE] = score_acc
+        for mt in pl.range(matmul_tokens // TOKEN_M_TILE):
+            m0 = mt * TOKEN_M_TILE
+            valid_rows = pl.min(TOKEN_M_TILE, num_tokens - m0)
+            kv_acc = pl.create_tensor([TOKEN_M_TILE, OUT_TILE], dtype=pl.FP32)
+            score_acc = pl.create_tensor([TOKEN_M_TILE, OUT_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, K_BLOCKS, stage=2):
+                k0 = kb * K_TILE
+                x_tile = pl.slice(
+                    x_flat,
+                    [TOKEN_M_TILE, K_TILE],
+                    [m0, k0],
+                    valid_shape=[valid_rows, K_TILE],
+                )
+                # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load (K-contiguous
+                # long bursts) instead of ND2NZ (strided short bursts). Matches ratio4/CSA/decode-HCA.
+                wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+                wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+                if k0 == 0:
+                    kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
+                    score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
+                else:
+                    kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
+                    score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
+            kv_proj_scratch[m0 : m0 + TOKEN_M_TILE, o0 : o0 + OUT_TILE] = kv_acc
+            score_proj_scratch[m0 : m0 + TOKEN_M_TILE, o0 : o0 + OUT_TILE] = score_acc
 
     # Precompute write_i -> (position, dst cache row) once (input-only deps -> overlaps the matmul),
     # replacing the O(T) write-discovery scan in pool / rmsnorm_rope / kv_finalize. Sized to

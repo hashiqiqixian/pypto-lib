@@ -83,16 +83,11 @@ def prefill_indexer_compressor(
 ):
     num_tokens = pl.tensor.dim(x_in, 0)
     x = pl.create_tensor([T, D], dtype=pl.BF16)
-    position_ids = pl.create_tensor([T], dtype=pl.INT32)
-    idx_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    inner_state_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_compressor_dynamic_pad"):
-        x[:, :] = pl.slice(x_in, [T, D], [0, 0], valid_shape=[num_tokens, D])
-        position_ids[:] = pl.slice(position_ids_in, [T], [0], valid_shape=[num_tokens])
-        idx_slot_mapping[:] = pl.slice(idx_slot_mapping_in, [T], [0], valid_shape=[num_tokens])
-        inner_state_slot_mapping[:] = pl.slice(
-            inner_state_slot_mapping_in, [T], [0], valid_shape=[num_tokens]
-        )
+    for pad_t in pl.spmd(T, name_hint="prefill_idx_compressor_dynamic_pad_x"):
+        x_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+        if pad_t < num_tokens:
+            x_row = pl.load(x_in, [pad_t, 0], [1, D], target_memory=pl.MemorySpace.Vec)
+        pl.store(x_row, [pad_t, 0], x)
     kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     kv_state_flat = pl.reshape(kv_state, [INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, OUT_DIM])
@@ -135,9 +130,9 @@ def prefill_indexer_compressor(
         map_seen = pl.cast(0, pl.INDEX)
         for map_w in pl.range(T):
             if map_w < num_tokens:
-                map_slot_raw = pl.read(idx_slot_mapping, [map_w])
+                map_slot_raw = pl.read(idx_slot_mapping_in, [map_w])
                 if map_slot_raw >= 0:
-                    pl.write(write_pos_tile, [0, map_seen], pl.read(position_ids, [map_w]))
+                    pl.write(write_pos_tile, [0, map_seen], pl.read(position_ids_in, [map_w]))
                     pl.write(write_dst_tile, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
                     map_seen = map_seen + 1
         write_pos_map[0:1, 0:MAX_CMP_WRITES] = write_pos_tile
@@ -215,7 +210,7 @@ def prefill_indexer_compressor(
 
             for pool_t in pl.range(T):
                 if pool_t < num_tokens:
-                    pool_pos = pl.read(position_ids, [pool_t])
+                    pool_pos = pl.read(position_ids_in, [pool_t])
                     if pool_pos <= write_pos:
                         if pool_pos >= prev_start:
                             pool_ape_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
@@ -384,10 +379,10 @@ def prefill_indexer_compressor(
         update_t = update_idx // PACKED_PROJ_BLOCKS
         update_o0 = update_ob * OUT_TILE
         if update_t < num_tokens:
-            state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
+            state_row_raw = pl.read(inner_state_slot_mapping_in, [update_t])
             if state_row_raw >= 0:
                 state_row = pl.cast(state_row_raw, pl.INDEX)
-                update_pos = pl.read(position_ids, [update_t])
+                update_pos = pl.read(position_ids_in, [update_t])
                 ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
                 ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
                 pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
@@ -730,13 +725,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
+    parser.add_argument("--num-tokens", type=int, default=T,
+                        help="Active token count used to validate the bounded dynamic prefill path.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=prefill_indexer_compressor_test,
-        specs=build_tensor_specs(args.start_pos),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_indexer_compressor,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),

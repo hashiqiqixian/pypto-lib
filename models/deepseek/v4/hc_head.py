@@ -12,9 +12,7 @@
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
-
-
-T_DYN = pl.dynamic("T_DYN")
+from dynamic_shapes import TOKENS_DYN as T_DYN
 
 
 B = DECODE_BATCH
@@ -75,7 +73,7 @@ def hc_head(
     y: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
-    t_linear = pl.max(t_dim, LINEAR_T_TILE)
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, D])
     inv_rms = pl.create_tensor([T_MAX, 1], dtype=pl.FP32)
@@ -86,19 +84,28 @@ def hc_head(
     pre_t = pl.create_tensor([HC_PAD, T_MAX], dtype=pl.FP32)
 
     # inv_rms scope: read the FP32 activations back and reduce sum-of-squares -> rsqrt.
-    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_head_rms", allow_early_resolve=True):
+    token_tiles = (t_dim + T_TILE - 1) // T_TILE
+    for t in pl.spmd(token_tiles, name_hint="hc_head_rms", allow_early_resolve=True):
         t0 = t * T_TILE
-        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        valid_rows = pl.min(T_TILE, t_dim - t0)
+        row_reduce_tmp = pl.create_tile([T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        sq_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(RMS_K_BLOCKS, stage=4):
             k0 = kb * RMS_K_CHUNK
-            x_chunk = x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK]
+            x_chunk = pl.load(
+                x_flat,
+                [t0, k0],
+                [T_TILE, RMS_K_CHUNK],
+                valid_shapes=[valid_rows, RMS_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
             sq_sum = pl.add(
                 sq_sum,
-                pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]),
+                pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk), row_reduce_tmp), [1, T_TILE]),
             )
         head_var = pl.add(pl.mul(sq_sum, HC_DIM_INV), EPS)
         inv = pl.reshape(pl.rsqrt(head_var, high_precision=True), [T_TILE, 1])
-        inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
+        pl.store(pl.set_validshape(inv, valid_rows, 1), [t0, 0], inv_rms)
 
     # Split-K head projection: zero-seed mixes_raw, then dispatch
     # NUM_T_TILES * LINEAR_OK tasks -- each owns one token-tile and one 1/OK
@@ -114,21 +121,29 @@ def hc_head(
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_head_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
-        acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
+        acc = pl.create_tile(
+            [LINEAR_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
+        )
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
             k0 = k_base + kb * LINEAR_K_CHUNK
-            x_linear_chunk = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_CHUNK]  # FP32 input -> pure-AIC matmul
-            w_chunk = pl.slice(
+            linear_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+            x_linear_chunk = pl.load(
+                x_flat,
+                [t0, k0],
+                [LINEAR_T_TILE, LINEAR_K_CHUNK],
+                valid_shapes=[linear_rows, LINEAR_K_CHUNK],
+            )
+            w_chunk = pl.load(
                 hc_head_fn,
-                [HC_PAD, LINEAR_K_CHUNK],
                 [0, k0],
-                valid_shape=[HC_MULT, LINEAR_K_CHUNK],
+                [HC_PAD, LINEAR_K_CHUNK],
+                valid_shapes=[HC_MULT, LINEAR_K_CHUNK],
             )
             if kb == 0:
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
             else:
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+        mixes_raw = pl.store(acc, [t0, 0], mixes_raw, atomic=pl.AtomicType.Add)
 
     # Fused scale + sigmoid + transpose -> pre_t in one scope (one dispatch).
     # Per TRANSPOSE_T_TILE block: row-scale the raw projection by inv_rms, apply
@@ -136,7 +151,16 @@ def hc_head(
     # straight into pre_t[:, tile]. The mixes and pre intermediates never touch GM.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_head_pre_fused", allow_early_resolve=True):
         scale = pl.read(hc_head_scale, [0])
-        base = pl.reshape(pl.slice(hc_head_base, [HC_PAD], [0], valid_shape=[HC_MULT]), [1, HC_PAD])
+        base = pl.reshape(
+            pl.load(
+                hc_head_base,
+                [0],
+                [HC_PAD],
+                valid_shapes=[HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
+            ),
+            [1, HC_PAD],
+        )
         for t0 in pl.pipeline(0, t_dim, TRANSPOSE_T_TILE, stage=2):
             scaled = pl.row_expand_mul(
                 mixes_raw[t0 : t0 + TRANSPOSE_T_TILE, 0:HC_PAD],
@@ -151,6 +175,7 @@ def hc_head(
 
     for t0 in pl.parallel(0, t_dim, T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_head_reduce", allow_early_resolve=True):
+            valid_rows = pl.min(T_TILE, t_dim - t0)
             # Per head h, pre_t[h] is a contiguous row of per-token scales; slice it
             # and reshape [1, T_TILE] -> [T_TILE, 1] for the row-broadcast multiply.
             pre0 = pl.reshape(pre_t[0:1, t0 : t0 + T_TILE], [T_TILE, 1])
@@ -159,17 +184,42 @@ def hc_head(
             pre3 = pl.reshape(pre_t[3:4, t0 : t0 + T_TILE], [T_TILE, 1])
             for db in pl.pipeline(D_BLOCKS, stage=2):
                 d0 = db * D_CHUNK
-                x_h0 = x_flat[t0 : t0 + T_TILE, 0 * D + d0 : 0 * D + d0 + D_CHUNK]
-                x_h1 = x_flat[t0 : t0 + T_TILE, 1 * D + d0 : 1 * D + d0 + D_CHUNK]
-                x_h2 = x_flat[t0 : t0 + T_TILE, 2 * D + d0 : 2 * D + d0 + D_CHUNK]
-                x_h3 = x_flat[t0 : t0 + T_TILE, 3 * D + d0 : 3 * D + d0 + D_CHUNK]
+                x_h0 = pl.load(
+                    x_flat,
+                    [t0, 0 * D + d0],
+                    [T_TILE, D_CHUNK],
+                    valid_shapes=[valid_rows, D_CHUNK],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                x_h1 = pl.load(
+                    x_flat,
+                    [t0, 1 * D + d0],
+                    [T_TILE, D_CHUNK],
+                    valid_shapes=[valid_rows, D_CHUNK],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                x_h2 = pl.load(
+                    x_flat,
+                    [t0, 2 * D + d0],
+                    [T_TILE, D_CHUNK],
+                    valid_shapes=[valid_rows, D_CHUNK],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                x_h3 = pl.load(
+                    x_flat,
+                    [t0, 3 * D + d0],
+                    [T_TILE, D_CHUNK],
+                    valid_shapes=[valid_rows, D_CHUNK],
+                    target_memory=pl.MemorySpace.Vec,
+                )
                 y_tile = pl.add(
                     pl.add(pl.row_expand_mul(x_h0, pre0), pl.row_expand_mul(x_h1, pre1)),
                     pl.add(pl.row_expand_mul(x_h2, pre2), pl.row_expand_mul(x_h3, pre3)),
                 )
-                y_flat[t0 : t0 + T_TILE, d0 : d0 + D_CHUNK] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+                y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+                y_valid = pl.set_validshape(y_bf16, valid_rows, D_CHUNK)
+                pl.store(y_valid, [t0, d0], y_flat)
 
-    y = pl.reshape(y_flat, [t_dim, D])
     return y
 
 

@@ -715,6 +715,8 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
                         choices=list(SUPPORTED_COMPRESS_RATIOS))
+    parser.add_argument("--num-tokens", type=int, default=T,
+                        help="Active token count used to validate the bounded dynamic prefill path.")
     parser.add_argument("--enable-l2-swimlane", nargs="?", const=4, default=0, type=int)
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -722,7 +724,7 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=prefill_sparse_attn_test,
-        specs=build_tensor_specs(args.compress_ratio),
+        specs=build_tensor_specs(args.compress_ratio, args.num_tokens),
         golden_fn=golden_prefill_sparse_attn,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(

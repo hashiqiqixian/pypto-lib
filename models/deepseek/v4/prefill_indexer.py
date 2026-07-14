@@ -136,22 +136,18 @@ def prefill_indexer(
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     cos = pl.create_tensor([T, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     sin = pl.create_tensor([T, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    position_ids = pl.create_tensor([T], dtype=pl.INT32)
-    idx_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    inner_state_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
     score = pl.create_tensor([T, INDEXER_SCORE_CAP], dtype=pl.FP32)
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_indexer_dynamic_pad"):
-        x[:, :] = pl.slice(x_in, [T, D], [0, 0], valid_shape=[num_tokens, D])
+    for pad_t in pl.spmd(T, name_hint="prefill_indexer_dynamic_pad_x"):
+        x_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+        if pad_t < num_tokens:
+            x_row = pl.load(x_in, [pad_t, 0], [1, D], target_memory=pl.MemorySpace.Vec)
+        pl.store(x_row, [pad_t, 0], x)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_indexer_dynamic_pad_meta"):
         qr[:, :] = pl.slice(qr_in, [T, Q_LORA], [0, 0], valid_shape=[num_tokens, Q_LORA])
         qr_scale[:, :] = pl.slice(qr_scale_in, [T, 1], [0, 0], valid_shape=[num_tokens, 1])
         cos[:, :] = pl.slice(cos_in, [T, ROPE_HEAD_DIM // 2], [0, 0], valid_shape=[num_tokens, ROPE_HEAD_DIM // 2])
         sin[:, :] = pl.slice(sin_in, [T, ROPE_HEAD_DIM // 2], [0, 0], valid_shape=[num_tokens, ROPE_HEAD_DIM // 2])
-        position_ids[:] = pl.slice(position_ids_in, [T], [0], valid_shape=[num_tokens])
-        idx_slot_mapping[:] = pl.slice(idx_slot_mapping_in, [T], [0], valid_shape=[num_tokens])
-        inner_state_slot_mapping[:] = pl.slice(
-            inner_state_slot_mapping_in, [T], [0], valid_shape=[num_tokens]
-        )
     # === Q projection: int8 qr x int8 wq_b -> dequant (mirrors decode_indexer qr_proj) ===
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
     for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="prefill_idx_qr_proj"):
@@ -246,7 +242,7 @@ def prefill_indexer(
 
     # === inner compressor: build the paged compressed index KV cache ===
     prefill_indexer_compressor(
-        x,
+        x_in,
         inner_kv_state, inner_score_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         freqs_cos, freqs_sin, hadamard,
@@ -268,7 +264,7 @@ def prefill_indexer(
             score_wide[si : si + SCORE_INIT_TILE, :] = pl.full([SCORE_INIT_TILE, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score"):
-        last_pos = pl.read(position_ids, [num_tokens - 1])
+        last_pos = pl.read(position_ids_in, [num_tokens - 1])
         max_visible = pl.min((last_pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
         for cb in pl.range(INDEXER_SCORE_BLOCKS):
             cache0 = cb * CACHE_TILE
@@ -289,7 +285,7 @@ def prefill_indexer(
                         score_tile_s = pl.col_expand_mul(pl.row_expand_mul(score_tile_s, kv_cache_scale_dq), qh_scale_s)
                         relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
                         weighted_score_s = pl.reshape(pl.row_sum(pl.col_expand_mul(relu_score_s, weights[t : t + 1, :])), [1, CACHE_TILE])
-                        pos = pl.read(position_ids, [t])
+                        pos = pl.read(position_ids_in, [t])
                         visible_t = pl.min((pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
                         if visible_t > cache0:
                             valid_len_t = pl.min(CACHE_TILE, visible_t - cache0)
@@ -311,7 +307,7 @@ def prefill_indexer(
             t = t0 + ti
             cmp_topk_indices[t : t + 1, 0:IDX_TOPK] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
             if t < num_tokens:
-                pos = pl.read(position_ids, [t])
+                pos = pl.read(position_ids_in, [t])
                 visible_t = pl.min((pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
                 if visible_t > 0:
                     # Sort the wide score row and gather the top-k indices (#505^'s exact wide+aligned
@@ -415,10 +411,12 @@ def golden_prefill_indexer_core(tensors):
     wq_b = tensors["wq_b"]
     wq_b_scale = tensors["wq_b_scale"].float()
     hadamard = tensors["hadamard"].float()
-    cos = tensors["cos"].float().view(T, 1, -1)
-    sin = tensors["sin"].float().view(T, 1, -1)
+    cos = tensors["cos"].float().view(num_tokens, 1, -1)
+    sin = tensors["sin"].float().view(num_tokens, 1, -1)
     q_i32 = qr.to(torch.int32) @ wq_b.to(torch.int32)
-    q = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(T, IDX_N_HEADS, IDX_HEAD_DIM)
+    q = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(
+        num_tokens, IDX_N_HEADS, IDX_HEAD_DIM
+    )
     q_pair = q[..., -rd:].unflatten(-1, (-1, 2))
     q0, q1 = q_pair[..., 0], q_pair[..., 1]
     y0 = (q0 * cos - q1 * sin).to(torch.bfloat16)
@@ -442,9 +440,9 @@ def golden_prefill_indexer_core(tensors):
 
     # W8A8C16 int8 score, matching decode_indexer: per-row quantize q, INT32 matmul against the
     # pre-quantized KV, then dequantize by both scales before the FP32 head-weighted reduce.
-    q_i8, q_sc = _int8_quant_per_row(q.reshape(T * IDX_N_HEADS, IDX_HEAD_DIM))
-    q_i8 = q_i8.view(T, IDX_N_HEADS, IDX_HEAD_DIM).to(torch.int32)
-    q_sc = q_sc.view(T, IDX_N_HEADS, 1)
+    q_i8, q_sc = _int8_quant_per_row(q.reshape(num_tokens * IDX_N_HEADS, IDX_HEAD_DIM))
+    q_i8 = q_i8.view(num_tokens, IDX_N_HEADS, IDX_HEAD_DIM).to(torch.int32)
+    q_sc = q_sc.view(num_tokens, IDX_N_HEADS, 1)
     score_i32 = torch.einsum("thd,cd->thc", q_i8, kv_i8)
     score = score_i32.float() * q_sc * kv_sc
     score = (torch.relu(score) * weights.unsqueeze(-1)).sum(dim=1)  # [T, max_visible]
@@ -742,6 +740,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
+    parser.add_argument("--num-tokens", type=int, default=T,
+                        help="Active token count used to validate the bounded dynamic prefill path.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -764,9 +764,32 @@ if __name__ == "__main__":
         )
     topk_idxs_compare.__name__ = "topk_pair_compare"
 
+    def active_cache_compare(atol, rtol, max_error_ratio):
+        base_cmp = ratio_allclose(atol=atol, rtol=rtol, max_error_ratio=max_error_ratio)
+
+        def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+            active_rows = inputs["idx_slot_mapping"].reshape(-1)
+            active_rows = torch.unique(active_rows[active_rows >= 0].long())
+            if active_rows.numel() == 0:
+                return True, ""
+            actual_flat = actual.reshape(-1, actual.shape[-1]).index_select(0, active_rows)
+            expected_flat = expected.reshape(-1, expected.shape[-1]).index_select(0, active_rows)
+            return base_cmp(
+                actual_flat,
+                expected_flat,
+                actual_outputs=actual_outputs,
+                expected_outputs=expected_outputs,
+                inputs=inputs,
+                rtol=rtol,
+                atol=atol,
+            )
+
+        cmp.__name__ = "active_cache_rows"
+        return cmp
+
     result = run_jit(
         fn=prefill_indexer_test,
-        specs=build_tensor_specs(args.start_pos),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_indexer,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
@@ -777,8 +800,8 @@ if __name__ == "__main__":
             "score": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "topk_idxs": topk_idxs_compare,
             # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
-            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-            "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+            "idx_kv_cache": active_cache_compare(atol=1, rtol=0, max_error_ratio=0.01),
+            "idx_kv_scale": active_cache_compare(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
         },
     )
     if not result.passed:

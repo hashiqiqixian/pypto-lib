@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 # ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
-"""DeepSeek-V4 Flash packed-prefill forward experiment.
+"""DeepSeek-V4 Flash dynamic-token prefill forward.
 
 Mirrors ``decode_fwd.py``: a single rank-generic ``@pl.jit`` per-rank kernel
 (``prefill_fwd``) is launched once per EP rank from an ``@pl.jit.host`` driver
@@ -17,10 +17,11 @@ program scales to EP 2 / 4 / 8.  The per-rank kernel hand-unrolls the model's
 layer schedule and calls ``prefill_attention_{swa,hca,csa}`` + ``moe`` directly
 (no ``prefill_layer`` wrapper).  Each attention / moe stage runs in its own
 ``pl.scope`` under ``auto_scope=False`` (matching ``decode_fwd``), and the final
-hidden state passes ``hc_head`` -> final ``rms_norm`` -> TP-sharded ``lm_head``
-to produce full-vocabulary logits.  This is a kernel-only smoke driver: it does
-not run a golden comparison.  With ``lm_head`` composed in, ``--ep 2`` / TP=2
-only (mirrors ``decode_fwd``).
+hidden state passes ``hc_head`` -> final ``rms_norm``. One invocation represents
+one bounded physical chunk of at most ``PREFILL_TOKENS`` rows; packed
+multi-request orchestration, request-local cache/table isolation, and splitting
+longer requests into dynamic tail chunks live in ``prefill_layer.py``. This is a
+kernel-only smoke driver and does not run a golden comparison.
 """
 
 import argparse
@@ -58,6 +59,7 @@ from moe import (
     moe,
 )
 from config import FLASH as MODEL_CONFIG
+from dynamic_shapes import TOKENS_DYN as T_DYN, validate_token_count
 from prefill_attention_swa import (
     build_tensor_specs as build_swa_attention_tensor_specs,
     prefill_attention_swa,
@@ -215,7 +217,7 @@ RESIDENT_CACHE_OUTPUT_NAMES = frozenset(["kv_cache"])
 
 @pl.jit(auto_scope=False)
 def prefill_fwd(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -264,20 +266,20 @@ def prefill_fwd(
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    input_ids: pl.Tensor[[T], pl.INT64],
-    hca_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    input_ids: pl.Tensor[[T_DYN], pl.INT64],
+    hca_cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    hca_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    csa_cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    csa_idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    csa_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    csa_inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
-    x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    x_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -306,10 +308,21 @@ def prefill_fwd(
     shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     my_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, D], pl.BF16]:
-    nt: pl.Scalar[pl.INT32] = num_tokens
-    hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+) -> pl.Tensor[[T_DYN, D], pl.BF16]:
+    x_hc.bind_dynamic(0, T_DYN)
+    ori_slot_mapping.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    hca_cmp_slot_mapping.bind_dynamic(0, T_DYN)
+    hca_state_slot_mapping.bind_dynamic(0, T_DYN)
+    csa_cmp_slot_mapping.bind_dynamic(0, T_DYN)
+    csa_idx_slot_mapping.bind_dynamic(0, T_DYN)
+    csa_state_slot_mapping.bind_dynamic(0, T_DYN)
+    csa_inner_state_slot_mapping.bind_dynamic(0, T_DYN)
+    input_ids.bind_dynamic(0, T_DYN)
+    x_out.bind_dynamic(0, T_DYN)
+
+    t_dim = pl.tensor.dim(x_hc, 0)
+    hidden: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32] = pl.create_tensor([t_dim, HC_MULT, D], dtype=pl.FP32)
 
     # ===================== layer 0 : swa =================================
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
@@ -346,7 +359,7 @@ def prefill_fwd(
     shared_w3_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [0 * MOE_INTER])
     shared_w2_l0: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [0 * D, 0])
     shared_w2_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [0 * D])
-    x_attn0: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn0: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32] = pl.create_tensor([t_dim, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
         prefill_attention_swa(
             x_hc,
@@ -356,7 +369,7 @@ def prefill_fwd(
             kv_cache_l0, ori_block_table, ori_slot_mapping,
             position_ids,
             attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
-            x_attn0, nt,
+            x_attn0,
         )
     with pl.scope():
         moe(
@@ -370,7 +383,7 @@ def prefill_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
+            pl.cast(0, pl.INT32), my_rank, pl.cast(1, pl.INT32),
         )
 
     # ===================== layer 1 : swa =================================
@@ -408,7 +421,7 @@ def prefill_fwd(
     shared_w3_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [1 * MOE_INTER])
     shared_w2_l1: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [1 * D, 0])
     shared_w2_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [1 * D])
-    x_attn1: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn1: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32] = pl.create_tensor([t_dim, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
         prefill_attention_swa(
             hidden,
@@ -418,7 +431,7 @@ def prefill_fwd(
             kv_cache_l1, ori_block_table, ori_slot_mapping,
             position_ids,
             attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
-            x_attn1, nt,
+            x_attn1,
         )
     with pl.scope():
         moe(
@@ -432,7 +445,7 @@ def prefill_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
+            pl.cast(1, pl.INT32), my_rank, pl.cast(2, pl.INT32),
         )
 
     # ============ loop : csa (even) + hca (odd) pairs, layers 2..41 ======
@@ -496,8 +509,8 @@ def prefill_fwd(
         shared_w3_scale_csa: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer * MOE_INTER])
         shared_w2_csa: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer * D, 0])
         shared_w2_scale_csa: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [csa_layer * D])
-        x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-        hidden_mid: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_csa: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32] = pl.create_tensor([t_dim, HC_MULT, D], dtype=pl.FP32)
+        hidden_mid: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32] = pl.create_tensor([t_dim, HC_MULT, D], dtype=pl.FP32)
         with pl.scope():
             prefill_attention_csa(
                 hidden,
@@ -515,7 +528,7 @@ def prefill_fwd(
                 position_ids, csa_cmp_slot_mapping, csa_idx_slot_mapping,
                 csa_state_slot_mapping, csa_inner_state_slot_mapping,
                 attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
-                x_attn_csa, nt,
+            x_attn_csa,
             )
         with pl.scope():
             moe(
@@ -529,7 +542,7 @@ def prefill_fwd(
                 hidden_mid,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                csa_layer, nt, my_rank, csa_moe_epoch,
+            csa_layer, my_rank, csa_moe_epoch,
             )
 
         # ---- hca attention weights (per-FWD by hca_layer, compact by loop_i) ----
@@ -574,7 +587,7 @@ def prefill_fwd(
         shared_w3_scale_hca: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [hca_layer * MOE_INTER])
         shared_w2_hca: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [hca_layer * D, 0])
         shared_w2_scale_hca: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [hca_layer * D])
-        x_attn_hca: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_hca: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32] = pl.create_tensor([t_dim, HC_MULT, D], dtype=pl.FP32)
         with pl.scope():
             prefill_attention_hca(
                 hidden_mid,
@@ -587,7 +600,7 @@ def prefill_fwd(
                 cmp_kv_hca, cmp_block_table,
                 position_ids, hca_cmp_slot_mapping, hca_state_slot_mapping,
                 attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
-                x_attn_hca, nt,
+            x_attn_hca,
             )
         with pl.scope():
             moe(
@@ -601,7 +614,7 @@ def prefill_fwd(
                 hidden,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                hca_layer, nt, my_rank, hca_moe_epoch,
+            hca_layer, my_rank, hca_moe_epoch,
             )
 
     # ================ layer 42 (FWD_LAST_LAYER) : csa -> x_out ===========
@@ -661,8 +674,8 @@ def prefill_fwd(
     shared_w3_scale_last: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer_last * MOE_INTER])
     shared_w2_last: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer_last * D, 0])
     shared_w2_scale_last: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [csa_layer_last * D])
-    x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    x_next_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_last: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32] = pl.create_tensor([t_dim, HC_MULT, D], dtype=pl.FP32)
+    x_next_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32] = pl.create_tensor([t_dim, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
         prefill_attention_csa(
             hidden,
@@ -680,7 +693,7 @@ def prefill_fwd(
             position_ids, csa_cmp_slot_mapping, csa_idx_slot_mapping,
             csa_state_slot_mapping, csa_inner_state_slot_mapping,
             attn_sink_last, wo_a_last, wo_b_last, wo_b_scale_last,
-            x_attn_last, nt,
+            x_attn_last,
         )
     with pl.scope():
         moe(
@@ -694,9 +707,9 @@ def prefill_fwd(
             x_next_hc,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            csa_layer_last, nt, my_rank, last_moe_epoch,
+            csa_layer_last, my_rank, last_moe_epoch,
         )
-    x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_head: pl.Tensor[[T_DYN, D], pl.BF16] = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(x_next_hc, hc_head_fn, hc_head_scale, hc_head_base, x_head)
         rms_norm(x_head, final_norm_w, x_out)
@@ -705,7 +718,7 @@ def prefill_fwd(
 
 @pl.jit.host
 def l3_prefill_fwd(
-    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -754,15 +767,15 @@ def l3_prefill_fwd(
     ori_block_table: pl.Tensor[[N_RANKS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[N_RANKS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
-    input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
-    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[N_RANKS, T_DYN], pl.INT64],
+    position_ids: pl.Tensor[[N_RANKS, T_DYN], pl.INT32],
+    input_ids: pl.Tensor[[N_RANKS, T_DYN], pl.INT64],
+    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, T_DYN], pl.INT64],
+    hca_state_slot_mapping: pl.Tensor[[N_RANKS, T_DYN], pl.INT64],
+    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, T_DYN], pl.INT64],
+    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, T_DYN], pl.INT64],
+    csa_state_slot_mapping: pl.Tensor[[N_RANKS, T_DYN], pl.INT64],
+    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, T_DYN], pl.INT64],
     hc_ffn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -786,8 +799,7 @@ def l3_prefill_fwd(
     hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
-    hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    num_tokens: pl.Scalar[pl.INT32],
+    hidden_out: pl.Out[pl.Tensor[[N_RANKS, T_DYN, D], pl.BF16]],
 ):
     recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)
     recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
@@ -837,7 +849,7 @@ def l3_prefill_fwd(
             routed_w2[r], routed_w2_scale[r],
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
             shared_w2[r], shared_w2_scale[r],
-            r, num_tokens,
+            r,
             device=r,
         )
 
@@ -1211,18 +1223,18 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
         else:
             tensor_specs.append(spec)
 
-    tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    tensor_specs.append(TensorSpec("x_next", [N_RANKS, num_tokens, HC_MULT, D], torch.float32, is_output=True))
     tensor_by_name = {spec.name: spec for spec in tensor_specs}
     missing = [name for name in HOST_TENSOR_ORDER if name not in tensor_by_name]
     if missing:
         raise ValueError(f"missing unified prefill layer tensor specs: {missing}")
     return [tensor_by_name[name] for name in HOST_TENSOR_ORDER] + [
-        ScalarSpec("num_tokens", torch.int32, num_tokens),
         ScalarSpec("layer_id", torch.int32, layer_id),
     ]
 
 
 def build_tensor_specs(start_pos=0, num_tokens=T):
+    num_tokens = validate_token_count(num_tokens)
     import torch
     from golden import TensorSpec
 
@@ -1289,9 +1301,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in RESIDENT_CACHE_NAMES:
             spec.resident = "stacked"
 
-    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    from golden import ScalarSpec
-    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
+    specs.append(TensorSpec("hidden_out", [N_RANKS, num_tokens, D], torch.bfloat16, is_output=True))
     return specs
 
 

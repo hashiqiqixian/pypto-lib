@@ -27,9 +27,7 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import DECODE_TOKENS, FLASH as M, LM_HEAD_TP_SIZE, PREFILL_TOKENS
-
-
-T_DYN = pl.dynamic("LM_HEAD_T_DYN")
+from dynamic_shapes import TOKENS_DYN as T_DYN
 
 
 # Tensor shapes and loop trip counts are static in the frontend, so the TP
