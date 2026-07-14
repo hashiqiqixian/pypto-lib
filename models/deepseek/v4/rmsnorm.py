@@ -12,10 +12,7 @@ activations for both decode and prefill attention paths."""
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
-
-
-# Dynamic shape variables.
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+from dynamic_shapes import TOKENS_DYN as T_DYN
 
 
 # model config
@@ -39,26 +36,42 @@ def rms_norm(
     t_dim = pl.tensor.dim(x, 0)
     # Capture form (not `for ... in pl.spmd`): callers need the producer TaskId to
     # hang a `pl.system.task_dummy` barrier off it and defer non-critical consumers.
-    with pl.spmd(t_dim // T_TILE, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
+    token_tiles = (t_dim + T_TILE - 1) // T_TILE
+    with pl.spmd(token_tiles, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
         tg_idx = pl.tile.get_block_idx()
         tg = tg_idx * T_TILE
+        valid_rows = pl.min(T_TILE, t_dim - tg)
         x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for rms_db in pl.pipeline(D // D_TILE, stage=2):
             rms_d0 = rms_db * D_TILE
-            rms_x_chunk = pl.cast(x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
+            rms_x_input = pl.slice(
+                x,
+                [T_TILE, D_TILE],
+                [tg, rms_d0],
+                valid_shape=[valid_rows, D_TILE],
+            )
+            rms_x_chunk = pl.cast(rms_x_input, target_type=pl.FP32)
             x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
         x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
         x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
         for apply_db in pl.pipeline(D // D_TILE, stage=2):
             apply_d0 = apply_db * D_TILE
-            apply_x_chunk = pl.cast(x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE], target_type=pl.FP32)
+            apply_x_input = pl.slice(
+                x,
+                [T_TILE, D_TILE],
+                [tg, apply_d0],
+                valid_shape=[valid_rows, D_TILE],
+            )
+            apply_x_chunk = pl.cast(apply_x_input, target_type=pl.FP32)
             norm_w_chunk = pl.cast(pl.reshape(norm_w[apply_d0 : apply_d0 + D_TILE], [1, D_TILE]), pl.FP32)
             x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
-            x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(
+            x_normed_chunk = pl.cast(
                 x_normed_chunk,
                 target_type=pl.BF16,
                 mode="rint",
             )
+            x_normed_valid = pl.set_validshape(x_normed_chunk, valid_rows, D_TILE)
+            pl.store(x_normed_valid, [tg, apply_d0], x_normed)
 
     return rms_tid
 

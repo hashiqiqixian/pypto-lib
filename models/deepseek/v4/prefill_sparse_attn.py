@@ -28,6 +28,7 @@ from config import (
     PREFILL_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
 )
+from dynamic_shapes import TOKENS_DYN as T_DYN
 
 # Prefill target shape. T is fixed at 128.
 B = PREFILL_BATCH
@@ -110,22 +111,42 @@ SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 
 @pl.jit.inline
 def prefill_sparse_attn(
-    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    q_in: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    swa_indices_in: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+    cmp_indices_in: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_cos_in: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin_in: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    attn_out_dyn: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
     """Gather cache-first SWA/compressed rows, then run sparse attention and o-proj."""
+    num_tokens = pl.tensor.dim(q_in, 0)
+    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
+    swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
+    cmp_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
+    freqs_cos = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
+    freqs_sin = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
+    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_sparse_dynamic_pad"):
+        q[:, :, :] = pl.slice(q_in, [T, H, HEAD_DIM], [0, 0, 0], valid_shape=[num_tokens, H, HEAD_DIM])
+        swa_indices[:, :] = pl.slice(
+            swa_indices_in, [T, WIN], [0, 0], valid_shape=[num_tokens, WIN]
+        )
+        cmp_indices[:, :] = pl.slice(
+            cmp_indices_in, [T, IDX_TOPK], [0, 0], valid_shape=[num_tokens, IDX_TOPK]
+        )
+        freqs_cos[:, :] = pl.slice(
+            freqs_cos_in, [T, ROPE_DIM], [0, 0], valid_shape=[num_tokens, ROPE_DIM]
+        )
+        freqs_sin[:, :] = pl.slice(
+            freqs_sin_in, [T, ROPE_DIM], [0, 0], valid_shape=[num_tokens, ROPE_DIM]
+        )
     # Gather KV per token: each (token, block) of PREFILL_ATTN_TILE slots is staged into one
     # UB tile (scattered 1-row loads on MTE2, invalid slots stay zero) then flushed with a
     # single wide MTE3 store. Invalid slots are carried by -1 padding.
@@ -427,25 +448,33 @@ def prefill_sparse_attn(
             out_t = pl.col_expand_mul(acc, wb_scale_chunk)
             attn_out[b_tb:b_tb + PROJ_B_ACT_T_TILE, ob_n0:ob_n0 + PROJ_B_ACT_N_TILE] = pl.cast(out_t, target_type=pl.BF16, mode="rint")
 
-    return attn_out
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_sparse_dynamic_store"):
+        pl.store(pl.slice(attn_out, [T, D], [0, 0], valid_shape=[num_tokens, D]), [0, 0], attn_out_dyn)
+    return attn_out_dyn
 
 @pl.jit
 def prefill_sparse_attn_test(
-    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+    cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
+    q.bind_dynamic(0, T_DYN)
+    swa_indices.bind_dynamic(0, T_DYN)
+    cmp_indices.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
+    attn_out.bind_dynamic(0, T_DYN)
+
     return prefill_sparse_attn(
         q,
         ori_kv,
@@ -454,7 +483,6 @@ def prefill_sparse_attn_test(
         cmp_block_table,
         cmp_indices,
         attn_sink,
-        num_tokens,
         freqs_cos,
         freqs_sin,
         wo_a,
@@ -489,7 +517,7 @@ def golden_prefill_sparse_attn(tensors):
     """Self-contained torch reference for the cache-first sparse-attn entry."""
     import torch
 
-    num_tokens = int(tensors["num_tokens"])
+    num_tokens = tensors["q"].shape[0]
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
     cmp_kv = tensors["cmp_kv"].float()
@@ -503,7 +531,7 @@ def golden_prefill_sparse_attn(tensors):
     wo_b_i8 = tensors["wo_b"]
     wo_b_scale = tensors["wo_b_scale"].float()
 
-    o = torch.zeros(T, H, HEAD_DIM)
+    o = torch.zeros(num_tokens, H, HEAD_DIM)
     for t in range(num_tokens):
         gathered = []
         for row_i in swa_indices[t].tolist():
@@ -561,19 +589,19 @@ def golden_prefill_sparse_attn(tensors):
     o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
     o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
 
-    o_model = o.float().view(T, O_GROUPS, O_GROUP_IN)
+    o_model = o.float().view(num_tokens, O_GROUPS, O_GROUP_IN)
     o_r = torch.einsum("tgd,grd->tgr", o_model, wo_a)   # [T, G, O_LORA]
     # PER-GROUP INT8 activation quant (one amax per O_LORA group, not per full row) --
     # mirrors the decoupled proj_a[g]->quant[g]->proj_b[g] kernel pipeline. Each group's
     # INT32 partial is dequantized by its OWN per-row act scale (the per-group scale cannot
     # factor out of the K-sum), then the per-channel weight scale is applied.
-    o_r_g = o_r.reshape(T, O_GROUPS, O_LORA)
+    o_r_g = o_r.reshape(num_tokens, O_GROUPS, O_LORA)
     amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)   # [T, G, 1]
     scale_q_g = INT8_SCALE_MAX / amax_g
     o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dq_g = 1.0 / scale_q_g                                              # [T, G, 1]
     wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
-    out = torch.zeros(T, D, dtype=torch.float32)
+    out = torch.zeros(num_tokens, D, dtype=torch.float32)
     for g in range(O_GROUPS):
         p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T   # [T, D]
         out = out + p_g.float() * scale_dq_g[:, g]                             # per-row group scale
@@ -588,22 +616,23 @@ def get_prefill_cmp_valid(compress_ratio: int) -> int:
         return min(IDX_TOPK, S // compress_ratio, CMP_MAX_BLOCKS * BLOCK_SIZE)
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
 
-def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
+def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO, num_tokens: int = T):
     import torch
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables, materialize_token_rope_tables
 
-    num_tokens = T
+    if num_tokens <= 0 or num_tokens > T:
+        raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
     cmp_valid = get_prefill_cmp_valid(compress_ratio)
     shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, compress_ratio, dtype=torch.bfloat16)
     shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(
         shared_freqs_cos,
         shared_freqs_sin,
-        torch.arange(T, dtype=torch.int32),
+        torch.arange(num_tokens, dtype=torch.int32),
     )
 
     def init_q():
-        return ((torch.rand(T, H, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+        return ((torch.rand(num_tokens, H, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_ori_kv():
         return ((torch.rand(ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_kv():
@@ -614,14 +643,14 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
             table[blk] = blk
         return table
     def init_swa_indices():
-        idx = torch.full((T, WIN), -1, dtype=torch.int32)
+        idx = torch.full((num_tokens, WIN), -1, dtype=torch.int32)
         for t in range(num_tokens):
             window_start = max(0, t - WIN + 1)
             window = torch.arange(window_start, t + 1, dtype=torch.int32)
             idx[t, :window.numel()] = window
         return idx
     def init_cmp_indices():
-        idx = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
+        idx = torch.full((num_tokens, IDX_TOPK), -1, dtype=torch.int32)
         if compress_ratio:
             for t in range(num_tokens):
                 comp_count = min(cmp_valid, (t + 1) // compress_ratio, IDX_TOPK)
@@ -642,20 +671,19 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     wo_b_i8, wo_b_scale = _quant_w_per_channel(init_wo_b())
 
     return [
-        TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
+        TensorSpec("q", [num_tokens, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("swa_indices", [T, WIN], torch.int32, init_value=init_swa_indices),
+        TensorSpec("swa_indices", [num_tokens, WIN], torch.int32, init_value=init_swa_indices),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("cmp_indices", [T, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
+        TensorSpec("cmp_indices", [num_tokens, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        ScalarSpec("num_tokens", torch.int32, num_tokens),
-        TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("freqs_cos", [num_tokens, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [num_tokens, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("attn_out", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("attn_out", [num_tokens, D], torch.bfloat16, is_output=True),
     ]
 
 if __name__ == "__main__":
