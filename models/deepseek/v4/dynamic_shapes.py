@@ -15,11 +15,6 @@ of accepting a separate valid-prefix scalar.  One invocation is bounded by
 ``MAX_TOKENS_PER_CALL``; larger requests are split only by the orchestration
 layer, while request-boundary and cache metadata remain explicit tensors.
 
-During the Attention-first migration, the public Attention entry points retain
-the legacy ``num_tokens`` argument only as a compatibility boundary for callers
-that still provide padded tensors.  They immediately slice token-aligned inputs
-and outputs to the logical physical shape.  The compatibility argument is
-removed when packed prefill and MoE adopt this contract in the follow-up commit.
 """
 
 import pypto.language as pl

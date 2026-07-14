@@ -129,16 +129,7 @@ def prefill_attention_swa(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-    num_tokens: pl.Scalar[pl.INT32],
 ):
-    # Transitional caller boundary: Attention and every child below it consume
-    # the real physical token shape, even while packed prefill still supplies a
-    # padded tensor plus its valid-prefix scalar.
-    token_count = pl.cast(num_tokens, pl.INDEX)
-    x_hc = pl.slice(x_hc, [token_count, HC_MULT, D], [0, 0, 0])
-    ori_slot_mapping = pl.slice(ori_slot_mapping, [token_count], [0])
-    position_ids = pl.slice(position_ids, [token_count], [0])
-    x_out = pl.slice(x_out, [token_count, HC_MULT, D], [0, 0, 0])
     num_tokens = pl.tensor.dim(x_hc, 0)
     x_mixed = pl.create_tensor([num_tokens, D], dtype=pl.BF16)
     post = pl.create_tensor([num_tokens, HC_MULT], dtype=pl.FP32)
@@ -260,7 +251,6 @@ def prefill_attention_swa_test(
         position_ids,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out,
-        pl.cast(pl.tensor.dim(x_hc, 0), pl.INT32),
     )
     return kv_cache, x_out
 

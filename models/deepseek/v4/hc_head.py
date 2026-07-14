@@ -12,9 +12,7 @@
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
-
-
-T_DYN = pl.dynamic("T_DYN")
+from dynamic_shapes import TOKENS_DYN as T_DYN
 
 
 B = DECODE_BATCH
@@ -75,7 +73,7 @@ def hc_head(
     y: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
-    t_linear = pl.max(t_dim, LINEAR_T_TILE)
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, D])
     inv_rms = pl.create_tensor([T_MAX, 1], dtype=pl.FP32)
@@ -86,12 +84,19 @@ def hc_head(
     pre_t = pl.create_tensor([HC_PAD, T_MAX], dtype=pl.FP32)
 
     # inv_rms scope: read the FP32 activations back and reduce sum-of-squares -> rsqrt.
-    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_head_rms", allow_early_resolve=True):
+    token_tiles = (t_dim + T_TILE - 1) // T_TILE
+    for t in pl.spmd(token_tiles, name_hint="hc_head_rms", allow_early_resolve=True):
         t0 = t * T_TILE
+        valid_rows = pl.min(T_TILE, t_dim - t0)
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(RMS_K_BLOCKS, stage=4):
             k0 = kb * RMS_K_CHUNK
-            x_chunk = x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK]
+            x_chunk = pl.slice(
+                x_flat,
+                [T_TILE, RMS_K_CHUNK],
+                [t0, k0],
+                valid_shape=[valid_rows, RMS_K_CHUNK],
+            )
             sq_sum = pl.add(
                 sq_sum,
                 pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]),
@@ -117,7 +122,13 @@ def hc_head(
         acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
             k0 = k_base + kb * LINEAR_K_CHUNK
-            x_linear_chunk = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_CHUNK]  # FP32 input -> pure-AIC matmul
+            linear_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+            x_linear_chunk = pl.slice(
+                x_flat,
+                [LINEAR_T_TILE, LINEAR_K_CHUNK],
+                [t0, k0],
+                valid_shape=[linear_rows, LINEAR_K_CHUNK],
+            )
             w_chunk = pl.slice(
                 hc_head_fn,
                 [HC_PAD, LINEAR_K_CHUNK],
@@ -151,6 +162,7 @@ def hc_head(
 
     for t0 in pl.parallel(0, t_dim, T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_head_reduce", allow_early_resolve=True):
+            valid_rows = pl.min(T_TILE, t_dim - t0)
             # Per head h, pre_t[h] is a contiguous row of per-token scales; slice it
             # and reshape [1, T_TILE] -> [T_TILE, 1] for the row-broadcast multiply.
             pre0 = pl.reshape(pre_t[0:1, t0 : t0 + T_TILE], [T_TILE, 1])
@@ -159,15 +171,17 @@ def hc_head(
             pre3 = pl.reshape(pre_t[3:4, t0 : t0 + T_TILE], [T_TILE, 1])
             for db in pl.pipeline(D_BLOCKS, stage=2):
                 d0 = db * D_CHUNK
-                x_h0 = x_flat[t0 : t0 + T_TILE, 0 * D + d0 : 0 * D + d0 + D_CHUNK]
-                x_h1 = x_flat[t0 : t0 + T_TILE, 1 * D + d0 : 1 * D + d0 + D_CHUNK]
-                x_h2 = x_flat[t0 : t0 + T_TILE, 2 * D + d0 : 2 * D + d0 + D_CHUNK]
-                x_h3 = x_flat[t0 : t0 + T_TILE, 3 * D + d0 : 3 * D + d0 + D_CHUNK]
+                x_h0 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 0 * D + d0], valid_shape=[valid_rows, D_CHUNK])
+                x_h1 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 1 * D + d0], valid_shape=[valid_rows, D_CHUNK])
+                x_h2 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 2 * D + d0], valid_shape=[valid_rows, D_CHUNK])
+                x_h3 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 3 * D + d0], valid_shape=[valid_rows, D_CHUNK])
                 y_tile = pl.add(
                     pl.add(pl.row_expand_mul(x_h0, pre0), pl.row_expand_mul(x_h1, pre1)),
                     pl.add(pl.row_expand_mul(x_h2, pre2), pl.row_expand_mul(x_h3, pre3)),
                 )
-                y_flat[t0 : t0 + T_TILE, d0 : d0 + D_CHUNK] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+                y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+                y_valid = pl.set_validshape(y_bf16, valid_rows, D_CHUNK)
+                pl.store(y_valid, [t0, d0], y_flat)
 
     y = pl.reshape(y_flat, [t_dim, D])
     return y

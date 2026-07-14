@@ -22,25 +22,16 @@ amax+rescale of the same tokens.
 import pypto.language as pl
 
 from config import (FLASH as M, MOE_TOKENS, INT8_SCALE_MAX, INT8_AMAX_EPS)
+from dynamic_shapes import TOKENS_DYN as T_DYN
 
 
 # model config
-T = MOE_TOKENS
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
 
 # tiling
 SH_M_TILE = 16
-T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-# Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
-# SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
-# per-block row count the static valid_shape below can't express.
-assert T <= SH_M_TILE or T % SH_M_TILE == 0, \
-    "expert_shared needs T <= SH_M_TILE (decode) or T a multiple of SH_M_TILE (prefill)"
-SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
-N_MTILES = T_PAD // SH_M_TILE
-
 K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 256
@@ -56,20 +47,23 @@ W2_ACT_INNER = 8
 
 @pl.jit.inline
 def expert_shared(
-    x_local_i8: pl.Tensor[[T, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    x_local_i8: pl.Tensor[[T_DYN, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[T_DYN, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Tensor[[T, D], pl.BF16],
+    sh: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
+    t_dim = pl.tensor.dim(x_local_i8, 0)
+    n_mtiles = (t_dim + SH_M_TILE - 1) // SH_M_TILE
     # One M-tile of SH_M_TILE rows per iteration (decode: 1 tile, T<=16 rows valid;
     # prefill: T_PAD/SH_M_TILE fully-valid tiles).
-    for mt in pl.parallel(N_MTILES):
+    for mt in pl.parallel(n_mtiles):
         ts0 = mt * SH_M_TILE
+        valid_rows = pl.min(SH_M_TILE, t_dim - ts0)
 
         h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
         gate_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
@@ -80,7 +74,7 @@ def expert_shared(
             n0 = nb_idx * MM_INTER_TILE
             gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[valid_rows, K_TILE])
                 sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                 if k0 == 0:
                     gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
@@ -93,7 +87,7 @@ def expert_shared(
             n0 = nb_idx * MM_INTER_TILE
             up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[valid_rows, K_TILE])
                 sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                 if k0 == 0:
                     up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
@@ -108,8 +102,9 @@ def expert_shared(
                 n0 = n_base + ng * ACT_INTER_TILE
                 gate_2d_i32 = gate_i32[:, n0 : n0 + ACT_INTER_TILE]
                 up_2d_i32 = up_i32[:, n0 : n0 + ACT_INTER_TILE]
-                # Static valid_shape: a dynamic one perturbs the Vec row_expand_mul.
-                x_local_scale_dq_tile = pl.slice(x_local_scale_dq, [SH_M_TILE, 1], [ts0, 0], valid_shape=[SH_VALID_M, 1])
+                x_local_scale_dq_tile = pl.slice(
+                    x_local_scale_dq, [SH_M_TILE, 1], [ts0, 0], valid_shape=[valid_rows, 1]
+                )
                 w1_scale_chunk = pl.reshape(shared_w1_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
                 w3_scale_chunk = pl.reshape(shared_w3_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
                 gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
@@ -169,7 +164,7 @@ def expert_shared(
                 # Write valid rows straight to the (unpadded) output, mirroring
                 # expert_routed's direct recv_y store; no sh_pad round-trip.
                 y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
-                sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE_ACT] = y_bf16[0:SH_VALID_M, :]
+                pl.store(pl.set_validshape(y_bf16, valid_rows, D_OUT_TILE_ACT), [ts0, d0], sh)
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; sh is convenient because it's already pl.Out.
@@ -178,16 +173,20 @@ def expert_shared(
 
 @pl.jit
 def expert_shared_test(
-    x_local_i8: pl.Tensor[[T, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    x_local_i8: pl.Tensor[[T_DYN, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[T_DYN, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    sh: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
+    x_local_i8.bind_dynamic(0, T_DYN)
+    x_local_scale_dq.bind_dynamic(0, T_DYN)
+    sh.bind_dynamic(0, T_DYN)
+
     expert_shared(
         x_local_i8, x_local_scale_dq,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
@@ -275,13 +274,13 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     return w_i8, scale
 
 
-def build_tensor_specs():
+def build_tensor_specs(num_tokens=MOE_TOKENS):
     import torch
     from golden import TensorSpec
 
     # Pre-quantize x_local once so the i8 / scale specs see consistent values
     # (mirrors what gate produces in the full pipeline).
-    x_local_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
+    x_local_bf16 = torch.randn(num_tokens, D, dtype=torch.bfloat16)
     x_local_i8_pre, x_local_sd_pre = _int8_quant_per_row(x_local_bf16)
 
     # Synthesize (int8, per-channel scale) by simulating the real MXFP8 shared-expert
@@ -293,15 +292,15 @@ def build_tensor_specs():
     sw2_i8, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
 
     return [
-        TensorSpec("x_local_i8", [T, D], torch.int8, init_value=lambda: x_local_i8_pre),
-        TensorSpec("x_local_scale_dq", [T, 1], torch.float32, init_value=lambda: x_local_sd_pre.float()),
+        TensorSpec("x_local_i8", [num_tokens, D], torch.int8, init_value=lambda: x_local_i8_pre),
+        TensorSpec("x_local_scale_dq", [num_tokens, 1], torch.float32, init_value=lambda: x_local_sd_pre.float()),
         TensorSpec("shared_w1", [MOE_INTER, D], torch.int8, init_value=lambda: sw1_i8),
         TensorSpec("shared_w1_scale", [MOE_INTER], torch.float32, init_value=lambda: sw1_s),
         TensorSpec("shared_w3", [MOE_INTER, D], torch.int8, init_value=lambda: sw3_i8),
         TensorSpec("shared_w3_scale", [MOE_INTER], torch.float32, init_value=lambda: sw3_s),
         TensorSpec("shared_w2", [D, MOE_INTER], torch.int8, init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale", [D], torch.float32, init_value=lambda: sw2_s),
-        TensorSpec("sh", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("sh", [num_tokens, D], torch.bfloat16, is_output=True),
     ]
 
 

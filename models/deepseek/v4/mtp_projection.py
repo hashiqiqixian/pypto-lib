@@ -27,9 +27,9 @@ from config import (
     PREFILL_BATCH,
     PREFILL_SEQ,
 )
+from dynamic_shapes import TOKENS_DYN as T_DYN
 
 
-T_DYN = pl.dynamic("T_DYN")
 D = M.hidden_size
 HC_MULT = M.hc_mult
 HC_DIM = HC_MULT * D
