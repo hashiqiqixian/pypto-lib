@@ -305,7 +305,17 @@ def prefill_fwd(
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
+    token_count = pl.cast(num_tokens, pl.INDEX)
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_hc_valid = pl.slice(x_hc, [token_count, HC_MULT, D], [0, 0, 0])
+    ori_slot_mapping_valid = pl.slice(ori_slot_mapping, [token_count], [0])
+    position_ids_valid = pl.slice(position_ids, [token_count], [0])
+    hca_cmp_slot_mapping_valid = pl.slice(hca_cmp_slot_mapping, [token_count], [0])
+    hca_state_slot_mapping_valid = pl.slice(hca_state_slot_mapping, [token_count], [0])
+    csa_cmp_slot_mapping_valid = pl.slice(csa_cmp_slot_mapping, [token_count], [0])
+    csa_idx_slot_mapping_valid = pl.slice(csa_idx_slot_mapping, [token_count], [0])
+    csa_state_slot_mapping_valid = pl.slice(csa_state_slot_mapping, [token_count], [0])
+    csa_inner_state_slot_mapping_valid = pl.slice(csa_inner_state_slot_mapping, [token_count], [0])
 
     # ===================== layer 0 : swa =================================
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
@@ -342,18 +352,21 @@ def prefill_fwd(
     shared_w3_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [0 * MOE_INTER])
     shared_w2_l0: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [0 * D, 0])
     shared_w2_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [0 * D])
-    x_attn0: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn0_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn0_valid = pl.slice(x_attn0_storage, [token_count, HC_MULT, D], [0, 0, 0])
     with pl.scope():
         prefill_attention_swa(
-            x_hc,
+            x_hc_valid,
             hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0, attn_norm_w_l0,
             wq_a_l0, wq_b_l0, wq_b_scale_l0, wkv_l0, gamma_cq_l0, gamma_ckv_l0,
             freqs_cos, freqs_sin,
-            kv_cache_l0, ori_block_table, ori_slot_mapping,
-            position_ids,
+            kv_cache_l0, ori_block_table, ori_slot_mapping_valid,
+            position_ids_valid,
             attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
-            x_attn0, nt,
+            x_attn0_valid,
         )
+    x_attn0: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn0 = pl.assemble(x_attn0, x_attn0_valid, [0, 0, 0])
     with pl.scope():
         moe(
             x_attn0,
@@ -404,18 +417,22 @@ def prefill_fwd(
     shared_w3_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [1 * MOE_INTER])
     shared_w2_l1: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [1 * D, 0])
     shared_w2_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [1 * D])
-    x_attn1: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn1_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn1_valid = pl.slice(x_attn1_storage, [token_count, HC_MULT, D], [0, 0, 0])
+    hidden_l1_valid = pl.slice(hidden, [token_count, HC_MULT, D], [0, 0, 0])
     with pl.scope():
         prefill_attention_swa(
-            hidden,
+            hidden_l1_valid,
             hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1, attn_norm_w_l1,
             wq_a_l1, wq_b_l1, wq_b_scale_l1, wkv_l1, gamma_cq_l1, gamma_ckv_l1,
             freqs_cos, freqs_sin,
-            kv_cache_l1, ori_block_table, ori_slot_mapping,
-            position_ids,
+            kv_cache_l1, ori_block_table, ori_slot_mapping_valid,
+            position_ids_valid,
             attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
-            x_attn1, nt,
+            x_attn1_valid,
         )
+    x_attn1: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn1 = pl.assemble(x_attn1, x_attn1_valid, [0, 0, 0])
     with pl.scope():
         moe(
             x_attn1,
@@ -490,11 +507,13 @@ def prefill_fwd(
         shared_w3_scale_csa: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer * MOE_INTER])
         shared_w2_csa: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer * D, 0])
         shared_w2_scale_csa: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [csa_layer * D])
-        x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_csa_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_csa_valid = pl.slice(x_attn_csa_storage, [token_count, HC_MULT, D], [0, 0, 0])
         hidden_mid: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        hidden_csa_valid = pl.slice(hidden, [token_count, HC_MULT, D], [0, 0, 0])
         with pl.scope():
             prefill_attention_csa(
-                hidden,
+                hidden_csa_valid,
                 hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa, attn_norm_w_csa,
                 wq_a_csa, wq_b_csa, wq_b_scale_csa, wkv_csa, gamma_cq_csa, gamma_ckv_csa,
                 freqs_cos, freqs_sin,
@@ -504,13 +523,15 @@ def prefill_fwd(
                 csa_idx_wq_b_csa, csa_idx_wq_b_scale_csa, csa_weights_proj_csa,
                 csa_inner_wkv_csa, csa_inner_wgate_csa, csa_inner_ape_csa, csa_inner_norm_w_csa,
                 csa_inner_compress_state_csa, csa_inner_compress_state_block_table,
-                kv_cache_csa, ori_block_table, ori_slot_mapping,
+                kv_cache_csa, ori_block_table, ori_slot_mapping_valid,
                 cmp_kv_csa, cmp_block_table, idx_kv_cache_csa, idx_kv_scale_csa, idx_block_table,
-                position_ids, csa_cmp_slot_mapping, csa_idx_slot_mapping,
-                csa_state_slot_mapping, csa_inner_state_slot_mapping,
+                position_ids_valid, csa_cmp_slot_mapping_valid, csa_idx_slot_mapping_valid,
+                csa_state_slot_mapping_valid, csa_inner_state_slot_mapping_valid,
                 attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
-                x_attn_csa, nt,
+                x_attn_csa_valid,
             )
+        x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_csa = pl.assemble(x_attn_csa, x_attn_csa_valid, [0, 0, 0])
         with pl.scope():
             moe(
                 x_attn_csa,
@@ -567,21 +588,25 @@ def prefill_fwd(
         shared_w3_scale_hca: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [hca_layer * MOE_INTER])
         shared_w2_hca: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [hca_layer * D, 0])
         shared_w2_scale_hca: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [hca_layer * D])
-        x_attn_hca: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_hca_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_hca_valid = pl.slice(x_attn_hca_storage, [token_count, HC_MULT, D], [0, 0, 0])
+        hidden_mid_hca_valid = pl.slice(hidden_mid, [token_count, HC_MULT, D], [0, 0, 0])
         with pl.scope():
             prefill_attention_hca(
-                hidden_mid,
+                hidden_mid_hca_valid,
                 hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca, attn_norm_w_hca,
                 wq_a_hca, wq_b_hca, wq_b_scale_hca, wkv_hca, gamma_cq_hca, gamma_ckv_hca,
                 freqs_cos, freqs_sin,
                 hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                 hca_compress_state_hca, hca_compress_state_block_table,
-                kv_cache_hca, ori_slot_mapping, ori_block_table,
+                kv_cache_hca, ori_slot_mapping_valid, ori_block_table,
                 cmp_kv_hca, cmp_block_table,
-                position_ids, hca_cmp_slot_mapping, hca_state_slot_mapping,
+                position_ids_valid, hca_cmp_slot_mapping_valid, hca_state_slot_mapping_valid,
                 attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
-                x_attn_hca, nt,
+                x_attn_hca_valid,
             )
+        x_attn_hca: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_hca = pl.assemble(x_attn_hca, x_attn_hca_valid, [0, 0, 0])
         with pl.scope():
             moe(
                 x_attn_hca,
@@ -652,10 +677,12 @@ def prefill_fwd(
     shared_w3_scale_last: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer_last * MOE_INTER])
     shared_w2_last: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer_last * D, 0])
     shared_w2_scale_last: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [csa_layer_last * D])
-    x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_last_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_last_valid = pl.slice(x_attn_last_storage, [token_count, HC_MULT, D], [0, 0, 0])
+    hidden_last_valid = pl.slice(hidden, [token_count, HC_MULT, D], [0, 0, 0])
     with pl.scope():
         prefill_attention_csa(
-            hidden,
+            hidden_last_valid,
             hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last, attn_norm_w_last,
             wq_a_last, wq_b_last, wq_b_scale_last, wkv_last, gamma_cq_last, gamma_ckv_last,
             freqs_cos, freqs_sin,
@@ -665,13 +692,15 @@ def prefill_fwd(
             csa_idx_wq_b_last, csa_idx_wq_b_scale_last, csa_weights_proj_last,
             csa_inner_wkv_last, csa_inner_wgate_last, csa_inner_ape_last, csa_inner_norm_w_last,
             csa_inner_compress_state_last, csa_inner_compress_state_block_table,
-            kv_cache_last, ori_block_table, ori_slot_mapping,
+            kv_cache_last, ori_block_table, ori_slot_mapping_valid,
             cmp_kv_last, cmp_block_table, idx_kv_cache_last, idx_kv_scale_last, idx_block_table,
-            position_ids, csa_cmp_slot_mapping, csa_idx_slot_mapping,
-            csa_state_slot_mapping, csa_inner_state_slot_mapping,
+            position_ids_valid, csa_cmp_slot_mapping_valid, csa_idx_slot_mapping_valid,
+            csa_state_slot_mapping_valid, csa_inner_state_slot_mapping_valid,
             attn_sink_last, wo_a_last, wo_b_last, wo_b_scale_last,
-            x_attn_last, nt,
+            x_attn_last_valid,
         )
+    x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_last = pl.assemble(x_attn_last, x_attn_last_valid, [0, 0, 0])
     with pl.scope():
         moe(
             x_attn_last,

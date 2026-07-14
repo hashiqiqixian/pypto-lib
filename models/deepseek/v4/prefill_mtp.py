@@ -151,8 +151,10 @@ def mtp_prefill_fwd(
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
+    token_count = pl.cast(num_tokens, pl.INDEX)
     projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_valid = pl.slice(x_attn_storage, [token_count, HC_MULT, D], [0, 0, 0])
 
     mtp_projection(
         hidden_states, prev_hidden_states,
@@ -162,17 +164,22 @@ def mtp_prefill_fwd(
         projected,
     )
 
+    projected_valid = pl.slice(projected, [token_count, HC_MULT, D], [0, 0, 0])
+    ori_slot_mapping_valid = pl.slice(ori_slot_mapping, [token_count], [0])
+    position_ids_valid = pl.slice(position_ids, [token_count], [0])
     prefill_attention_swa(
-        projected,
+        projected_valid,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
-        kv_cache, ori_block_table, ori_slot_mapping,
-        position_ids,
+        kv_cache, ori_block_table, ori_slot_mapping_valid,
+        position_ids_valid,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        x_attn, nt,
+        x_attn_valid,
     )
 
+    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn = pl.assemble(x_attn, x_attn_valid, [0, 0, 0])
     moe(
         x_attn,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
