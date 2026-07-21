@@ -415,6 +415,14 @@ def qkv_prepare_diagnostic(
                     q_flat,
                 )
 
+                q_rope_normed = pl.row_expand_mul(q_head_dq[:, NOPE_DIM:HEAD_DIM], q_head_inv_rms)
+                q_rope_bf16 = pl.cast(q_rope_normed, target_type=pl.BF16, mode="rint")
+                pl.store(
+                    pl.set_validshape(q_rope_bf16, valid_rows, ROPE_DIM),
+                    [tg, h0 + NOPE_DIM],
+                    q_flat,
+                )
+
 @pl.jit.inline
 def qkv_proj_rope(
     x: pl.Tensor,
