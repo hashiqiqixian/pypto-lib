@@ -134,7 +134,7 @@ def rms_norm_diagnostics(
         pl.store(mean_eps, [tg_idx, tg], diag_mean_eps)
         pl.store(x_inv_rms, [tg_idx, tg], diag_inv_rms)
         pl.store(x_inv_sqrt_recip, [tg_idx, tg], diag_inv_sqrt_recip)
-        x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
+        x_inv_rms_t = pl.reshape(x_inv_sqrt_recip, [T_TILE, 1])
         for apply_db in pl.pipeline(D // D_TILE, stage=2):
             apply_d0 = apply_db * D_TILE
             apply_x_input = pl.load(
