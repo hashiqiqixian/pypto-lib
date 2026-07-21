@@ -45,7 +45,10 @@ def rms_norm(
         valid_rows = pl.min(T_TILE, t_dim - tg)
         row_reduce_tmp = pl.create_tile([T_TILE, D_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
         x_sq_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for rms_db in pl.pipeline(D // D_TILE, stage=2):
+        # row_reduce_tmp is shared by each reduction step. Keep this loop
+        # sequential so adjacent pipeline stages cannot overwrite the scratch
+        # tile before its partial sum is accumulated.
+        for rms_db in pl.range(D // D_TILE):
             rms_d0 = rms_db * D_TILE
             rms_x_input = pl.load(
                 x,
