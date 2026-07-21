@@ -139,9 +139,7 @@ def prefill_attention_swa(
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
     x_normed = pl.create_tensor([num_tokens, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
-    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
-    late_dep = pl.system.task_dummy(deps=[rms_tid])
+    rms_norm(x_mixed, attn_norm_w, x_normed)
 
     rope_cos_t = pl.create_tensor([num_tokens, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([num_tokens, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -153,31 +151,8 @@ def prefill_attention_swa(
         rope_sin_t,
     )
 
-    # Reuse the shared prefill QKV/RoPE projection to stay aligned with decode.
-    q_storage = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    kv_storage = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr_storage = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale_storage = pl.create_tensor([T, 1], dtype=pl.FP32)
-    q = pl.slice(q_storage, [num_tokens, H, HEAD_DIM], [0, 0, 0])
-    kv = pl.slice(kv_storage, [num_tokens, HEAD_DIM], [0, 0])
-    qr = pl.slice(qr_storage, [num_tokens, Q_LORA], [0, 0])
-    qr_scale = pl.slice(qr_scale_storage, [num_tokens, 1], [0, 0])
-    qkv_proj_rope(
-        x_normed, wq_a, wq_b, wq_b_scale, wkv,
-        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale, late_dep,
-    )
-
-    kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cache_write"):
-        for write_t in pl.range(num_tokens):
-            write_row_raw = pl.read(ori_slot_mapping, [write_t])
-            if write_row_raw >= 0:
-                write_row = pl.cast(write_row_raw, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
-
-    # Diagnostic breakpoint: retain QKV/RoPE and KV writeback, then stop before
-    # sparse attention and output projection.
+    # Diagnostic breakpoint: retain Attention RMS and RoPE row materialization,
+    # then stop before QKV projection.
     hc_post_prefill(x_normed, x_hc, post, comb, x_out)
     return kv_cache, x_out
 
@@ -255,38 +230,10 @@ def golden_prefill_attention_swa(tensors):
         "comb": comb,
     })
 
-    q = torch.zeros(num_tokens, H, HEAD_DIM, dtype=torch.bfloat16)
-    kv = torch.zeros(num_tokens, HEAD_DIM, dtype=torch.bfloat16)
-    qr = torch.zeros(num_tokens, Q_LORA, dtype=torch.int8)
-    qr_scale = torch.zeros(num_tokens, 1, dtype=torch.float32)
     x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
     positions = tensors["position_ids"].to(torch.long)
     rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
     rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
-    golden_qkv_proj_rope({
-        "x": x_normed,
-        "wq_a": tensors["wq_a"],
-        "wq_b": tensors["wq_b"],
-        "wq_b_scale": tensors["wq_b_scale"],
-        "wkv": tensors["wkv"],
-        "rope_cos": rope_cos_t,
-        "rope_sin": rope_sin_t,
-        "gamma_cq": tensors["gamma_cq"],
-        "gamma_ckv": tensors["gamma_ckv"],
-        "q": q,
-        "kv": kv,
-        "qr": qr,
-        "qr_scale": qr_scale,
-    })
-
-    kv_cache_in = tensors["kv_cache"].clone()
-    kv_cache_flat = kv_cache_in.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
-    for t in range(num_tokens):
-        dst_row = int(tensors["ori_slot_mapping"][t].item())
-        if dst_row >= 0:
-            kv_cache_flat[dst_row, :] = kv[t]
-
-    tensors["kv_cache"][:] = kv_cache_in
 
     y = torch.zeros(num_tokens, HC_MULT, D, dtype=torch.float32)
     golden_hc_post_prefill({
