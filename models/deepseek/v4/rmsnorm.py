@@ -90,6 +90,69 @@ def rms_norm(
     return rms_tid
 
 
+@pl.jit.inline
+def rms_norm_diagnostics(
+    x: pl.Tensor,
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_normed: pl.Tensor,
+    diag_partial_sq_sum: pl.Tensor,
+    diag_accum_sq_sum: pl.Tensor,
+    diag_inv_rms: pl.Tensor,
+):
+    """Mirror ``rms_norm`` while exposing its reduction dataflow for diagnosis."""
+    t_dim = pl.tensor.dim(x, 0)
+    token_tiles = (t_dim + T_TILE - 1) // T_TILE
+    with pl.spmd(token_tiles, name_hint="rms_norm_diagnostics", allow_early_resolve=True) as rms_tid:
+        tg_idx = pl.tile.get_block_idx()
+        tg = tg_idx * T_TILE
+        valid_rows = pl.min(T_TILE, t_dim - tg)
+        row_reduce_tmp = pl.create_tile([T_TILE, D_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        x_sq_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for rms_db in pl.pipeline(D // D_TILE, stage=2):
+            rms_d0 = rms_db * D_TILE
+            rms_x_input = pl.load(
+                x,
+                [tg, rms_d0],
+                [T_TILE, D_TILE],
+                valid_shapes=[valid_rows, D_TILE],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            rms_x_chunk = pl.cast(rms_x_input, target_type=pl.FP32)
+            partial_sq_sum = pl.reshape(
+                pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk), row_reduce_tmp),
+                [1, T_TILE],
+            )
+            x_sq_sum = pl.add(x_sq_sum, partial_sq_sum)
+            pl.store(partial_sq_sum, [rms_db, tg], diag_partial_sq_sum)
+            pl.store(x_sq_sum, [rms_db, tg], diag_accum_sq_sum)
+
+        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
+        pl.store(x_inv_rms, [tg_idx, tg], diag_inv_rms)
+        x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
+        for apply_db in pl.pipeline(D // D_TILE, stage=2):
+            apply_d0 = apply_db * D_TILE
+            apply_x_input = pl.load(
+                x,
+                [tg, apply_d0],
+                [T_TILE, D_TILE],
+                valid_shapes=[valid_rows, D_TILE],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            apply_x_chunk = pl.cast(apply_x_input, target_type=pl.FP32)
+            norm_w_input = pl.load(
+                norm_w,
+                [apply_d0],
+                [D_TILE],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            norm_w_chunk = pl.cast(pl.reshape(norm_w_input, [1, D_TILE]), pl.FP32)
+            x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
+            x_normed_chunk = pl.cast(x_normed_chunk, target_type=pl.BF16, mode="rint")
+            pl.store(pl.set_validshape(x_normed_chunk, valid_rows, D_TILE), [tg, apply_d0], x_normed)
+
+    return rms_tid
+
+
 @pl.jit
 def rms_norm_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],

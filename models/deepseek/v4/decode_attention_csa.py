@@ -50,7 +50,7 @@ from hc_post import hc_post
 from hc_pre import hc_pre
 from decode_indexer import indexer
 from qkv_proj_rope import qkv_proj_rope
-from rmsnorm import rms_norm
+from rmsnorm import D_TILE as RMS_D_TILE, rms_norm_diagnostics
 from decode_sparse_attn import sparse_attn
 
 # model config
@@ -102,6 +102,7 @@ CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
 CSA_WB_TOKEN_TILE = 8
+RMS_CHUNKS = D // RMS_D_TILE
 
 @pl.jit.inline
 def attention_csa(
@@ -156,6 +157,9 @@ def attention_csa(
     x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     diag_x_mixed: pl.Tensor[[T, D], pl.BF16],
     diag_x_normed: pl.Tensor[[T, D], pl.BF16],
+    diag_rms_partial_sq_sum: pl.Tensor[[RMS_CHUNKS, T], pl.FP32],
+    diag_rms_accum_sq_sum: pl.Tensor[[RMS_CHUNKS, T], pl.FP32],
+    diag_rms_inv: pl.Tensor[[1, T], pl.FP32],
     diag_q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     diag_qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     diag_qr_scale: pl.Tensor[[T, 1], pl.FP32],
@@ -197,7 +201,14 @@ def attention_csa(
             cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
     x_normed_t = diag_x_normed
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    rms_tid = rms_norm_diagnostics(
+        x_mixed,
+        attn_norm_w,
+        x_normed_t,
+        diag_rms_partial_sq_sum,
+        diag_rms_accum_sq_sum,
+        diag_rms_inv,
+    )
     # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj
     # and weights_proj. The latter three take this barrier instead of racing the first:
     # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
@@ -322,6 +333,9 @@ def attention_csa_test(
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     diag_x_mixed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     diag_x_normed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    diag_rms_partial_sq_sum: pl.Out[pl.Tensor[[RMS_CHUNKS, T], pl.FP32]],
+    diag_rms_accum_sq_sum: pl.Out[pl.Tensor[[RMS_CHUNKS, T], pl.FP32]],
+    diag_rms_inv: pl.Out[pl.Tensor[[1, T], pl.FP32]],
     diag_q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
     diag_qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
     diag_qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
@@ -344,7 +358,16 @@ def attention_csa_test(
         state_slot_mapping, inner_state_slot_mapping,
         position_ids, kv_seq_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        x_out, diag_x_mixed, diag_x_normed, diag_q, diag_qr, diag_qr_scale, diag_attn_out,
+        x_out,
+        diag_x_mixed,
+        diag_x_normed,
+        diag_rms_partial_sq_sum,
+        diag_rms_accum_sq_sum,
+        diag_rms_inv,
+        diag_q,
+        diag_qr,
+        diag_qr_scale,
+        diag_attn_out,
     )
     return x_out
 
@@ -399,6 +422,15 @@ def golden_attention_csa(tensors):
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
     x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
     tensors["diag_x_normed"][:] = x_normed
+    rms_partial = x_mixed.float().square().reshape(T, RMS_CHUNKS, RMS_D_TILE).sum(dim=-1).transpose(0, 1)
+    rms_accum = torch.empty_like(rms_partial)
+    running_sq_sum = torch.zeros(1, T, dtype=torch.float32)
+    for rms_chunk in range(RMS_CHUNKS):
+        running_sq_sum = running_sq_sum + rms_partial[rms_chunk : rms_chunk + 1]
+        rms_accum[rms_chunk : rms_chunk + 1] = running_sq_sum
+    tensors["diag_rms_partial_sq_sum"][:] = rms_partial
+    tensors["diag_rms_accum_sq_sum"][:] = rms_accum
+    tensors["diag_rms_inv"][:] = torch.rsqrt(running_sq_sum * (1.0 / D) + EPS)
     golden_qkv_proj_rope({
         "x": x_normed,
         "wq_a": tensors["wq_a"],
@@ -885,6 +917,9 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("x_out", [T, HC_MULT, D], torch.float32, is_output=True),
         TensorSpec("diag_x_mixed", [T, D], torch.bfloat16, is_output=True),
         TensorSpec("diag_x_normed", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("diag_rms_partial_sq_sum", [RMS_CHUNKS, T], torch.float32, is_output=True),
+        TensorSpec("diag_rms_accum_sq_sum", [RMS_CHUNKS, T], torch.float32, is_output=True),
+        TensorSpec("diag_rms_inv", [1, T], torch.float32, is_output=True),
         TensorSpec("diag_q", [T, H, HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("diag_qr", [T, Q_LORA], torch.int8, is_output=True),
         TensorSpec("diag_qr_scale", [T, 1], torch.float32, is_output=True),
@@ -930,6 +965,9 @@ if __name__ == "__main__":
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "diag_x_mixed": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_x_normed": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
+            "diag_rms_partial_sq_sum": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
+            "diag_rms_accum_sq_sum": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
+            "diag_rms_inv": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_q": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "diag_qr": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
