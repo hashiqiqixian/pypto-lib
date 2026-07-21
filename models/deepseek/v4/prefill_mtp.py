@@ -81,7 +81,7 @@ MTP_LAYER_ID = M.num_hidden_layers
 MTP_MOE_EPOCH = 1
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def mtp_prefill_fwd(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
     prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -156,13 +156,14 @@ def mtp_prefill_fwd(
     x_attn_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn_valid = pl.slice(x_attn_storage, [token_count, HC_MULT, D], [0, 0, 0])
 
-    mtp_projection(
-        hidden_states, prev_hidden_states,
-        enorm_w, hnorm_w,
-        e_proj_w, e_proj_w_scale, e_proj_smooth,
-        h_proj_w, h_proj_w_scale, h_proj_smooth,
-        projected,
-    )
+    with pl.scope():
+        mtp_projection(
+            hidden_states, prev_hidden_states,
+            enorm_w, hnorm_w,
+            e_proj_w, e_proj_w_scale, e_proj_smooth,
+            h_proj_w, h_proj_w_scale, h_proj_smooth,
+            projected,
+        )
 
     projected_valid = pl.slice(projected, [token_count, HC_MULT, D], [0, 0, 0])
     ori_slot_mapping_valid = pl.slice(ori_slot_mapping, [token_count], [0])
