@@ -159,6 +159,8 @@ def attention_csa(
     diag_q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     diag_qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     diag_qr_scale: pl.Tensor[[T, 1], pl.FP32],
+    diag_kv: pl.Tensor[[T, HEAD_DIM], pl.BF16],
+    diag_idx_topk: pl.Tensor[[B, S, INDEXER_SCORE_LEN], pl.INT32],
     diag_attn_out: pl.Tensor[[T, D], pl.BF16],
 ):
     x_mixed = diag_x_mixed
@@ -203,7 +205,7 @@ def attention_csa(
     # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = diag_q
-    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    kv = diag_kv
     qr = diag_qr
     qr_scale = diag_qr_scale
     qkv_proj_rope(
@@ -240,7 +242,7 @@ def attention_csa(
 
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
     idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
-    idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
+    idx_topk_full = diag_idx_topk
     indexer(
         x_normed, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
         weights_proj, step_cos, step_sin, hadamard_idx,
@@ -301,7 +303,7 @@ def attention_csa_test(
     inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
     inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
@@ -325,6 +327,8 @@ def attention_csa_test(
     diag_q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
     diag_qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
     diag_qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
+    diag_kv: pl.Out[pl.Tensor[[T, HEAD_DIM], pl.BF16]],
+    diag_idx_topk: pl.Out[pl.Tensor[[B, S, INDEXER_SCORE_LEN], pl.INT32]],
     diag_attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     attention_csa(
@@ -344,7 +348,8 @@ def attention_csa_test(
         state_slot_mapping, inner_state_slot_mapping,
         position_ids, kv_seq_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        x_out, diag_x_mixed, diag_x_normed, diag_q, diag_qr, diag_qr_scale, diag_attn_out,
+        x_out, diag_x_mixed, diag_x_normed, diag_q, diag_qr, diag_qr_scale,
+        diag_kv, diag_idx_topk, diag_attn_out,
     )
     return x_out
 
@@ -417,6 +422,7 @@ def golden_attention_csa(tensors):
     tensors["diag_q"][:] = q
     tensors["diag_qr"][:] = qr_i8
     tensors["diag_qr_scale"][:] = qr_scale
+    tensors["diag_kv"][:] = kv
 
     kv_cache = tensors["kv_cache"]
     window_swa_indices = tensors["window_swa_indices"]
@@ -473,6 +479,7 @@ def golden_attention_csa(tensors):
         "kv_seq_lens": tensors["kv_seq_lens"],
         "offset": torch.tensor(0, dtype=torch.int32),
     })
+    tensors["diag_idx_topk"][:] = idx_topk_full
 
     ori_slot_mapping = tensors["ori_slot_mapping"].to(torch.int64)
     for t in range(T):
@@ -864,7 +871,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
         TensorSpec("inner_compress_state_block_table", [B, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
-        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv, is_output=True),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: shared_idx_kv_cache_i8.clone()),
         TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: shared_idx_kv_scale.clone()),
@@ -888,6 +895,8 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("diag_q", [T, H, HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("diag_qr", [T, Q_LORA], torch.int8, is_output=True),
         TensorSpec("diag_qr_scale", [T, 1], torch.float32, is_output=True),
+        TensorSpec("diag_kv", [T, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("diag_idx_topk", [B, S, INDEXER_SCORE_LEN], torch.int32, is_output=True),
         TensorSpec("diag_attn_out", [T, D], torch.bfloat16, is_output=True),
     ]
 
@@ -933,6 +942,9 @@ if __name__ == "__main__":
             "diag_q": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "diag_qr": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "diag_kv": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
+            "cmp_kv": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
+            "diag_idx_topk": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
