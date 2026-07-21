@@ -133,7 +133,8 @@ def qkv_proj_rope(
     # rebuild the same arange/cast/gather chain on their critical AIV path.
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
-    q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
+    # TGATHER executes the full physical tile, so tail rows also need valid indices.
+    q_rope_swap_idx = pl.create_tensor([T_MAX, ROPE_DIM], dtype=pl.INT32)
     for qrp_idx in pl.spmd(
         (t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE,
         name_hint="q_rope_prepare",
@@ -202,11 +203,7 @@ def qkv_proj_rope(
             [qrp_t0, 0],
             q_rope_sin_signed,
         )
-        pl.store(
-            pl.set_validshape(qrp_swap_idx, qrp_valid_rows, ROPE_DIM),
-            [qrp_t0, 0],
-            q_rope_swap_idx,
-        )
+        pl.store(qrp_swap_idx, [qrp_t0, 0], q_rope_swap_idx)
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
     # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
@@ -403,7 +400,6 @@ def qkv_proj_rope(
                 q_rope_swap_idx,
                 [tg, 0],
                 [Q_ROPE_T_TILE, ROPE_DIM],
-                valid_shapes=[valid_rows, ROPE_DIM],
                 target_memory=pl.MemorySpace.Vec,
             )
             q_head_reduce_tmp = pl.create_tile(
