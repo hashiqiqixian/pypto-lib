@@ -365,7 +365,6 @@ def qkv_prepare_diagnostic(
     for hg_idx in pl.spmd(
         H // Q_ROPE_H_TILE,
         name_hint="qproj_dequant_rms_nope_rope",
-        allow_early_resolve=True,
     ):
         hg = hg_idx * Q_ROPE_H_TILE
         for tg_idx in pl.range((t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE):
