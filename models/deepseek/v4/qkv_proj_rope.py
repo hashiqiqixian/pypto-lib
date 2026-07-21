@@ -514,8 +514,75 @@ def qkv_proj_rope(
     # dispatch. NOPE columns [0:NOPE_DIM) and rope columns [NOPE_DIM:HEAD_DIM) are
     # disjoint, so each task writes a clean, conflict-free row block of kv. Vec UB stays
     # well under the 192 KB cap (chunks are at most [KV_RMS_T_TILE, KV_TILE] fp32).
-    for tg_idx in pl.spmd((t_dim + KV_RMS_T_TILE - 1) // KV_RMS_T_TILE, name_hint="kv_rms_norm_rope"):
+    full_kv_tiles = t_dim // KV_RMS_T_TILE
+    for tg_idx in pl.spmd(full_kv_tiles, name_hint="kv_rms_norm_rope"):
         tg = tg_idx * KV_RMS_T_TILE
+        # Preserve the established Tensor-level reduction and RoPE path for
+        # complete token tiles. Only a non-aligned final tile needs the
+        # explicit Tile load/store path below.
+        kv_sq_sum = pl.full([1, KV_RMS_T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(HEAD_DIM // KV_TILE, stage=2):
+            kv_sq_col0 = kb * KV_TILE
+            kv_chunk = kv_fp32[tg : tg + KV_RMS_T_TILE, kv_sq_col0 : kv_sq_col0 + KV_TILE]
+            kv_sq_sum = pl.add(
+                kv_sq_sum,
+                pl.reshape(pl.row_sum(pl.mul(kv_chunk, kv_chunk)), [1, KV_RMS_T_TILE]),
+            )
+        kv_inv_rms = pl.rsqrt(pl.add(pl.mul(kv_sq_sum, 1.0 / HEAD_DIM), EPS), high_precision=True)
+        kv_inv_rms_t = pl.reshape(kv_inv_rms, [KV_RMS_T_TILE, 1])
+
+        for nb in pl.pipeline(NOPE_DIM // KV_TILE, stage=2):
+            n0 = nb * KV_TILE
+            kv_chunk = kv_fp32[tg : tg + KV_RMS_T_TILE, n0 : n0 + KV_TILE]
+            gamma_kv_cast = pl.cast(gamma_ckv[n0 : n0 + KV_TILE], target_type=pl.FP32)
+            gamma_kv_chunk = pl.reshape(gamma_kv_cast, [1, KV_TILE])
+            kv_normed = pl.col_expand_mul(pl.row_expand_mul(kv_chunk, kv_inv_rms_t), gamma_kv_chunk)
+            kv_view[tg : tg + KV_RMS_T_TILE, n0 : n0 + KV_TILE] = pl.cast(
+                kv_normed, target_type=pl.BF16, mode="rint"
+            )
+
+        gamma_rope_cast = pl.cast(gamma_ckv[NOPE_DIM : NOPE_DIM + ROPE_DIM], target_type=pl.FP32)
+        gamma_rope = pl.reshape(gamma_rope_cast, [1, ROPE_DIM])
+        kv_rope_chunk = kv_fp32[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
+        kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_inv_rms_t), gamma_rope)
+        kv_ones = pl.full([KV_RMS_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        kv_col = pl.col_expand_mul(
+            kv_ones,
+            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32),
+        )
+        kv_dup_f = pl.cast(
+            pl.cast(pl.mul(kv_col, 0.5), target_type=pl.INT32, mode="trunc"),
+            target_type=pl.FP32,
+        )
+        kv_dup_idx = pl.cast(kv_dup_f, target_type=pl.INT32)
+        kv_lane = pl.sub(kv_col, pl.mul(kv_dup_f, 2.0))
+        kv_swap_idx = pl.cast(
+            pl.sub(pl.add(kv_col, 1.0), pl.mul(kv_lane, 2.0)),
+            target_type=pl.INT32,
+        )
+        kv_sign = pl.sub(pl.mul(kv_lane, 2.0), 1.0)
+        kv_cos_il = pl.gather(
+            pl.cast(rope_cos_view[tg : tg + KV_RMS_T_TILE, :], target_type=pl.FP32),
+            dim=-1,
+            index=kv_dup_idx,
+        )
+        kv_sin_il = pl.gather(
+            pl.cast(rope_sin_view[tg : tg + KV_RMS_T_TILE, :], target_type=pl.FP32),
+            dim=-1,
+            index=kv_dup_idx,
+        )
+        kv_swapped = pl.gather(kv_rope_norm_chunk, dim=-1, index=kv_swap_idx)
+        kv_rope_rot = pl.add(
+            pl.mul(kv_rope_norm_chunk, kv_cos_il),
+            pl.mul(pl.mul(kv_swapped, kv_sign), kv_sin_il),
+        )
+        kv_view[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(
+            kv_rope_rot, target_type=pl.BF16, mode="rint"
+        )
+
+    tail_kv_tiles = (t_dim + KV_RMS_T_TILE - 1) // KV_RMS_T_TILE - full_kv_tiles
+    for tail_idx in pl.spmd(tail_kv_tiles, name_hint="kv_rms_norm_rope_tail"):
+        tg = (full_kv_tiles + tail_idx) * KV_RMS_T_TILE
         valid_rows = pl.min(KV_RMS_T_TILE, t_dim - tg)
         kv_reduce_tmp = pl.create_tile(
             [KV_RMS_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
