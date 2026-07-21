@@ -584,51 +584,57 @@ def qkv_proj_rope(
     for tail_idx in pl.spmd(tail_kv_tiles, name_hint="kv_rms_norm_rope_tail"):
         tg = (full_kv_tiles + tail_idx) * KV_RMS_T_TILE
         valid_rows = pl.min(KV_RMS_T_TILE, t_dim - tg)
-        kv_reduce_tmp = pl.create_tile(
+        tail_reduce_tmp = pl.create_tile(
             [KV_RMS_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
         )
-        kv_gather_tmp = pl.create_tile(
+        tail_gather_tmp = pl.create_tile(
             [KV_RMS_T_TILE, ROPE_DIM], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
         )
         # Pass 1: per-row sum of squares over the full HEAD_DIM -> inv_rms.
-        kv_sq_sum = pl.tile.full([1, KV_RMS_T_TILE], dtype=pl.FP32, value=0.0)
+        tail_sq_sum = pl.tile.full([1, KV_RMS_T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HEAD_DIM // KV_TILE, stage=2):
-            kv_sq_col0 = kb * KV_TILE
-            kv_chunk = pl.load(
+            tail_sq_col0 = kb * KV_TILE
+            tail_sq_chunk = pl.load(
                 kv_fp32,
-                [tg, kv_sq_col0],
+                [tg, tail_sq_col0],
                 [KV_RMS_T_TILE, KV_TILE],
                 valid_shapes=[valid_rows, KV_TILE],
                 target_memory=pl.MemorySpace.Vec,
             )
-            kv_sq_sum = pl.add(
-                kv_sq_sum,
-                pl.reshape(pl.row_sum(pl.mul(kv_chunk, kv_chunk), kv_reduce_tmp), [1, KV_RMS_T_TILE]),
+            tail_sq_sum = pl.add(
+                tail_sq_sum,
+                pl.reshape(
+                    pl.row_sum(pl.mul(tail_sq_chunk, tail_sq_chunk), tail_reduce_tmp),
+                    [1, KV_RMS_T_TILE],
+                ),
             )
-        kv_inv_rms = pl.rsqrt(pl.add(pl.mul(kv_sq_sum, 1.0 / HEAD_DIM), EPS), high_precision=True)
-        kv_inv_rms_t = pl.reshape(kv_inv_rms, [KV_RMS_T_TILE, 1])
+        tail_inv_rms = pl.rsqrt(pl.add(pl.mul(tail_sq_sum, 1.0 / HEAD_DIM), EPS), high_precision=True)
+        tail_inv_rms_t = pl.reshape(tail_inv_rms, [KV_RMS_T_TILE, 1])
 
         # NOPE writeback: rms-normalize columns [0:NOPE_DIM) with per-column gamma.
         for nb in pl.pipeline(NOPE_DIM // KV_TILE, stage=2):
             n0 = nb * KV_TILE
-            kv_chunk = pl.load(
+            tail_nope_chunk = pl.load(
                 kv_fp32,
                 [tg, n0],
                 [KV_RMS_T_TILE, KV_TILE],
                 valid_shapes=[valid_rows, KV_TILE],
                 target_memory=pl.MemorySpace.Vec,
             )
-            gamma_kv_input = pl.load(
+            tail_gamma_kv_input = pl.load(
                 gamma_ckv,
                 [n0],
                 [KV_TILE],
                 target_memory=pl.MemorySpace.Vec,
             )
-            gamma_kv_cast = pl.cast(gamma_kv_input, target_type=pl.FP32)
-            gamma_kv_chunk = pl.reshape(gamma_kv_cast, [1, KV_TILE])
-            kv_normed = pl.col_expand_mul(pl.row_expand_mul(kv_chunk, kv_inv_rms_t), gamma_kv_chunk)
-            kv_nope_out = pl.cast(kv_normed, target_type=pl.BF16, mode="rint")
-            pl.store(pl.set_validshape(kv_nope_out, valid_rows, KV_TILE), [tg, n0], kv_view)
+            tail_gamma_kv_cast = pl.cast(tail_gamma_kv_input, target_type=pl.FP32)
+            tail_gamma_kv_chunk = pl.reshape(tail_gamma_kv_cast, [1, KV_TILE])
+            tail_nope_normed = pl.col_expand_mul(
+                pl.row_expand_mul(tail_nope_chunk, tail_inv_rms_t),
+                tail_gamma_kv_chunk,
+            )
+            tail_nope_out = pl.cast(tail_nope_normed, target_type=pl.BF16, mode="rint")
+            pl.store(pl.set_validshape(tail_nope_out, valid_rows, KV_TILE), [tg, n0], kv_view)
 
         # RoPE writeback on columns [NOPE_DIM:HEAD_DIM), interleaved (CANN A3) swap-gather
         # (same form as qproj_dequant_rms_nope_rope), built in-kernel. inv_rms (per-row, the same
@@ -636,31 +642,37 @@ def qkv_proj_rope(
         # kv_rope_norm_chunk BEFORE the swap so the swapped lane n[j^1] carries gamma[j^1]
         # (gamma does NOT commute with the rotation; inv_rms does).
         #   out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]
-        gamma_rope_input = pl.load(
+        tail_gamma_rope_input = pl.load(
             gamma_ckv,
             [NOPE_DIM],
             [ROPE_DIM],
             target_memory=pl.MemorySpace.Vec,
         )
-        gamma_rope_cast = pl.cast(gamma_rope_input, target_type=pl.FP32)
-        gamma_rope = pl.reshape(gamma_rope_cast, [1, ROPE_DIM])
-        kv_rope_chunk = pl.load(
+        tail_gamma_rope_cast = pl.cast(tail_gamma_rope_input, target_type=pl.FP32)
+        tail_gamma_rope = pl.reshape(tail_gamma_rope_cast, [1, ROPE_DIM])
+        tail_rope_chunk = pl.load(
             kv_fp32,
             [tg, NOPE_DIM],
             [KV_RMS_T_TILE, ROPE_DIM],
             valid_shapes=[valid_rows, ROPE_DIM],
             target_memory=pl.MemorySpace.Vec,
         )
-        kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_inv_rms_t), gamma_rope)
-        kv_ones = pl.tile.full([KV_RMS_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        kv_col = pl.col_expand_mul(
-            kv_ones,
+        tail_rope_norm_chunk = pl.col_expand_mul(
+            pl.row_expand_mul(tail_rope_chunk, tail_inv_rms_t),
+            tail_gamma_rope,
+        )
+        tail_ones = pl.tile.full([KV_RMS_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        tail_col = pl.col_expand_mul(
+            tail_ones,
             pl.cast(pl.tile.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32),
         )
-        kv_dup_f = pl.cast(pl.cast(pl.mul(kv_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        kv_lane = pl.sub(kv_col, pl.mul(kv_dup_f, 2.0))                                            # j%2
-        kv_swap_f = pl.sub(pl.add(kv_col, 1.0), pl.mul(kv_lane, 2.0))                              # j^1
-        kv_row_seed = pl.cast(
+        tail_dup_f = pl.cast(
+            pl.cast(pl.mul(tail_col, 0.5), target_type=pl.INT32, mode="trunc"),
+            target_type=pl.FP32,
+        )
+        tail_lane = pl.sub(tail_col, pl.mul(tail_dup_f, 2.0))
+        tail_swap_f = pl.sub(pl.add(tail_col, 1.0), pl.mul(tail_lane, 2.0))
+        tail_row_seed = pl.cast(
             pl.mul(
                 pl.cast(
                     pl.tile.arange(0, [1, KV_RMS_T_TILE], dtype=pl.INT32),
@@ -670,34 +682,41 @@ def qkv_proj_rope(
             ),
             target_type=pl.INT32,
         )
-        kv_row_grid = pl.col_expand_mul(
+        tail_row_grid = pl.col_expand_mul(
             pl.tile.full([ROPE_DIM, KV_RMS_T_TILE], dtype=pl.INT32, value=1),
-            kv_row_seed,
+            tail_row_seed,
         )
-        kv_row_offset = pl.transpose(kv_row_grid, axis1=0, axis2=1)
-        kv_dup_idx = pl.add(pl.cast(kv_dup_f, target_type=pl.INT32), kv_row_offset)
-        kv_swap_idx = pl.add(pl.cast(kv_swap_f, target_type=pl.INT32), kv_row_offset)
-        kv_sign = pl.sub(pl.mul(kv_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        kv_cos_rows = pl.load(
+        tail_row_offset = pl.transpose(tail_row_grid, axis1=0, axis2=1)
+        tail_dup_idx = pl.add(pl.cast(tail_dup_f, target_type=pl.INT32), tail_row_offset)
+        tail_swap_idx = pl.add(pl.cast(tail_swap_f, target_type=pl.INT32), tail_row_offset)
+        tail_sign = pl.sub(pl.mul(tail_lane, 2.0), 1.0)
+        tail_cos_rows = pl.load(
             rope_cos_view,
             [tg, 0],
             [KV_RMS_T_TILE, ROPE_DIM],
             valid_shapes=[valid_rows, ROPE_DIM],
             target_memory=pl.MemorySpace.Vec,
         )
-        kv_sin_rows = pl.load(
+        tail_sin_rows = pl.load(
             rope_sin_view,
             [tg, 0],
             [KV_RMS_T_TILE, ROPE_DIM],
             valid_shapes=[valid_rows, ROPE_DIM],
             target_memory=pl.MemorySpace.Vec,
         )
-        kv_cos_il = pl.tile.gather(pl.cast(kv_cos_rows, target_type=pl.FP32), kv_dup_idx, kv_gather_tmp)
-        kv_sin_il = pl.tile.gather(pl.cast(kv_sin_rows, target_type=pl.FP32), kv_dup_idx, kv_gather_tmp)
-        kv_swapped = pl.tile.gather(kv_rope_norm_chunk, kv_swap_idx, kv_gather_tmp)
-        kv_rope_rot = pl.add(pl.mul(kv_rope_norm_chunk, kv_cos_il), pl.mul(pl.mul(kv_swapped, kv_sign), kv_sin_il))
-        kv_rope_i16 = pl.cast(kv_rope_rot, target_type=pl.BF16, mode="rint")
-        pl.store(pl.set_validshape(kv_rope_i16, valid_rows, ROPE_DIM), [tg, NOPE_DIM], kv_view)
+        tail_cos_il = pl.tile.gather(
+            pl.cast(tail_cos_rows, target_type=pl.FP32), tail_dup_idx, tail_gather_tmp
+        )
+        tail_sin_il = pl.tile.gather(
+            pl.cast(tail_sin_rows, target_type=pl.FP32), tail_dup_idx, tail_gather_tmp
+        )
+        tail_swapped = pl.tile.gather(tail_rope_norm_chunk, tail_swap_idx, tail_gather_tmp)
+        tail_rope_rot = pl.add(
+            pl.mul(tail_rope_norm_chunk, tail_cos_il),
+            pl.mul(pl.mul(tail_swapped, tail_sign), tail_sin_il),
+        )
+        tail_rope_out = pl.cast(tail_rope_rot, target_type=pl.BF16, mode="rint")
+        pl.store(pl.set_validshape(tail_rope_out, valid_rows, ROPE_DIM), [tg, NOPE_DIM], kv_view)
 
     return q
 
