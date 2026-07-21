@@ -150,25 +150,14 @@ def mtp_prefill_fwd(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
-    nt: pl.Scalar[pl.INT32] = num_tokens
     token_count = pl.cast(num_tokens, pl.INDEX)
-    projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_hc_valid = pl.slice(prev_hidden_states, [token_count, HC_MULT, D], [0, 0, 0])
     x_attn_valid = pl.slice(x_attn_storage, [token_count, HC_MULT, D], [0, 0, 0])
-
-    mtp_projection(
-        hidden_states, prev_hidden_states,
-        enorm_w, hnorm_w,
-        e_proj_w, e_proj_w_scale, e_proj_smooth,
-        h_proj_w, h_proj_w_scale, h_proj_smooth,
-        projected,
-    )
-
-    projected_valid = pl.slice(projected, [token_count, HC_MULT, D], [0, 0, 0])
     ori_slot_mapping_valid = pl.slice(ori_slot_mapping, [token_count], [0])
     position_ids_valid = pl.slice(position_ids, [token_count], [0])
     prefill_attention_swa(
-        projected_valid,
+        x_hc_valid,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
@@ -178,22 +167,9 @@ def mtp_prefill_fwd(
         x_attn_valid,
     )
 
-    moe(
-        x_attn_valid,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        norm_w, gate_w, gate_bias, tid2eid, input_ids,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        pre_hc_hidden_out,
-        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
-        pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
-    )
-
+    pre_hc_hidden_out[:, :, :] = x_attn_storage
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
-    hc_head(pre_hc_hidden_out, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
+    hc_head(x_attn_storage, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
     rms_norm(x_head, mtp_norm_w, hidden_out)
     return hidden_out
 
@@ -482,26 +458,10 @@ def golden_mtp_prefill_fwd(tensors):
 
     num_tokens = int(tensors["num_tokens"])
 
-    projected = torch.zeros_like(tensors["prev_hidden_states"])
-    for rank in range(N_RANKS):
-        golden_mtp_projection({
-            "hidden_states": tensors["hidden_states"][rank],
-            "prev_hidden_states": tensors["prev_hidden_states"][rank],
-            "enorm_w": tensors["enorm_w"][rank],
-            "hnorm_w": tensors["hnorm_w"][rank],
-            "e_proj_w": tensors["e_proj_w"][rank],
-            "e_proj_w_scale": tensors["e_proj_w_scale"][rank],
-            "e_proj_smooth": tensors["e_proj_smooth"][rank],
-            "h_proj_w": tensors["h_proj_w"][rank],
-            "h_proj_w_scale": tensors["h_proj_w_scale"][rank],
-            "h_proj_smooth": tensors["h_proj_smooth"][rank],
-            "hidden_states_out": projected[rank],
-        })
-
-    x_attn = torch.zeros_like(projected)
+    x_attn = torch.zeros_like(tensors["prev_hidden_states"])
     for rank in range(N_RANKS):
         golden_prefill_attention_swa({
-            "x_hc": projected[rank, :num_tokens],
+            "x_hc": tensors["prev_hidden_states"][rank, :num_tokens],
             "hc_attn_fn": tensors["hc_attn_fn"][rank],
             "hc_attn_scale": tensors["hc_attn_scale"][rank],
             "hc_attn_base": tensors["hc_attn_base"][rank],
@@ -526,16 +486,10 @@ def golden_mtp_prefill_fwd(tensors):
             "num_tokens": num_tokens,
         })
 
-    moe_tensors = dict(tensors)
-    moe_tensors["x_hc"] = x_attn
-    moe_tensors["x_next"] = tensors["pre_hc_hidden_out"]
-    moe_tensors["layer_id"] = MTP_LAYER_ID
-    moe_tensors["num_tokens"] = num_tokens
-    golden_moe(moe_tensors)
-
+    tensors["pre_hc_hidden_out"].copy_(x_attn)
     for rank in range(N_RANKS):
         x_head = _golden_hc_head_prefill(
-            tensors["pre_hc_hidden_out"][rank],
+            x_attn[rank],
             tensors["mtp_hc_head_fn"][rank],
             tensors["mtp_hc_head_scale"][rank],
             tensors["mtp_hc_head_base"][rank],
