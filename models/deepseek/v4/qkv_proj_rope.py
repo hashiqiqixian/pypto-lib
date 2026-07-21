@@ -127,7 +127,7 @@ def qkv_prepare_diagnostic(
 
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
-    q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
+    q_rope_swap_idx = pl.create_tensor([T_MAX, ROPE_DIM], dtype=pl.INT32)
     for qrp_idx in pl.spmd(
         (t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE,
         name_hint="q_rope_prepare",
@@ -196,11 +196,7 @@ def qkv_prepare_diagnostic(
             [qrp_t0, 0],
             q_rope_sin_signed,
         )
-        pl.store(
-            pl.set_validshape(qrp_swap_idx, qrp_valid_rows, ROPE_DIM),
-            [qrp_t0, 0],
-            q_rope_swap_idx,
-        )
+        pl.store(qrp_swap_idx, [qrp_t0, 0], q_rope_swap_idx)
 
     qr_fp32 = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.FP32)
     qr_i8_matmul = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.INT8)
@@ -396,7 +392,6 @@ def qkv_prepare_diagnostic(
                 q_rope_swap_idx,
                 [tg, 0],
                 [Q_ROPE_T_TILE, ROPE_DIM],
-                valid_shapes=[valid_rows, ROPE_DIM],
                 target_memory=pl.MemorySpace.Vec,
             )
             q_head_reduce_tmp = pl.create_tile(
