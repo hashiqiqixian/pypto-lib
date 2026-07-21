@@ -154,8 +154,12 @@ def attention_csa(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    diag_x_mixed: pl.Tensor[[T, D], pl.BF16],
+    diag_x_normed: pl.Tensor[[T, D], pl.BF16],
+    diag_q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    diag_attn_out: pl.Tensor[[T, D], pl.BF16],
 ):
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_mixed = diag_x_mixed
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
@@ -190,13 +194,13 @@ def attention_csa(
             cmp_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
             cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
-    x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_normed_t = diag_x_normed
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
     # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj
     # and weights_proj. The latter three take this barrier instead of racing the first:
     # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
-    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
+    q = diag_q
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
@@ -251,7 +255,7 @@ def attention_csa(
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
     position_ids_t1 = pl.reshape(position_ids, [T, 1])
 
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    attn_out = diag_attn_out
     sparse_attn(
         q, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk_flat, position_ids_t1,
@@ -314,6 +318,10 @@ def attention_csa_test(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    diag_x_mixed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    diag_x_normed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    diag_q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
+    diag_attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     attention_csa(
         x_hc,
@@ -332,7 +340,7 @@ def attention_csa_test(
         state_slot_mapping, inner_state_slot_mapping,
         position_ids, kv_seq_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        x_out,
+        x_out, diag_x_mixed, diag_x_normed, diag_q, diag_attn_out,
     )
     return x_out
 
@@ -361,6 +369,7 @@ def golden_attention_csa(tensors):
         "post": post_t,
         "comb": comb_t,
     })
+    tensors["diag_x_mixed"][:] = x_mixed
 
     position_ids = tensors["position_ids"].to(torch.int64)
     position_ids_bsd = position_ids.reshape(B, S).to(torch.int32).contiguous()
@@ -385,6 +394,7 @@ def golden_attention_csa(tensors):
     qr_i8 = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
     x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
+    tensors["diag_x_normed"][:] = x_normed
     golden_qkv_proj_rope({
         "x": x_normed,
         "wq_a": tensors["wq_a"],
@@ -400,6 +410,7 @@ def golden_attention_csa(tensors):
         "qr": qr_i8,
         "qr_scale": qr_scale,
     })
+    tensors["diag_q"][:] = q
 
     kv_cache = tensors["kv_cache"]
     window_swa_indices = tensors["window_swa_indices"]
@@ -486,6 +497,7 @@ def golden_attention_csa(tensors):
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
     })
+    tensors["diag_attn_out"][:] = attn_out
 
     y = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
     golden_hc_post({
@@ -865,6 +877,10 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [T, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("diag_x_mixed", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("diag_x_normed", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("diag_q", [T, H, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("diag_attn_out", [T, D], torch.bfloat16, is_output=True),
     ]
 
 
@@ -904,6 +920,10 @@ if __name__ == "__main__":
             # Tightened from CANN's 1e-2 bar while allowing one BF16 step around unit-scale values.
             "x_out": ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_x_normed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_q": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
     if not result.passed:
