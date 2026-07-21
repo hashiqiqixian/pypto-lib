@@ -156,9 +156,22 @@ def prefill_attention_swa(
         rope_sin_t,
     )
 
-    # Diagnostic breakpoint: add only the QKV pad and RoPE preparation stages.
+    # Diagnostic breakpoint: add QKV preparation and the complete QR chain.
     x_matmul = pl.create_tensor([T, D], dtype=pl.BF16)
-    qkv_prepare_diagnostic(x_normed, rope_cos_t, rope_sin_t, x_matmul)
+    qr_storage = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+    qr_scale_storage = pl.create_tensor([T, 1], dtype=pl.FP32)
+    qr = pl.slice(qr_storage, [num_tokens, Q_LORA], [0, 0])
+    qr_scale = pl.slice(qr_scale_storage, [num_tokens, 1], [0, 0])
+    qkv_prepare_diagnostic(
+        x_normed,
+        wq_a,
+        rope_cos_t,
+        rope_sin_t,
+        gamma_cq,
+        qr,
+        qr_scale,
+        x_matmul,
+    )
     x_matmul_valid = pl.slice(x_matmul, [num_tokens, D], [0, 0])
     hc_post_prefill(x_matmul_valid, x_hc, post, comb, x_out)
     return kv_cache, x_out
