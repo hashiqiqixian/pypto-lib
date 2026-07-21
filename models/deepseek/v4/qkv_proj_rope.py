@@ -99,6 +99,7 @@ def materialize_rope_rows(
 def qkv_prepare_diagnostic(
     x: pl.Tensor,
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -327,6 +328,36 @@ def qkv_prepare_diagnostic(
             qr_q_out = pl.set_validshape(qr_q_i8, valid_rows, QUANT_TILE)
             pl.store(qr_q_out, [tg, qa], qr_view)
             pl.store(qr_q_out, [tg, qa], qr_i8_matmul)
+
+    q_proj_i32 = pl.create_tensor([T_MAX, H * HEAD_DIM], dtype=pl.INT32)
+    for hg_idx in pl.spmd(
+        (H * HEAD_DIM) // QPROJ_MM_N_TILE,
+        name_hint="qproj_matmul",
+        allow_early_resolve=True,
+    ):
+        w_col0 = hg_idx * QPROJ_MM_N_TILE
+        for tc in pl.range(t_matmul // QPROJ_M_TILE):
+            t0 = tc * QPROJ_M_TILE
+            col_acc = pl.create_tile(
+                [QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc
+            )
+            for qb in pl.pipeline(0, Q_LORA // Q_PROJ_TILE, stage=1):
+                qr_proj_col0 = qb * Q_PROJ_TILE
+                qr_i8_chunk = pl.load(
+                    qr_i8_matmul,
+                    [t0, qr_proj_col0],
+                    [QPROJ_M_TILE, Q_PROJ_TILE],
+                )
+                wq_chunk = pl.load(
+                    wq_b,
+                    [qr_proj_col0, w_col0],
+                    [Q_PROJ_TILE, QPROJ_MM_N_TILE],
+                )
+                if qr_proj_col0 == 0:
+                    col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
+                else:
+                    col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
+            pl.store(col_acc, [t0, w_col0], q_proj_i32)
 
 @pl.jit.inline
 def qkv_proj_rope(
