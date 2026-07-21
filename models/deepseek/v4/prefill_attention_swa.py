@@ -30,7 +30,12 @@ from config import (
 )
 from hc_post import golden_hc_post_prefill, hc_post_prefill
 from hc_pre import golden_hc_pre, hc_pre
-from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
+from qkv_proj_rope import (
+    golden_qkv_proj_rope,
+    materialize_rope_rows,
+    qkv_prepare_diagnostic,
+    qkv_proj_rope,
+)
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
     _quant_w_per_channel,
@@ -151,9 +156,11 @@ def prefill_attention_swa(
         rope_sin_t,
     )
 
-    # Diagnostic breakpoint: retain Attention RMS and RoPE row materialization,
-    # then stop before QKV projection.
-    hc_post_prefill(x_normed, x_hc, post, comb, x_out)
+    # Diagnostic breakpoint: add only the QKV pad and RoPE preparation stages.
+    x_matmul = pl.create_tensor([T, D], dtype=pl.BF16)
+    qkv_prepare_diagnostic(x_normed, rope_cos_t, rope_sin_t, x_matmul)
+    x_matmul_valid = pl.slice(x_matmul, [num_tokens, D], [0, 0])
+    hc_post_prefill(x_matmul_valid, x_hc, post, comb, x_out)
     return kv_cache, x_out
 
 

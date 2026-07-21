@@ -94,6 +94,104 @@ def materialize_rope_rows(
                 rope_cos_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
                 rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
 
+
+@pl.jit.inline
+def qkv_prepare_diagnostic(
+    x: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    x_matmul: pl.Out[pl.Tensor[[T_MAX, D], pl.BF16]],
+):
+    """Diagnostic breakpoint containing only QKV padding and RoPE preparation."""
+    t_dim = pl.tensor.dim(x, 0)
+    x_view = pl.reshape(x, [t_dim, D])
+    rope_cos_view = pl.reshape(rope_cos, [t_dim, ROPE_DIM])
+    rope_sin_view = pl.reshape(rope_sin, [t_dim, ROPE_DIM])
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qkv_dynamic_pad_x"):
+        for pad_t in pl.range(T_MAX):
+            x_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+            if pad_t < t_dim:
+                x_row = pl.load(x_view, [pad_t, 0], [1, D], target_memory=pl.MemorySpace.Vec)
+            pl.store(x_row, [pad_t, 0], x_matmul)
+
+    q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
+    for qrp_idx in pl.spmd(
+        (t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE,
+        name_hint="q_rope_prepare",
+        allow_early_resolve=True,
+    ):
+        qrp_t0 = qrp_idx * Q_ROPE_T_TILE
+        qrp_valid_rows = pl.min(Q_ROPE_T_TILE, t_dim - qrp_t0)
+        qrp_ones = pl.tile.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        qrp_idx_i32 = pl.tile.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
+        qrp_idx_fp32 = pl.cast(qrp_idx_i32, target_type=pl.FP32)
+        qrp_col = pl.col_expand_mul(qrp_ones, qrp_idx_fp32)
+        qrp_half = pl.mul(qrp_col, 0.5)
+        qrp_dup_i32 = pl.cast(qrp_half, target_type=pl.INT32, mode="trunc")
+        qrp_dup_f = pl.cast(qrp_dup_i32, target_type=pl.FP32)
+        qrp_lane = pl.sub(qrp_col, pl.mul(qrp_dup_f, 2.0))
+        qrp_next_col = pl.add(qrp_col, 1.0)
+        qrp_lane_offset = pl.mul(qrp_lane, 2.0)
+        qrp_swap_f = pl.sub(qrp_next_col, qrp_lane_offset)
+        qrp_row_seed = pl.cast(
+            pl.mul(
+                pl.cast(
+                    pl.tile.arange(0, [1, Q_ROPE_T_TILE], dtype=pl.INT32),
+                    target_type=pl.FP32,
+                ),
+                ROPE_DIM_SCALE,
+            ),
+            target_type=pl.INT32,
+        )
+        qrp_row_grid = pl.col_expand_mul(
+            pl.tile.full([ROPE_DIM, Q_ROPE_T_TILE], dtype=pl.INT32, value=1),
+            qrp_row_seed,
+        )
+        qrp_row_offset = pl.transpose(qrp_row_grid, axis1=0, axis2=1)
+        qrp_dup_idx = pl.add(pl.cast(qrp_dup_f, target_type=pl.INT32), qrp_row_offset)
+        qrp_swap_idx = pl.add(pl.cast(qrp_swap_f, target_type=pl.INT32), qrp_row_offset)
+        qrp_sign = pl.sub(pl.mul(qrp_lane, 2.0), 1.0)
+        qrp_cos_rows = pl.load(
+            rope_cos_view,
+            [qrp_t0, 0],
+            [Q_ROPE_T_TILE, ROPE_DIM],
+            valid_shapes=[qrp_valid_rows, ROPE_DIM],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        qrp_sin_rows = pl.load(
+            rope_sin_view,
+            [qrp_t0, 0],
+            [Q_ROPE_T_TILE, ROPE_DIM],
+            valid_shapes=[qrp_valid_rows, ROPE_DIM],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        qrp_cos = pl.cast(qrp_cos_rows, target_type=pl.FP32)
+        qrp_sin = pl.cast(qrp_sin_rows, target_type=pl.FP32)
+        qrp_gather_tmp = pl.create_tile(
+            [Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+        )
+        qrp_cos_il = pl.tile.gather(qrp_cos, qrp_dup_idx, qrp_gather_tmp)
+        qrp_sin_il = pl.tile.gather(qrp_sin, qrp_dup_idx, qrp_gather_tmp)
+        qrp_sin_signed = pl.mul(qrp_sin_il, qrp_sign)
+        pl.store(
+            pl.set_validshape(qrp_cos_il, qrp_valid_rows, ROPE_DIM),
+            [qrp_t0, 0],
+            q_rope_cos_il,
+        )
+        pl.store(
+            pl.set_validshape(qrp_sin_signed, qrp_valid_rows, ROPE_DIM),
+            [qrp_t0, 0],
+            q_rope_sin_signed,
+        )
+        pl.store(
+            pl.set_validshape(qrp_swap_idx, qrp_valid_rows, ROPE_DIM),
+            [qrp_t0, 0],
+            q_rope_swap_idx,
+        )
+
 @pl.jit.inline
 def qkv_proj_rope(
     x: pl.Tensor,
