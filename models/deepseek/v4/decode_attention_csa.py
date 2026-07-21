@@ -166,6 +166,7 @@ def attention_csa(
     diag_kv: pl.Tensor[[T, HEAD_DIM], pl.BF16],
     diag_cmp_out: pl.Tensor[[B, S, HEAD_DIM], pl.FP32],
     diag_idx_kv: pl.Tensor[[B, S, IDX_HEAD_DIM], pl.FP32],
+    diag_idx_score: pl.Tensor[[B, S, INDEXER_SCORE_LEN], pl.FP32],
     diag_idx_topk: pl.Tensor[[B, S, INDEXER_SCORE_LEN], pl.INT32],
     diag_qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     diag_qr_scale: pl.Tensor[[T, 1], pl.FP32],
@@ -258,7 +259,7 @@ def attention_csa(
     )
 
     idx_kv_unused = diag_idx_kv
-    idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
+    idx_score_unused = diag_idx_score
     idx_topk_full = diag_idx_topk
     indexer(
         x_normed, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
@@ -350,6 +351,7 @@ def attention_csa_test(
     diag_kv: pl.Out[pl.Tensor[[T, HEAD_DIM], pl.BF16]],
     diag_cmp_out: pl.Out[pl.Tensor[[B, S, HEAD_DIM], pl.FP32]],
     diag_idx_kv: pl.Out[pl.Tensor[[B, S, IDX_HEAD_DIM], pl.FP32]],
+    diag_idx_score: pl.Out[pl.Tensor[[B, S, INDEXER_SCORE_LEN], pl.FP32]],
     diag_idx_topk: pl.Out[pl.Tensor[[B, S, INDEXER_SCORE_LEN], pl.INT32]],
     diag_qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
     diag_qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
@@ -384,6 +386,7 @@ def attention_csa_test(
         diag_kv,
         diag_cmp_out,
         diag_idx_kv,
+        diag_idx_score,
         diag_idx_topk,
         diag_qr,
         diag_qr_scale,
@@ -500,7 +503,7 @@ def golden_attention_csa(tensors):
     })
 
     idx_kv = tensors["diag_idx_kv"]
-    idx_score = torch.zeros(B, S, INDEXER_SCORE_LEN, dtype=torch.float32)
+    idx_score = tensors["diag_idx_score"]
     idx_topk_full = tensors["diag_idx_topk"]
     idx_topk_full.fill_(-1)
     golden_indexer({
@@ -952,6 +955,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("diag_kv", [T, HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("diag_cmp_out", [B, S, HEAD_DIM], torch.float32, is_output=True),
         TensorSpec("diag_idx_kv", [B, S, IDX_HEAD_DIM], torch.float32, is_output=True),
+        TensorSpec("diag_idx_score", [B, S, INDEXER_SCORE_LEN], torch.float32, is_output=True),
         TensorSpec("diag_idx_topk", [B, S, INDEXER_SCORE_LEN], torch.int32, is_output=True),
         TensorSpec("diag_qr", [T, Q_LORA], torch.int8, is_output=True),
         TensorSpec("diag_qr_scale", [T, 1], torch.float32, is_output=True),
@@ -1006,6 +1010,7 @@ if __name__ == "__main__":
             "diag_kv": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_cmp_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "diag_idx_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_idx_score": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "diag_idx_topk": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
