@@ -178,23 +178,23 @@ def mtp_prefill_fwd(
         x_attn_valid,
     )
 
-    moe(
-        x_attn_valid,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        norm_w, gate_w, gate_bias, tid2eid, input_ids,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        pre_hc_hidden_out,
-        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
-        pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
-    )
-
+    # Diagnostic breakpoint: exclude MoE while preserving valid output writes.
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
-    hc_head(pre_hc_hidden_out, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
+    hc_head(x_attn_storage, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
     rms_norm(x_head, mtp_norm_w, hidden_out)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_diag_output"):
+        for copy_t0 in pl.range(0, T, 8):
+            for copy_hc in pl.range(HC_MULT):
+                for copy_d0 in pl.range(0, D, 128):
+                    pre_hc_hidden_out[
+                        copy_t0 : copy_t0 + 8,
+                        copy_hc : copy_hc + 1,
+                        copy_d0 : copy_d0 + 128,
+                    ] = x_attn_storage[
+                        copy_t0 : copy_t0 + 8,
+                        copy_hc : copy_hc + 1,
+                        copy_d0 : copy_d0 + 128,
+                    ]
     return hidden_out
 
 
@@ -525,6 +525,17 @@ def golden_mtp_prefill_fwd(tensors):
             "x_out": x_attn[rank, :num_tokens],
             "num_tokens": num_tokens,
         })
+
+    tensors["pre_hc_hidden_out"][:] = x_attn
+    for rank in range(N_RANKS):
+        x_head = _golden_hc_head_prefill(
+            x_attn[rank, :num_tokens],
+            tensors["mtp_hc_head_fn"][rank],
+            tensors["mtp_hc_head_scale"][rank],
+            tensors["mtp_hc_head_base"][rank],
+        )
+        tensors["hidden_out"][rank, :num_tokens] = golden_rms_norm(x_head, tensors["mtp_norm_w"][rank])
+    return
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn

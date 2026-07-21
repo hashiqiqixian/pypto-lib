@@ -138,82 +138,9 @@ def prefill_attention_swa(
     # attention/o_proj -> KV writeback -> hc_post.
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
-    x_normed = pl.create_tensor([num_tokens, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
-    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
-    late_dep = pl.system.task_dummy(deps=[rms_tid])
-
-    rope_cos_t = pl.create_tensor([num_tokens, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([num_tokens, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
-        position_ids,
-        rope_cos_t,
-        rope_sin_t,
-    )
-
-    # Reuse the shared prefill QKV/RoPE projection to stay aligned with decode.
-    q_storage = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    kv_storage = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr_storage = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale_storage = pl.create_tensor([T, 1], dtype=pl.FP32)
-    q = pl.slice(q_storage, [num_tokens, H, HEAD_DIM], [0, 0, 0])
-    kv = pl.slice(kv_storage, [num_tokens, HEAD_DIM], [0, 0])
-    qr = pl.slice(qr_storage, [num_tokens, Q_LORA], [0, 0])
-    qr_scale = pl.slice(qr_scale_storage, [num_tokens, 1], [0, 0])
-    qkv_proj_rope(
-        x_normed, wq_a, wq_b, wq_b_scale, wkv,
-        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale, late_dep,
-    )
-
-    kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cache_write"):
-        for write_t in pl.range(num_tokens):
-            write_row_raw = pl.read(ori_slot_mapping, [write_t])
-            if write_row_raw >= 0:
-                write_row = pl.cast(write_row_raw, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
-
-    swa_indices = pl.create_tensor([num_tokens, WIN], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_window_indices"):
-        for idx_t in pl.range(num_tokens):
-            idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            abs_pos = pl.read(position_ids, [idx_t])
-            window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            for win_col in pl.range(WIN):
-                win_col_i32 = pl.cast(win_col, pl.INT32)
-                if win_col_i32 < window_valid:
-                    key_abs = key_start_abs + win_col_i32
-                    blk_slot = key_abs // BLOCK_SIZE
-                    blk = pl.read(block_table, [pl.cast(blk_slot, pl.INDEX)])
-                    if blk >= 0:
-                        row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                        pl.write(idx_row, [0, win_col], row)
-            swa_indices = pl.assemble(swa_indices, idx_row, [idx_t, 0])
-
-    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_dummy_cmp_table"):
-        for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
-            pl.write(cmp_block_table_dummy, [dummy_blk], pl.cast(0, pl.INT32))
-    cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    cmp_indices_dummy = pl.create_tensor([num_tokens, IDX_TOPK], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_empty_cmp_meta"):
-        for cmp_t in pl.range(num_tokens):
-            cmp_indices_dummy[cmp_t:cmp_t + 1, 0:IDX_TOPK] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-    attn_out = pl.create_tensor([num_tokens, D], dtype=pl.BF16)
-    prefill_sparse_attn(
-        q, kv_cache, swa_indices,
-        cmp_kv_dummy, cmp_block_table_dummy,
-        cmp_indices_dummy,
-        attn_sink,
-        rope_cos_t, rope_sin_t,
-        wo_a, wo_b, wo_b_scale, attn_out,
-    )
-
-    hc_post_prefill(attn_out, x_hc, post, comb, x_out)
+    # Diagnostic breakpoint: consume the first dynamic Attention stage and
+    # return before QKV/RoPE, sparse attention, and output projection.
+    hc_post_prefill(x_mixed, x_hc, post, comb, x_out)
     return kv_cache, x_out
 
 
@@ -289,6 +216,17 @@ def golden_prefill_attention_swa(tensors):
         "post": post,
         "comb": comb,
     })
+
+    y = torch.zeros(num_tokens, HC_MULT, D, dtype=torch.float32)
+    golden_hc_post_prefill({
+        "x": x_mixed,
+        "residual": x_hc_flat,
+        "post": post,
+        "comb": comb,
+        "y": y,
+    })
+    tensors["x_out"][:] = y
+    return
 
     q = torch.zeros(num_tokens, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(num_tokens, HEAD_DIM, dtype=torch.bfloat16)
