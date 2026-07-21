@@ -176,44 +176,9 @@ def prefill_attention_swa(
                 write_row = pl.cast(write_row_raw, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
-    swa_indices = pl.create_tensor([num_tokens, WIN], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_window_indices"):
-        for idx_t in pl.range(num_tokens):
-            idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            abs_pos = pl.read(position_ids, [idx_t])
-            window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            for win_col in pl.range(WIN):
-                win_col_i32 = pl.cast(win_col, pl.INT32)
-                if win_col_i32 < window_valid:
-                    key_abs = key_start_abs + win_col_i32
-                    blk_slot = key_abs // BLOCK_SIZE
-                    blk = pl.read(block_table, [pl.cast(blk_slot, pl.INDEX)])
-                    if blk >= 0:
-                        row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                        pl.write(idx_row, [0, win_col], row)
-            swa_indices = pl.assemble(swa_indices, idx_row, [idx_t, 0])
-
-    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_dummy_cmp_table"):
-        for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
-            pl.write(cmp_block_table_dummy, [dummy_blk], pl.cast(0, pl.INT32))
-    cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    cmp_indices_dummy = pl.create_tensor([num_tokens, IDX_TOPK], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_empty_cmp_meta"):
-        for cmp_t in pl.range(num_tokens):
-            cmp_indices_dummy[cmp_t:cmp_t + 1, 0:IDX_TOPK] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-    attn_out = pl.create_tensor([num_tokens, D], dtype=pl.BF16)
-    prefill_sparse_attn(
-        q, kv_cache, swa_indices,
-        cmp_kv_dummy, cmp_block_table_dummy,
-        cmp_indices_dummy,
-        attn_sink,
-        rope_cos_t, rope_sin_t,
-        wo_a, wo_b, wo_b_scale, attn_out,
-    )
-
-    hc_post_prefill(attn_out, x_hc, post, comb, x_out)
+    # Diagnostic breakpoint: retain QKV/RoPE and KV writeback, then stop before
+    # sparse attention and output projection.
+    hc_post_prefill(x_normed, x_hc, post, comb, x_out)
     return kv_cache, x_out
 
 
@@ -321,50 +286,11 @@ def golden_prefill_attention_swa(tensors):
         if dst_row >= 0:
             kv_cache_flat[dst_row, :] = kv[t]
 
-    def cache_row_from_table(table, slot):
-        block = slot // BLOCK_SIZE
-        intra = slot % BLOCK_SIZE
-        phys_block = int(table[block].item())
-        if phys_block < 0:
-            return -1
-        return phys_block * BLOCK_SIZE + intra
-
-    def build_swa_metadata():
-        idx = torch.full((num_tokens, WIN), -1, dtype=torch.int32)
-        pos = tensors["position_ids"]
-        table = tensors["block_table"]
-        for t in range(num_tokens):
-            abs_pos = int(pos[t].item())
-            window_valid = min(WIN, abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            for k, key_abs in enumerate(range(key_start_abs, abs_pos + 1)):
-                row = cache_row_from_table(table, key_abs)
-                if row >= 0:
-                    idx[t, k] = row
-        return idx
-
-    attn_out = torch.zeros(num_tokens, D, dtype=torch.bfloat16)
-    golden_prefill_sparse_attn({
-        "q": q,
-        "ori_kv": kv_cache_in,
-        "swa_indices": build_swa_metadata(),
-        "cmp_kv": torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
-        "cmp_block_table": torch.zeros(SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32),
-        "cmp_indices": torch.full((num_tokens, IDX_TOPK), -1, dtype=torch.int32),
-        "attn_sink": tensors["attn_sink"],
-        "freqs_cos": rope_cos_t,
-        "freqs_sin": rope_sin_t,
-        "wo_a": tensors["wo_a"],
-        "wo_b": tensors["wo_b"],
-        "wo_b_scale": tensors["wo_b_scale"],
-        "attn_out": attn_out,
-    })
-
     tensors["kv_cache"][:] = kv_cache_in
 
     y = torch.zeros(num_tokens, HC_MULT, D, dtype=torch.float32)
     golden_hc_post_prefill({
-        "x": attn_out.view(num_tokens, D),
+        "x": x_normed,
         "residual": x_hc_flat,
         "post": post,
         "comb": comb,
