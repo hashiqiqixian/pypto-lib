@@ -81,7 +81,7 @@ MTP_LAYER_ID = M.num_hidden_layers
 MTP_MOE_EPOCH = 1
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def mtp_prefill_fwd(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
     prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -156,30 +156,32 @@ def mtp_prefill_fwd(
     x_attn_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn_valid = pl.slice(x_attn_storage, [token_count, HC_MULT, D], [0, 0, 0])
 
-    mtp_projection(
-        hidden_states, prev_hidden_states,
-        enorm_w, hnorm_w,
-        e_proj_w, e_proj_w_scale, e_proj_smooth,
-        h_proj_w, h_proj_w_scale, h_proj_smooth,
-        projected,
-    )
+    with pl.scope():
+        mtp_projection(
+            hidden_states, prev_hidden_states,
+            enorm_w, hnorm_w,
+            e_proj_w, e_proj_w_scale, e_proj_smooth,
+            h_proj_w, h_proj_w_scale, h_proj_smooth,
+            projected,
+        )
 
     projected_valid = pl.slice(projected, [token_count, HC_MULT, D], [0, 0, 0])
     ori_slot_mapping_valid = pl.slice(ori_slot_mapping, [token_count], [0])
     position_ids_valid = pl.slice(position_ids, [token_count], [0])
-    prefill_attention_swa(
-        projected_valid,
-        hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-        wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
-        kv_cache, ori_block_table, ori_slot_mapping_valid,
-        position_ids_valid,
-        attn_sink, wo_a, wo_b, wo_b_scale,
-        x_attn_valid,
-    )
+    with pl.scope():
+        prefill_attention_swa(
+            projected_valid,
+            hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+            wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+            freqs_cos, freqs_sin,
+            kv_cache, ori_block_table, ori_slot_mapping_valid,
+            position_ids_valid,
+            attn_sink, wo_a, wo_b, wo_b_scale,
+            x_attn_valid,
+        )
 
     moe(
-        x_attn_valid,
+        x_attn_storage,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,

@@ -258,9 +258,45 @@ def test_fixed_capacity_parents_isolate_dynamic_attention_outputs_from_moe() -> 
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "moe"
                 and isinstance(node.args[0], ast.Name)
-                and node.args[0].id == dynamic_name
+                and node.args[0].id == storage_name
                 for node in ast.walk(tree)
             )
+
+
+def test_full_prefill_sizes_both_active_runtime_rings() -> None:
+    source = (MODEL / "prefill_fwd.py").read_text(encoding="utf-8")
+
+    assert "PREFILL_RING_HEAP = (0, 512 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 0)" in source
+
+
+def test_full_prefill_reuses_fixed_capacity_buffers_across_layer_pairs() -> None:
+    function = _function("prefill_fwd.py", "prefill_fwd")
+    layer_loop = next(
+        node
+        for node in function.body
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "loop_i"
+    )
+    storage_names = {"x_attn_csa_storage", "hidden_mid", "x_attn_hca_storage"}
+
+    def assigned_name(node: ast.AST):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            return node.targets[0].id
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            return node.target.id
+        return None
+
+    assignments = [
+        node
+        for node in function.body
+        if assigned_name(node) in storage_names
+    ]
+    assert {assigned_name(node) for node in assignments} == storage_names
+    assert all(node.lineno < layer_loop.lineno for node in assignments)
+    assert not storage_names.intersection(
+        assigned_name(node) for node in ast.walk(layer_loop)
+    )
 
 
 def test_mtp_golden_limits_dynamic_attention_to_active_prefix() -> None:
@@ -270,6 +306,27 @@ def test_mtp_golden_limits_dynamic_attention_to_active_prefix() -> None:
     assert "'ori_slot_mapping': tensors['ori_slot_mapping'][rank, :num_tokens]" in source
     assert "'position_ids': tensors['position_ids'][rank, :num_tokens]" in source
     assert "'x_out': x_attn[rank, :num_tokens]" in source
+
+
+def test_mtp_projection_and_attention_have_independent_runtime_scopes() -> None:
+    function = _function("prefill_mtp.py", "mtp_prefill_fwd")
+    decorator = next(node for node in function.decorator_list if isinstance(node, ast.Call))
+    auto_scope = next(keyword for keyword in decorator.keywords if keyword.arg == "auto_scope")
+    assert isinstance(auto_scope.value, ast.Constant) and auto_scope.value.value is False
+
+    scopes = [node for node in function.body if isinstance(node, ast.With)]
+    assert len(scopes) == 2
+    scoped_calls = [
+        {
+            node.func.id
+            for node in ast.walk(scope)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        for scope in scopes
+    ]
+    assert "mtp_projection" in scoped_calls[0]
+    assert "prefill_attention_swa" in scoped_calls[1]
+    assert all("moe" not in calls for calls in scoped_calls)
 
 
 def test_shared_hc_pre_has_generic_token_contract() -> None:

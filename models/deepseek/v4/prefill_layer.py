@@ -381,7 +381,7 @@ def prefill_layer_core(
 
             x_next_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
             moe(
-                x_attn_valid,
+                x_attn_storage,
                 hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
                 norm_w, gate_w, gate_bias, tid2eid, input_ids_tile,
                 routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,

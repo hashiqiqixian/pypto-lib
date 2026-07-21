@@ -125,9 +125,9 @@ CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
-# T // 2 active tokens need more than the runtime's default ring-2 heap while
-# the 43-layer prefill scope is open. Keep the other rings on their defaults.
-PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)
+# Dynamic attention scopes exceed the default ring-1 heap, while the full
+# 43-layer prefill schedule still needs the larger ring-2 heap.
+PREFILL_RING_HEAP = (0, 512 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 0)
 
 # Replicated head weights (per-rank, not layer-stacked): hc_head projection and
 # the final RMSNorm gamma — mirrors decode_fwd.
@@ -367,7 +367,7 @@ def prefill_fwd(
         )
     with pl.scope():
         moe(
-            x_attn0_valid,
+            x_attn0_storage,
             hc_ffn_fn_l0, hc_ffn_scale_l0, hc_ffn_base_l0,
             norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
             routed_w1_l0, routed_w1_scale_l0, routed_w3_l0, routed_w3_scale_l0,
@@ -431,7 +431,7 @@ def prefill_fwd(
         )
     with pl.scope():
         moe(
-            x_attn1_valid,
+            x_attn1_storage,
             hc_ffn_fn_l1, hc_ffn_scale_l1, hc_ffn_base_l1,
             norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
             routed_w1_l1, routed_w1_scale_l1, routed_w3_l1, routed_w3_scale_l1,
@@ -443,6 +443,13 @@ def prefill_fwd(
             routed_y_buf, combine_arrived,
             pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
         )
+
+    # Reuse the fixed-capacity Attention/MoE handoff buffers across all layer pairs.
+    # Creating them inside the loop keeps every iteration's allocation alive in the
+    # implicit top-level runtime scope and exhausts ring 0 for the 43-layer model.
+    x_attn_csa_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    hidden_mid: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_hca_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
     # ============ loop : csa (even) + hca (odd) pairs, layers 2..41 ======
     for loop_i in pl.range(HCA_NUM_LAYERS):
@@ -503,9 +510,7 @@ def prefill_fwd(
         shared_w3_scale_csa: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer * MOE_INTER])
         shared_w2_csa: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer * D, 0])
         shared_w2_scale_csa: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [csa_layer * D])
-        x_attn_csa_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
         x_attn_csa_valid = pl.slice(x_attn_csa_storage, [token_count, HC_MULT, D], [0, 0, 0])
-        hidden_mid: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
         hidden_csa_valid = pl.slice(hidden, [token_count, HC_MULT, D], [0, 0, 0])
         with pl.scope():
             prefill_attention_csa(
@@ -528,7 +533,7 @@ def prefill_fwd(
             )
         with pl.scope():
             moe(
-                x_attn_csa_valid,
+                x_attn_csa_storage,
                 hc_ffn_fn_csa, hc_ffn_scale_csa, hc_ffn_base_csa,
                 norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa, input_ids,
                 routed_w1_csa, routed_w1_scale_csa, routed_w3_csa, routed_w3_scale_csa,
@@ -582,7 +587,6 @@ def prefill_fwd(
         shared_w3_scale_hca: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [hca_layer * MOE_INTER])
         shared_w2_hca: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [hca_layer * D, 0])
         shared_w2_scale_hca: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [hca_layer * D])
-        x_attn_hca_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
         x_attn_hca_valid = pl.slice(x_attn_hca_storage, [token_count, HC_MULT, D], [0, 0, 0])
         hidden_mid_hca_valid = pl.slice(hidden_mid, [token_count, HC_MULT, D], [0, 0, 0])
         with pl.scope():
@@ -601,7 +605,7 @@ def prefill_fwd(
             )
         with pl.scope():
             moe(
-                x_attn_hca_valid,
+                x_attn_hca_storage,
                 hc_ffn_fn_hca, hc_ffn_scale_hca, hc_ffn_base_hca,
                 norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca, input_ids,
                 routed_w1_hca, routed_w1_scale_hca, routed_w3_hca, routed_w3_scale_hca,
@@ -693,7 +697,7 @@ def prefill_fwd(
         )
     with pl.scope():
         moe(
-            x_attn_last_valid,
+            x_attn_last_storage,
             hc_ffn_fn_last, hc_ffn_scale_last, hc_ffn_base_last,
             norm_w_last, gate_w_last, gate_bias_last, tid2eid_last, input_ids,
             routed_w1_last, routed_w1_scale_last, routed_w3_last, routed_w3_scale_last,
