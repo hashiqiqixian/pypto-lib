@@ -164,6 +164,9 @@ def attention_csa(
     diag_rms_inv_sqrt_recip: pl.Tensor[[1, T], pl.FP32],
     diag_q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     diag_kv: pl.Tensor[[T, HEAD_DIM], pl.BF16],
+    diag_cmp_out: pl.Tensor[[B, S, HEAD_DIM], pl.FP32],
+    diag_idx_kv: pl.Tensor[[B, S, IDX_HEAD_DIM], pl.FP32],
+    diag_idx_topk: pl.Tensor[[B, S, INDEXER_SCORE_LEN], pl.INT32],
     diag_qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     diag_qr_scale: pl.Tensor[[T, 1], pl.FP32],
     diag_attn_out: pl.Tensor[[T, D], pl.BF16],
@@ -239,7 +242,7 @@ def attention_csa(
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
     x_normed = pl.reshape(x_normed_t, [B, S, D])
-    cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
+    cmp_out = diag_cmp_out
     position_ids_bsd = pl.reshape(position_ids, [B, S])
     cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
     idx_slot_mapping_bsd = pl.reshape(idx_slot_mapping, [B, S])
@@ -254,9 +257,9 @@ def attention_csa(
         late_dep,
     )
 
-    idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
+    idx_kv_unused = diag_idx_kv
     idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
-    idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
+    idx_topk_full = diag_idx_topk
     indexer(
         x_normed, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
         weights_proj, step_cos, step_sin, hadamard_idx,
@@ -345,6 +348,9 @@ def attention_csa_test(
     diag_rms_inv_sqrt_recip: pl.Out[pl.Tensor[[1, T], pl.FP32]],
     diag_q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
     diag_kv: pl.Out[pl.Tensor[[T, HEAD_DIM], pl.BF16]],
+    diag_cmp_out: pl.Out[pl.Tensor[[B, S, HEAD_DIM], pl.FP32]],
+    diag_idx_kv: pl.Out[pl.Tensor[[B, S, IDX_HEAD_DIM], pl.FP32]],
+    diag_idx_topk: pl.Out[pl.Tensor[[B, S, INDEXER_SCORE_LEN], pl.INT32]],
     diag_qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
     diag_qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
     diag_attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
@@ -376,6 +382,9 @@ def attention_csa_test(
         diag_rms_inv_sqrt_recip,
         diag_q,
         diag_kv,
+        diag_cmp_out,
+        diag_idx_kv,
+        diag_idx_topk,
         diag_qr,
         diag_qr_scale,
         diag_attn_out,
@@ -472,7 +481,7 @@ def golden_attention_csa(tensors):
     cmp_kv = tensors["cmp_kv"]
     cmp_block_table = tensors["cmp_block_table"]
 
-    cmp_out = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
+    cmp_out = tensors["diag_cmp_out"]
     golden_compressor({
         "x": x_normed.reshape(B, S, D),
         "kv": cmp_out,
@@ -490,9 +499,10 @@ def golden_attention_csa(tensors):
         "state_slot_mapping": state_slot_mapping_bsd,
     })
 
-    idx_kv = torch.zeros(B, S, IDX_HEAD_DIM, dtype=torch.float32)
+    idx_kv = tensors["diag_idx_kv"]
     idx_score = torch.zeros(B, S, INDEXER_SCORE_LEN, dtype=torch.float32)
-    idx_topk_full = torch.full((B, S, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
+    idx_topk_full = tensors["diag_idx_topk"]
+    idx_topk_full.fill_(-1)
     golden_indexer({
         "x": x_normed.reshape(B, S, D),
         "qr": qr_i8,
@@ -940,6 +950,9 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("diag_rms_inv_sqrt_recip", [1, T], torch.float32, is_output=True),
         TensorSpec("diag_q", [T, H, HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("diag_kv", [T, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("diag_cmp_out", [B, S, HEAD_DIM], torch.float32, is_output=True),
+        TensorSpec("diag_idx_kv", [B, S, IDX_HEAD_DIM], torch.float32, is_output=True),
+        TensorSpec("diag_idx_topk", [B, S, INDEXER_SCORE_LEN], torch.int32, is_output=True),
         TensorSpec("diag_qr", [T, Q_LORA], torch.int8, is_output=True),
         TensorSpec("diag_qr_scale", [T, 1], torch.float32, is_output=True),
         TensorSpec("diag_attn_out", [T, D], torch.bfloat16, is_output=True),
@@ -991,6 +1004,9 @@ if __name__ == "__main__":
             "diag_rms_inv_sqrt_recip": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_q": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "diag_kv": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
+            "diag_cmp_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_idx_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_idx_topk": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "diag_attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
