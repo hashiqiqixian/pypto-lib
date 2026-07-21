@@ -153,10 +153,11 @@ def mtp_prefill_fwd(
     nt: pl.Scalar[pl.INT32] = num_tokens
     token_count = pl.cast(num_tokens, pl.INDEX)
     projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    projected_materialized = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn_valid = pl.slice(x_attn_storage, [token_count, HC_MULT, D], [0, 0, 0])
 
-    mtp_projection(
+    projection_tid = mtp_projection(
         hidden_states, prev_hidden_states,
         enorm_w, hnorm_w,
         e_proj_w, e_proj_w_scale, e_proj_smooth,
@@ -164,7 +165,17 @@ def mtp_prefill_fwd(
         projected,
     )
 
-    projected_valid = pl.slice(projected, [token_count, HC_MULT, D], [0, 0, 0])
+    projected_flat = pl.reshape(projected, [T, HC_DIM])
+    projected_materialized_flat = pl.reshape(projected_materialized, [T, HC_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_materialize", deps=[projection_tid]):
+        for copy_t0 in pl.range(0, T, 8):
+            for copy_d0 in pl.range(0, HC_DIM, 128):
+                projected_materialized_flat[copy_t0 : copy_t0 + 8, copy_d0 : copy_d0 + 128] = projected_flat[
+                    copy_t0 : copy_t0 + 8,
+                    copy_d0 : copy_d0 + 128,
+                ]
+
+    projected_valid = pl.slice(projected_materialized, [token_count, HC_MULT, D], [0, 0, 0])
     ori_slot_mapping_valid = pl.slice(ori_slot_mapping, [token_count], [0])
     position_ids_valid = pl.slice(position_ids, [token_count], [0])
     prefill_attention_swa(

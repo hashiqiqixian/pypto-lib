@@ -138,6 +138,11 @@ def prefill_attention_swa(
     # attention/o_proj -> KV writeback -> hc_post.
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
+    # Diagnostic breakpoint: retain only the first dynamic Attention stage and
+    # consume all hc_pre outputs through hc_post.
+    hc_post_prefill(x_mixed, x_hc, post, comb, x_out)
+    return kv_cache, x_out
+
     x_normed = pl.create_tensor([num_tokens, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
@@ -289,6 +294,17 @@ def golden_prefill_attention_swa(tensors):
         "post": post,
         "comb": comb,
     })
+
+    y = torch.zeros(num_tokens, HC_MULT, D, dtype=torch.float32)
+    golden_hc_post_prefill({
+        "x": x_mixed,
+        "residual": x_hc_flat,
+        "post": post,
+        "comb": comb,
+        "y": y,
+    })
+    tensors["x_out"][:] = y
+    return
 
     q = torch.zeros(num_tokens, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(num_tokens, HEAD_DIM, dtype=torch.bfloat16)

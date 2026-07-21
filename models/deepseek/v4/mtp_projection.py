@@ -204,7 +204,7 @@ def mtp_projection(
                     acc = pl.add(hidden_deq, prev_deq)
                     out_pad = pl.assemble(out_pad, acc, [t0, prev_out])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_output"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_output") as projection_tid:
         for t0 in pl.pipeline(0, t_dim, T_TILE, stage=2):
             for hc in pl.range(HC_MULT):
                 out_base = hc * D
@@ -215,7 +215,7 @@ def mtp_projection(
                     ]
 
     hidden_states_out = pl.reshape(out_flat, [t_dim, HC_MULT, D])
-    return hidden_states_out
+    return projection_tid
 
 
 @pl.jit
@@ -235,7 +235,7 @@ def mtp_projection_test(
     hidden_states.bind_dynamic(0, T_DYN)
     prev_hidden_states.bind_dynamic(0, T_DYN)
     hidden_states_out.bind_dynamic(0, T_DYN)
-    return mtp_projection(
+    mtp_projection(
         hidden_states,
         prev_hidden_states,
         enorm_w,
@@ -248,6 +248,7 @@ def mtp_projection_test(
         h_proj_smooth,
         hidden_states_out,
     )
+    return hidden_states_out
 
 
 def _rms_norm(x, weight):
