@@ -85,6 +85,7 @@ MTP_MOE_EPOCH = 1
 def mtp_prefill_fwd(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
     prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    projected: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
     e_proj_w: pl.Tensor[[D, D], pl.INT8],
@@ -152,7 +153,6 @@ def mtp_prefill_fwd(
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
     token_count = pl.cast(num_tokens, pl.INDEX)
-    projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn_valid = pl.slice(x_attn_storage, [token_count, HC_MULT, D], [0, 0, 0])
 
@@ -202,6 +202,7 @@ def mtp_prefill_fwd(
 def l3_mtp_prefill_fwd(
     hidden_states: pl.Tensor[[N_RANKS, T, D], pl.BF16],
     prev_hidden_states: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    projected_scratch: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     hnorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     e_proj_w: pl.Tensor[[N_RANKS, D, D], pl.INT8],
@@ -279,6 +280,7 @@ def l3_mtp_prefill_fwd(
         mtp_prefill_fwd(
             hidden_states[r],
             prev_hidden_states[r],
+            projected_scratch[r],
             enorm_w[r], hnorm_w[r],
             e_proj_w[r], e_proj_w_scale[r], e_proj_smooth[r],
             h_proj_w[r], h_proj_w_scale[r], h_proj_smooth[r],
@@ -358,6 +360,8 @@ def _projection_specs():
         TensorSpec("hidden_states", [N_RANKS, T, D], torch.bfloat16, init_value=lambda: torch.randn(N_RANKS, T, D).to(torch.bfloat16)),
         TensorSpec("prev_hidden_states", [N_RANKS, T, HC_MULT, D], torch.float32,
                    init_value=lambda: torch.randn(N_RANKS, T, HC_MULT, D).to(torch.bfloat16)),
+        TensorSpec("projected_scratch", [N_RANKS, T, HC_MULT, D], torch.float32,
+                   init_value=lambda: torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)),
         TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
         TensorSpec("hnorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
         TensorSpec("e_proj_w", [N_RANKS, D, D], torch.int8, init_value=init_e_proj_w),
@@ -400,7 +404,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
     moe_specs = {spec.name: spec for spec in build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens) if isinstance(spec, TensorSpec)}
 
     ordered_names = [
-        "hidden_states", "prev_hidden_states",
+        "hidden_states", "prev_hidden_states", "projected_scratch",
         "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
         "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
