@@ -378,32 +378,8 @@ def qkv_prepare_diagnostic(
                 valid_shapes=[valid_rows, 1],
                 target_memory=pl.MemorySpace.Vec,
             )
-            q_cos_il = pl.load(
-                q_rope_cos_il,
-                [tg, 0],
-                [Q_ROPE_T_TILE, ROPE_DIM],
-                valid_shapes=[valid_rows, ROPE_DIM],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            q_sin_signed = pl.load(
-                q_rope_sin_signed,
-                [tg, 0],
-                [Q_ROPE_T_TILE, ROPE_DIM],
-                valid_shapes=[valid_rows, ROPE_DIM],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            q_swap_idx = pl.load(
-                q_rope_swap_idx,
-                [tg, 0],
-                [Q_ROPE_T_TILE, ROPE_DIM],
-                valid_shapes=[valid_rows, ROPE_DIM],
-                target_memory=pl.MemorySpace.Vec,
-            )
             q_head_reduce_tmp = pl.create_tile(
                 [Q_ROPE_T_TILE, HEAD_DIM], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
-            )
-            q_gather_tmp = pl.create_tile(
-                [Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
             )
             for h_inner in pl.range(Q_ROPE_H_TILE):
                 h = hg + h_inner
@@ -436,19 +412,6 @@ def qkv_prepare_diagnostic(
                 pl.store(
                     pl.set_validshape(q_nope_bf16, valid_rows, NOPE_DIM),
                     [tg, h0],
-                    q_flat,
-                )
-
-                q_rope_chunk_raw = q_head_dq[:, NOPE_DIM:HEAD_DIM]
-                q_rope_chunk = pl.row_expand_mul(q_rope_chunk_raw, q_head_inv_rms)
-                q_rope_swapped = pl.tile.gather(q_rope_chunk, q_swap_idx, q_gather_tmp)
-                q_rope_base = pl.mul(q_rope_chunk, q_cos_il)
-                q_rope_delta = pl.mul(q_rope_swapped, q_sin_signed)
-                q_rope_rot = pl.add(q_rope_base, q_rope_delta)
-                q_rope_bf16 = pl.cast(q_rope_rot, target_type=pl.BF16, mode="rint")
-                pl.store(
-                    pl.set_validshape(q_rope_bf16, valid_rows, ROPE_DIM),
-                    [tg, h0 + NOPE_DIM],
                     q_flat,
                 )
 
