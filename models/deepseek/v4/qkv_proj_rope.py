@@ -138,7 +138,6 @@ def qkv_proj_rope(
     for qrp_idx in pl.spmd(
         (t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE,
         name_hint="q_rope_prepare",
-        allow_early_resolve=True,
     ):
         qrp_t0 = qrp_idx * Q_ROPE_T_TILE
         qrp_valid_rows = pl.min(Q_ROPE_T_TILE, t_dim - qrp_t0)
