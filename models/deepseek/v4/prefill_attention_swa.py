@@ -140,8 +140,8 @@ def prefill_attention_swa(
 
     x_normed = pl.create_tensor([num_tokens, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
-    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
-    late_dep = pl.system.task_dummy(deps=[rms_tid])
+    # Diagnostic: match the standalone QKV graph by removing the RMS phase fence.
+    late_dep = pl.system.task_dummy(deps=[])
 
     rope_cos_t = pl.create_tensor([num_tokens, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([num_tokens, ROPE_HEAD_DIM], dtype=pl.BF16)
