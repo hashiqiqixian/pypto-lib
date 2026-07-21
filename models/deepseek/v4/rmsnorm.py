@@ -43,52 +43,93 @@ def rms_norm(
         tg_idx = pl.tile.get_block_idx()
         tg = tg_idx * T_TILE
         valid_rows = pl.min(T_TILE, t_dim - tg)
-        row_reduce_tmp = pl.create_tile([T_TILE, D_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        x_sq_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        # row_reduce_tmp is shared by each reduction step. Keep this loop
-        # sequential so adjacent pipeline stages cannot overwrite the scratch
-        # tile before its partial sum is accumulated.
-        for rms_db in pl.range(D // D_TILE):
-            rms_d0 = rms_db * D_TILE
-            rms_x_input = pl.load(
-                x,
-                [tg, rms_d0],
-                [T_TILE, D_TILE],
-                valid_shapes=[valid_rows, D_TILE],
-                target_memory=pl.MemorySpace.Vec,
+        if valid_rows == T_TILE:
+            # Preserve the established Tensor-level reduction and rounding path
+            # for complete tiles. Decode and aligned prefill inputs use this
+            # branch, so dynamic-shape support does not perturb their numerics.
+            full_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for full_rms_db in pl.pipeline(D // D_TILE, stage=2):
+                full_rms_d0 = full_rms_db * D_TILE
+                full_rms_x = pl.cast(
+                    x[tg : tg + T_TILE, full_rms_d0 : full_rms_d0 + D_TILE],
+                    target_type=pl.FP32,
+                )
+                full_sq_sum = pl.add(
+                    full_sq_sum,
+                    pl.reshape(pl.row_sum(pl.mul(full_rms_x, full_rms_x)), [1, T_TILE]),
+                )
+            full_inv_rms = pl.rsqrt(pl.add(pl.mul(full_sq_sum, 1.0 / D), EPS), high_precision=True)
+            full_inv_rms_t = pl.reshape(full_inv_rms, [T_TILE, 1])
+            for full_apply_db in pl.pipeline(D // D_TILE, stage=2):
+                full_apply_d0 = full_apply_db * D_TILE
+                full_apply_x = pl.cast(
+                    x[tg : tg + T_TILE, full_apply_d0 : full_apply_d0 + D_TILE],
+                    target_type=pl.FP32,
+                )
+                full_norm_w = pl.cast(
+                    pl.reshape(norm_w[full_apply_d0 : full_apply_d0 + D_TILE], [1, D_TILE]),
+                    pl.FP32,
+                )
+                full_normed = pl.col_expand_mul(
+                    pl.row_expand_mul(full_apply_x, full_inv_rms_t),
+                    full_norm_w,
+                )
+                x_normed[tg : tg + T_TILE, full_apply_d0 : full_apply_d0 + D_TILE] = pl.cast(
+                    full_normed,
+                    target_type=pl.BF16,
+                    mode="rint",
+                )
+        else:
+            row_reduce_tmp = pl.create_tile(
+                [T_TILE, D_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
             )
-            rms_x_chunk = pl.cast(rms_x_input, target_type=pl.FP32)
-            x_sq_sum = pl.add(
-                x_sq_sum,
-                pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk), row_reduce_tmp), [1, T_TILE]),
-            )
-        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
-        x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
-        for apply_db in pl.pipeline(D // D_TILE, stage=2):
-            apply_d0 = apply_db * D_TILE
-            apply_x_input = pl.load(
-                x,
-                [tg, apply_d0],
-                [T_TILE, D_TILE],
-                valid_shapes=[valid_rows, D_TILE],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            apply_x_chunk = pl.cast(apply_x_input, target_type=pl.FP32)
-            norm_w_input = pl.load(
-                norm_w,
-                [apply_d0],
-                [D_TILE],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            norm_w_chunk = pl.cast(pl.reshape(norm_w_input, [1, D_TILE]), pl.FP32)
-            x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
-            x_normed_chunk = pl.cast(
-                x_normed_chunk,
-                target_type=pl.BF16,
-                mode="rint",
-            )
-            x_normed_valid = pl.set_validshape(x_normed_chunk, valid_rows, D_TILE)
-            pl.store(x_normed_valid, [tg, apply_d0], x_normed)
+            tail_sq_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for tail_rms_db in pl.range(D // D_TILE):
+                tail_rms_d0 = tail_rms_db * D_TILE
+                tail_rms_input = pl.load(
+                    x,
+                    [tg, tail_rms_d0],
+                    [T_TILE, D_TILE],
+                    valid_shapes=[valid_rows, D_TILE],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                tail_rms_x = pl.cast(tail_rms_input, target_type=pl.FP32)
+                tail_sq_sum = pl.add(
+                    tail_sq_sum,
+                    pl.reshape(
+                        pl.row_sum(pl.mul(tail_rms_x, tail_rms_x), row_reduce_tmp),
+                        [1, T_TILE],
+                    ),
+                )
+            tail_inv_rms = pl.rsqrt(pl.add(pl.mul(tail_sq_sum, 1.0 / D), EPS), high_precision=True)
+            tail_inv_rms_t = pl.reshape(tail_inv_rms, [T_TILE, 1])
+            for tail_apply_db in pl.pipeline(D // D_TILE, stage=2):
+                tail_apply_d0 = tail_apply_db * D_TILE
+                tail_apply_input = pl.load(
+                    x,
+                    [tg, tail_apply_d0],
+                    [T_TILE, D_TILE],
+                    valid_shapes=[valid_rows, D_TILE],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                tail_apply_x = pl.cast(tail_apply_input, target_type=pl.FP32)
+                tail_norm_w_input = pl.load(
+                    norm_w,
+                    [tail_apply_d0],
+                    [D_TILE],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                tail_norm_w = pl.cast(pl.reshape(tail_norm_w_input, [1, D_TILE]), pl.FP32)
+                tail_normed = pl.col_expand_mul(
+                    pl.row_expand_mul(tail_apply_x, tail_inv_rms_t),
+                    tail_norm_w,
+                )
+                tail_normed_bf16 = pl.cast(tail_normed, target_type=pl.BF16, mode="rint")
+                pl.store(
+                    pl.set_validshape(tail_normed_bf16, valid_rows, D_TILE),
+                    [tg, tail_apply_d0],
+                    x_normed,
+                )
 
     return rms_tid
 
