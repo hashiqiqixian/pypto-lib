@@ -163,6 +163,7 @@ def attention_csa(
     diag_rms_inv: pl.Tensor[[1, T], pl.FP32],
     diag_rms_inv_sqrt_recip: pl.Tensor[[1, T], pl.FP32],
     diag_q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    diag_kv: pl.Tensor[[T, HEAD_DIM], pl.BF16],
     diag_qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     diag_qr_scale: pl.Tensor[[T, 1], pl.FP32],
     diag_attn_out: pl.Tensor[[T, D], pl.BF16],
@@ -218,7 +219,7 @@ def attention_csa(
     # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = diag_q
-    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    kv = diag_kv
     qr = diag_qr
     qr_scale = diag_qr_scale
     qkv_proj_rope(
@@ -343,6 +344,7 @@ def attention_csa_test(
     diag_rms_inv: pl.Out[pl.Tensor[[1, T], pl.FP32]],
     diag_rms_inv_sqrt_recip: pl.Out[pl.Tensor[[1, T], pl.FP32]],
     diag_q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
+    diag_kv: pl.Out[pl.Tensor[[T, HEAD_DIM], pl.BF16]],
     diag_qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
     diag_qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
     diag_attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
@@ -373,6 +375,7 @@ def attention_csa_test(
         diag_rms_inv,
         diag_rms_inv_sqrt_recip,
         diag_q,
+        diag_kv,
         diag_qr,
         diag_qr_scale,
         diag_attn_out,
@@ -459,6 +462,7 @@ def golden_attention_csa(tensors):
         "qr_scale": qr_scale,
     })
     tensors["diag_q"][:] = q
+    tensors["diag_kv"][:] = kv
     tensors["diag_qr"][:] = qr_i8
     tensors["diag_qr_scale"][:] = qr_scale
 
@@ -935,6 +939,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("diag_rms_inv", [1, T], torch.float32, is_output=True),
         TensorSpec("diag_rms_inv_sqrt_recip", [1, T], torch.float32, is_output=True),
         TensorSpec("diag_q", [T, H, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("diag_kv", [T, HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("diag_qr", [T, Q_LORA], torch.int8, is_output=True),
         TensorSpec("diag_qr_scale", [T, 1], torch.float32, is_output=True),
         TensorSpec("diag_attn_out", [T, D], torch.bfloat16, is_output=True),
@@ -985,6 +990,7 @@ if __name__ == "__main__":
             "diag_rms_inv": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_rms_inv_sqrt_recip": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_q": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_kv": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "diag_attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
