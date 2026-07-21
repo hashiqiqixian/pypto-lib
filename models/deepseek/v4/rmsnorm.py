@@ -97,7 +97,9 @@ def rms_norm_diagnostics(
     x_normed: pl.Tensor,
     diag_partial_sq_sum: pl.Tensor,
     diag_accum_sq_sum: pl.Tensor,
+    diag_mean_eps: pl.Tensor,
     diag_inv_rms: pl.Tensor,
+    diag_inv_sqrt_recip: pl.Tensor,
 ):
     """Mirror ``rms_norm`` while exposing its reduction dataflow for diagnosis."""
     t_dim = pl.tensor.dim(x, 0)
@@ -126,8 +128,12 @@ def rms_norm_diagnostics(
             pl.store(partial_sq_sum, [rms_db, tg], diag_partial_sq_sum)
             pl.store(x_sq_sum, [rms_db, tg], diag_accum_sq_sum)
 
-        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
+        mean_eps = pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)
+        x_inv_rms = pl.rsqrt(mean_eps, high_precision=True)
+        x_inv_sqrt_recip = pl.recip(pl.sqrt(mean_eps))
+        pl.store(mean_eps, [tg_idx, tg], diag_mean_eps)
         pl.store(x_inv_rms, [tg_idx, tg], diag_inv_rms)
+        pl.store(x_inv_sqrt_recip, [tg_idx, tg], diag_inv_sqrt_recip)
         x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
         for apply_db in pl.pipeline(D // D_TILE, stage=2):
             apply_d0 = apply_db * D_TILE

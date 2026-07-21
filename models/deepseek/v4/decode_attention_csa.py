@@ -159,7 +159,9 @@ def attention_csa(
     diag_x_normed: pl.Tensor[[T, D], pl.BF16],
     diag_rms_partial_sq_sum: pl.Tensor[[RMS_CHUNKS, T], pl.FP32],
     diag_rms_accum_sq_sum: pl.Tensor[[RMS_CHUNKS, T], pl.FP32],
+    diag_rms_mean_eps: pl.Tensor[[1, T], pl.FP32],
     diag_rms_inv: pl.Tensor[[1, T], pl.FP32],
+    diag_rms_inv_sqrt_recip: pl.Tensor[[1, T], pl.FP32],
     diag_q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     diag_qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     diag_qr_scale: pl.Tensor[[T, 1], pl.FP32],
@@ -207,7 +209,9 @@ def attention_csa(
         x_normed_t,
         diag_rms_partial_sq_sum,
         diag_rms_accum_sq_sum,
+        diag_rms_mean_eps,
         diag_rms_inv,
+        diag_rms_inv_sqrt_recip,
     )
     # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj
     # and weights_proj. The latter three take this barrier instead of racing the first:
@@ -335,7 +339,9 @@ def attention_csa_test(
     diag_x_normed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     diag_rms_partial_sq_sum: pl.Out[pl.Tensor[[RMS_CHUNKS, T], pl.FP32]],
     diag_rms_accum_sq_sum: pl.Out[pl.Tensor[[RMS_CHUNKS, T], pl.FP32]],
+    diag_rms_mean_eps: pl.Out[pl.Tensor[[1, T], pl.FP32]],
     diag_rms_inv: pl.Out[pl.Tensor[[1, T], pl.FP32]],
+    diag_rms_inv_sqrt_recip: pl.Out[pl.Tensor[[1, T], pl.FP32]],
     diag_q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
     diag_qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
     diag_qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
@@ -363,7 +369,9 @@ def attention_csa_test(
         diag_x_normed,
         diag_rms_partial_sq_sum,
         diag_rms_accum_sq_sum,
+        diag_rms_mean_eps,
         diag_rms_inv,
+        diag_rms_inv_sqrt_recip,
         diag_q,
         diag_qr,
         diag_qr_scale,
@@ -430,7 +438,11 @@ def golden_attention_csa(tensors):
         rms_accum[rms_chunk : rms_chunk + 1] = running_sq_sum
     tensors["diag_rms_partial_sq_sum"][:] = rms_partial
     tensors["diag_rms_accum_sq_sum"][:] = rms_accum
-    tensors["diag_rms_inv"][:] = torch.rsqrt(running_sq_sum * (1.0 / D) + EPS)
+    rms_mean_eps = running_sq_sum * (1.0 / D) + EPS
+    rms_inv = torch.rsqrt(rms_mean_eps)
+    tensors["diag_rms_mean_eps"][:] = rms_mean_eps
+    tensors["diag_rms_inv"][:] = rms_inv
+    tensors["diag_rms_inv_sqrt_recip"][:] = rms_inv
     golden_qkv_proj_rope({
         "x": x_normed,
         "wq_a": tensors["wq_a"],
@@ -919,7 +931,9 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("diag_x_normed", [T, D], torch.bfloat16, is_output=True),
         TensorSpec("diag_rms_partial_sq_sum", [RMS_CHUNKS, T], torch.float32, is_output=True),
         TensorSpec("diag_rms_accum_sq_sum", [RMS_CHUNKS, T], torch.float32, is_output=True),
+        TensorSpec("diag_rms_mean_eps", [1, T], torch.float32, is_output=True),
         TensorSpec("diag_rms_inv", [1, T], torch.float32, is_output=True),
+        TensorSpec("diag_rms_inv_sqrt_recip", [1, T], torch.float32, is_output=True),
         TensorSpec("diag_q", [T, H, HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("diag_qr", [T, Q_LORA], torch.int8, is_output=True),
         TensorSpec("diag_qr_scale", [T, 1], torch.float32, is_output=True),
@@ -967,7 +981,9 @@ if __name__ == "__main__":
             "diag_x_normed": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_rms_partial_sq_sum": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_rms_accum_sq_sum": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
+            "diag_rms_mean_eps": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_rms_inv": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
+            "diag_rms_inv_sqrt_recip": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_q": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "diag_qr": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
