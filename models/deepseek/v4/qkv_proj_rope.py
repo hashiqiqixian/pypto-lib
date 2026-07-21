@@ -538,7 +538,7 @@ def qkv_proj_rope(
                 kv_sq_sum,
                 pl.reshape(pl.row_sum(pl.mul(kv_chunk, kv_chunk), kv_reduce_tmp), [1, KV_RMS_T_TILE]),
             )
-        kv_inv_rms = pl.rsqrt(pl.add(pl.mul(kv_sq_sum, 1.0 / HEAD_DIM), EPS), high_precision=True)
+        kv_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(kv_sq_sum, 1.0 / HEAD_DIM), EPS)))
         kv_inv_rms_t = pl.reshape(kv_inv_rms, [KV_RMS_T_TILE, 1])
 
         # NOPE writeback: rms-normalize columns [0:NOPE_DIM) with per-column gamma.

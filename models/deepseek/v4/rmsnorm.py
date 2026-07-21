@@ -59,7 +59,7 @@ def rms_norm(
                 x_sq_sum,
                 pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk), row_reduce_tmp), [1, T_TILE]),
             )
-        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
+        x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
         x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
         for apply_db in pl.pipeline(D // D_TILE, stage=2):
             apply_d0 = apply_db * D_TILE
