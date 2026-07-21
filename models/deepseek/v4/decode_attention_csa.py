@@ -928,10 +928,10 @@ if __name__ == "__main__":
             # Tightened from CANN's 1e-2 bar while allowing one BF16 step around unit-scale values.
             "x_out": ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "diag_x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "diag_x_normed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_x_mixed": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
+            "diag_x_normed": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_q": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "diag_qr": ratio_allclose(atol=1, rtol=0, max_error_ratio=0),
+            "diag_qr": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
             "diag_qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "diag_attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
