@@ -673,6 +673,15 @@ def test_qkv_rope_gathers_include_flattened_row_offsets() -> None:
     assert "kv_swap_idx = pl.add(pl.cast(kv_swap_f" in source
 
 
+def test_qkv_rope_tail_initializes_full_gather_index_tiles() -> None:
+    source = ast.unparse(_function("qkv_proj_rope.py", "qkv_proj_rope"))
+
+    assert "q_rope_swap_idx = pl.create_tensor([T_MAX, ROPE_DIM], dtype=pl.INT32)" in source
+    assert "pl.store(qrp_swap_idx, [qrp_t0, 0], q_rope_swap_idx)" in source
+    assert "pl.set_validshape(qrp_swap_idx" not in source
+    assert "q_swap_idx = pl.load(q_rope_swap_idx, [tg, 0], [Q_ROPE_T_TILE, ROPE_DIM], target_memory=" in source
+
+
 def test_sparse_dynamic_padding_is_row_tiled() -> None:
     source = ast.unparse(_function("prefill_sparse_attn.py", "prefill_sparse_attn"))
     assert "prefill_sparse_dynamic_pad_q" in source
