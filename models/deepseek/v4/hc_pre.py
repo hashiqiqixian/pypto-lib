@@ -422,15 +422,18 @@ def _hc_pre_syncall(
                         y3 = pl.row_expand_mul(x3, pre3)
                         y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
                         y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-                        x_mixed_pad_store = pl.assemble(x_mixed_pad_store, y_bf16, [t0, d0])
-                        y_out = pl.load(
-                            x_mixed_pad_store,
-                            [t0, d0],
-                            [T_TILE, D_CHUNK],
-                            valid_shapes=[valid_rows, D_CHUNK],
-                            target_memory=pl.MemorySpace.Vec,
-                        )
-                        pl.store(y_out, [t0, d0], x_mixed)
+                        if valid_rows == T_TILE:
+                            x_mixed = pl.assemble(x_mixed, y_bf16, [t0, d0])
+                        else:
+                            x_mixed_pad_store = pl.assemble(x_mixed_pad_store, y_bf16, [t0, d0])
+                            y_out = pl.load(
+                                x_mixed_pad_store,
+                                [t0, d0],
+                                [T_TILE, D_CHUNK],
+                                valid_shapes=[valid_rows, D_CHUNK],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            pl.store(y_out, [t0, d0], x_mixed)
 
                 else:
                     ob = gw - tt_n - mixx_n
@@ -692,15 +695,18 @@ def _hc_pre_separate(
             y3 = pl.row_expand_mul(x3, pre3)
             y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
             y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            x_mixed_pad_store = pl.assemble(x_mixed_pad_store, y_bf16, [t0, d0])
-            y_out = pl.load(
-                x_mixed_pad_store,
-                [t0, d0],
-                [T_TILE, D_CHUNK],
-                valid_shapes=[valid_rows, D_CHUNK],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            pl.store(y_out, [t0, d0], x_mixed)
+            if valid_rows == T_TILE:
+                x_mixed = pl.assemble(x_mixed, y_bf16, [t0, d0])
+            else:
+                x_mixed_pad_store = pl.assemble(x_mixed_pad_store, y_bf16, [t0, d0])
+                y_out = pl.load(
+                    x_mixed_pad_store,
+                    [t0, d0],
+                    [T_TILE, D_CHUNK],
+                    valid_shapes=[valid_rows, D_CHUNK],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                pl.store(y_out, [t0, d0], x_mixed)
     return x_mixed
 
 
