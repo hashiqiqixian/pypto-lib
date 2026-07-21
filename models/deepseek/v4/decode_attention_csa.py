@@ -157,6 +157,8 @@ def attention_csa(
     diag_x_mixed: pl.Tensor[[T, D], pl.BF16],
     diag_x_normed: pl.Tensor[[T, D], pl.BF16],
     diag_q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    diag_qr: pl.Tensor[[T, Q_LORA], pl.INT8],
+    diag_qr_scale: pl.Tensor[[T, 1], pl.FP32],
     diag_attn_out: pl.Tensor[[T, D], pl.BF16],
 ):
     x_mixed = diag_x_mixed
@@ -202,8 +204,8 @@ def attention_csa(
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = diag_q
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    qr = diag_qr
+    qr_scale = diag_qr_scale
     qkv_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
@@ -321,6 +323,8 @@ def attention_csa_test(
     diag_x_mixed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     diag_x_normed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     diag_q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
+    diag_qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
+    diag_qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
     diag_attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     attention_csa(
@@ -340,7 +344,7 @@ def attention_csa_test(
         state_slot_mapping, inner_state_slot_mapping,
         position_ids, kv_seq_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        x_out, diag_x_mixed, diag_x_normed, diag_q, diag_attn_out,
+        x_out, diag_x_mixed, diag_x_normed, diag_q, diag_qr, diag_qr_scale, diag_attn_out,
     )
     return x_out
 
@@ -411,6 +415,8 @@ def golden_attention_csa(tensors):
         "qr_scale": qr_scale,
     })
     tensors["diag_q"][:] = q
+    tensors["diag_qr"][:] = qr_i8
+    tensors["diag_qr_scale"][:] = qr_scale
 
     kv_cache = tensors["kv_cache"]
     window_swa_indices = tensors["window_swa_indices"]
@@ -880,6 +886,8 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("diag_x_mixed", [T, D], torch.bfloat16, is_output=True),
         TensorSpec("diag_x_normed", [T, D], torch.bfloat16, is_output=True),
         TensorSpec("diag_q", [T, H, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("diag_qr", [T, Q_LORA], torch.int8, is_output=True),
+        TensorSpec("diag_qr_scale", [T, 1], torch.float32, is_output=True),
         TensorSpec("diag_attn_out", [T, D], torch.bfloat16, is_output=True),
     ]
 
@@ -923,6 +931,8 @@ if __name__ == "__main__":
             "diag_x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "diag_x_normed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "diag_q": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "diag_qr": ratio_allclose(atol=1, rtol=0, max_error_ratio=0),
+            "diag_qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "diag_attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
