@@ -523,13 +523,23 @@ def _hc_pre_separate(
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
             k0 = kb * RMS_K_CHUNK
-            x_chunk = pl.slice(
-                x_flat,
-                [T_TILE, RMS_K_CHUNK],
-                [t0, k0],
-                valid_shape=[valid_rows, RMS_K_CHUNK],
-            )
-            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
+            if valid_rows == T_TILE:
+                x_chunk_full = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
+                sq_sum = pl.add(
+                    sq_sum,
+                    pl.reshape(pl.row_sum(pl.mul(x_chunk_full, x_chunk_full)), [1, T_TILE]),
+                )
+            else:
+                x_chunk_tail = pl.slice(
+                    x_flat,
+                    [T_TILE, RMS_K_CHUNK],
+                    [t0, k0],
+                    valid_shape=[valid_rows, RMS_K_CHUNK],
+                )
+                sq_sum = pl.add(
+                    sq_sum,
+                    pl.reshape(pl.row_sum(pl.mul(x_chunk_tail, x_chunk_tail)), [1, T_TILE]),
+                )
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
