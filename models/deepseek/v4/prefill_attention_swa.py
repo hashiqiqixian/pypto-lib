@@ -156,19 +156,23 @@ def prefill_attention_swa(
         rope_sin_t,
     )
 
-    # Diagnostic breakpoint: add QKV preparation, QR, and qproj matmul only.
+    # Diagnostic breakpoint: add QKV preparation and the complete Q branch.
     x_matmul = pl.create_tensor([T, D], dtype=pl.BF16)
+    q_storage = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     qr_storage = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale_storage = pl.create_tensor([T, 1], dtype=pl.FP32)
     qr = pl.slice(qr_storage, [num_tokens, Q_LORA], [0, 0])
     qr_scale = pl.slice(qr_scale_storage, [num_tokens, 1], [0, 0])
+    q = pl.slice(q_storage, [num_tokens, H, HEAD_DIM], [0, 0, 0])
     qkv_prepare_diagnostic(
         x_normed,
         wq_a,
         wq_b,
+        wq_b_scale,
         rope_cos_t,
         rope_sin_t,
         gamma_cq,
+        q,
         qr,
         qr_scale,
         x_matmul,
