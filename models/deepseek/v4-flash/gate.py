@@ -293,14 +293,7 @@ def _gate_core(
             local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE, :]
             gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
             gather_valid = pl.set_validshape(gather_all, GATE_T_TILE, TOPK)
-            topk_vals_pad_buf = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32)
-            topk_vals_pad_buf[:, :] = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
-            topk_vals_pad = pl.load(
-                topk_vals_pad_buf,
-                [0, 0],
-                [GATE_T_TILE, TOPK_PAD],
-                target_memory=pl.MemorySpace.Vec,
-            )
+            topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
             nm_reduce_tmp = pl.create_tile(
                 [GATE_T_TILE, TOPK_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
             )
