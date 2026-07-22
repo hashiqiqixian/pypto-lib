@@ -97,10 +97,10 @@ assert RECV_MAX == N_RANKS * MAX_PER_SRC
 # pl.at(CORE_GROUP) so program order stays push -> notify -> wait -> gather.
 @pl.jit.inline
 def dispatch(
-    indices: pl.Tensor[[T_DYN, TOPK], pl.INT32],
-    x_norm_i8: pl.Tensor[[T_DYN, D], pl.INT8],
-    x_norm_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
-    weights: pl.Tensor[[T_DYN, TOPK], pl.FP32],
+    indices: pl.Tensor,
+    x_norm_i8: pl.Tensor,
+    x_norm_scale: pl.Tensor,
+    weights: pl.Tensor,
     # compact per-expert outputs consumed by expert_routed / combine
     recv_x_out: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.INT8],
     recv_scale_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
@@ -277,8 +277,8 @@ def dispatch(
 def combine(
     recv_y: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.BF16],
     recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
-    sh: pl.Tensor[[T_DYN, D], pl.BF16],
-    ffn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    sh: pl.Tensor,
+    ffn_out: pl.Tensor,
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -350,7 +350,7 @@ def combine(
 @pl.jit.inline(auto_scope=False)
 def moe(
     # model inputs
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor,
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -358,7 +358,7 @@ def moe(
     gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[T_DYN], pl.INT64],
+    input_ids: pl.Tensor,
     routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
@@ -372,7 +372,7 @@ def moe(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # final output
-    x_next: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    x_next: pl.Tensor,
     # windows
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -387,7 +387,7 @@ def moe(
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id for the shared flag windows (distinct from layer_id).
     moe_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]:
+):
     t_dim = pl.tensor.dim(x_hc, 0)
     # Non-output intermediates allocate locally, in their producer's scope.
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
