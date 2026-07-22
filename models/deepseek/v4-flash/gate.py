@@ -47,19 +47,19 @@ assert TOPK <= TOPK_PAD
 
 @pl.jit.inline
 def _gate_core(
-    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    x_mixed: pl.Tensor,
     norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
     active_tokens_arg: pl.Scalar[pl.INDEX],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[T_DYN], pl.INT64],
-    x_norm: pl.Tensor[[T_DYN, D], pl.BF16],
-    x_norm_i8: pl.Tensor[[T_DYN, D], pl.INT8],
-    x_norm_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
-    indices: pl.Tensor[[T_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[T_DYN, TOPK], pl.FP32],
+    input_ids: pl.Tensor,
+    x_norm: pl.Tensor,
+    x_norm_i8: pl.Tensor,
+    x_norm_scale: pl.Tensor,
+    indices: pl.Tensor,
+    weights: pl.Tensor,
 ):
     token_dim = pl.tensor.dim(x_mixed, 0)
     token_pad = ((token_dim + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
@@ -321,18 +321,18 @@ def _gate_core(
 
 @pl.jit.inline
 def gate(
-    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    x_mixed: pl.Tensor,
     norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[T_DYN], pl.INT64],
-    x_norm: pl.Tensor[[T_DYN, D], pl.BF16],
-    x_norm_i8: pl.Tensor[[T_DYN, D], pl.INT8],
-    x_norm_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
-    indices: pl.Tensor[[T_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[T_DYN, TOPK], pl.FP32],
+    input_ids: pl.Tensor,
+    x_norm: pl.Tensor,
+    x_norm_i8: pl.Tensor,
+    x_norm_scale: pl.Tensor,
+    indices: pl.Tensor,
+    weights: pl.Tensor,
 ):
     token_dim = pl.tensor.dim(x_mixed, 0)
     gate_done = _gate_core(

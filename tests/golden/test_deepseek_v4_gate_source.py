@@ -37,7 +37,7 @@ def _calls_named(function: ast.FunctionDef, name: str) -> list[ast.Call]:
     ]
 
 
-def test_gate_uses_one_dynamic_token_dimension_without_num_tokens() -> None:
+def test_gate_derives_token_dimension_without_leaking_entry_symbol() -> None:
     tree = _module()
     gate = _function(tree, "gate")
     gate_test = _function(tree, "gate_test")
@@ -54,13 +54,20 @@ def test_gate_uses_one_dynamic_token_dimension_without_num_tokens() -> None:
         "indices",
         "weights",
     }
-    annotations = {
+    gate_annotations = {
         arg.arg: ast.unparse(arg.annotation)
         for arg in gate.args.args
         if arg.annotation is not None and arg.arg in token_aligned
     }
-    assert set(annotations) == token_aligned
-    assert all("T_DYN" in annotation for annotation in annotations.values())
+    assert gate_annotations == {name: "pl.Tensor" for name in token_aligned}
+
+    entry_annotations = {
+        arg.arg: ast.unparse(arg.annotation)
+        for arg in gate_test.args.args
+        if arg.annotation is not None and arg.arg in token_aligned
+    }
+    assert set(entry_annotations) == token_aligned
+    assert all("T_DYN" in annotation for annotation in entry_annotations.values())
 
     dim_calls = _calls_named(gate, "pl.tensor.dim")
     assert len(dim_calls) == 1

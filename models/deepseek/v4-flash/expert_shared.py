@@ -49,15 +49,15 @@ W2_ACT_INNER = 8
 
 @pl.jit.inline
 def expert_shared(
-    x_local_i8: pl.Tensor[[T_DYN, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[T_DYN, 1], pl.FP32],
+    x_local_i8: pl.Tensor,
+    x_local_scale_dq: pl.Tensor,
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Tensor[[T_DYN, D], pl.BF16],
+    sh: pl.Tensor,
     late_dep: pl.Scalar[pl.TASK_ID],
 ):
     t_dim = pl.tensor.dim(x_local_i8, 0)
