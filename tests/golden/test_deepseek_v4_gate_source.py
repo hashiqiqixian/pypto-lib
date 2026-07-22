@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-GATE_SOURCE = ROOT / "models" / "deepseek" / "v4" / "gate.py"
+GATE_SOURCE = ROOT / "models" / "deepseek" / "v4-flash" / "gate.py"
 
 
 def _module() -> ast.Module:
