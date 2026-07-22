@@ -377,7 +377,7 @@ def prefill_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
+            pl.cast(0, pl.INT32), my_rank, pl.cast(1, pl.INT32),
         )
 
     # ===================== layer 1 : swa =================================
@@ -441,7 +441,7 @@ def prefill_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
+            pl.cast(1, pl.INT32), my_rank, pl.cast(2, pl.INT32),
         )
 
     # Reuse the fixed-capacity Attention/MoE handoff buffers across all layer pairs.
@@ -543,7 +543,7 @@ def prefill_fwd(
                 hidden_mid,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                csa_layer, nt, my_rank, csa_moe_epoch,
+                csa_layer, my_rank, csa_moe_epoch,
             )
 
         # ---- hca attention weights (per-FWD by hca_layer, compact by loop_i) ----
@@ -615,7 +615,7 @@ def prefill_fwd(
                 hidden,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                hca_layer, nt, my_rank, hca_moe_epoch,
+                hca_layer, my_rank, hca_moe_epoch,
             )
 
     # ================ layer 42 (FWD_LAST_LAYER) : csa -> x_out ===========
@@ -707,7 +707,7 @@ def prefill_fwd(
             pre_hc_hidden_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            csa_layer_last, nt, my_rank, last_moe_epoch,
+            csa_layer_last, my_rank, last_moe_epoch,
         )
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():

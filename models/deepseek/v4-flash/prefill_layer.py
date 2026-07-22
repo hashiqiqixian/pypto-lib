@@ -391,7 +391,7 @@ def prefill_layer_core(
                 x_next_tile,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                layer_id, valid_n, my_rank, moe_epoch,
+                layer_id, my_rank, moe_epoch,
             )
 
             # Scatter the tile back into the padded physical output. Each
