@@ -615,7 +615,7 @@ def qkv_proj_rope(
         tg = tg_idx * KV_RMS_T_TILE
         valid_rows = pl.min(KV_RMS_T_TILE, t_dim - tg)
         kv_reduce_tmp = pl.create_tile(
-            [KV_RMS_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            [KV_RMS_T_TILE, KV_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
         )
         kv_gather_tmp = pl.create_tile(
             [KV_RMS_T_TILE, ROPE_DIM], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
