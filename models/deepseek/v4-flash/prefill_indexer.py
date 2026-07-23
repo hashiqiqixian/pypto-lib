@@ -127,7 +127,7 @@ def prefill_indexer(
     idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    score_dyn: pl.Out[pl.Tensor[[T_DYN, INDEXER_SCORE_CAP], pl.FP32]],
+    score_dyn: pl.Out[pl.Tensor[[T_DYN, INDEXER_SCORE_CAP], pl.INT32]],
     cmp_topk_indices_dyn: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
     position_ids_in: pl.Tensor[[T_DYN], pl.INT32],
     idx_slot_mapping_in: pl.Tensor[[T_DYN], pl.INT64],
@@ -172,6 +172,7 @@ def prefill_indexer(
             pl.store(qr_scale_row, [0, scale_t0], qr_scale)
     # === Q projection: int8 qr x int8 wq_b -> dequant (mirrors decode_indexer qr_proj) ===
     qr_proj = pl.create_tensor([work_tokens, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
+    qr_acc_diag = pl.create_tensor([work_tokens, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
     qr_col_blocks = IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE
     qr_tasks = (work_tokens // QR_PROJ_ROW_TILE) * qr_col_blocks
     with pl.spmd(qr_tasks, name_hint="prefill_idx_qr_proj", deps=[qr_scale_tid]) as _qr_proj_tid:
@@ -188,6 +189,7 @@ def prefill_indexer(
             qr_tile = qr[r0 : r0 + QR_PROJ_ROW_TILE, q0 : q0 + Q_TILE]
             wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
             qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+        qr_acc_diag[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_acc
         wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
         acc_fp32 = pl.cast(qr_acc, target_type=pl.FP32, mode="none")
         scale_dq = pl.reshape(qr_scale[:, r0 : r0 + QR_PROJ_ROW_TILE], [QR_PROJ_ROW_TILE, 1])
@@ -354,16 +356,25 @@ def prefill_indexer(
                     cmp_topk_indices[t : t + 1, 0:PREFILL_TOPK_CAP] = pl.set_validshape(
                         topk_idxs_tile, 1, valid_topk)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_indexer_dynamic_store"):
-        for t0 in pl.range(0, num_tokens, TOPK_TILE):
-            valid_rows = pl.min(TOPK_TILE, num_tokens - t0)
-            score_tile = pl.load(
-                score,
-                [t0, 0],
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_tail_diagnostic") as diag_tid:
+        for diag_t0 in pl.range(0, num_tokens, TOPK_TILE):
+            diag_valid_rows = pl.min(TOPK_TILE, num_tokens - diag_t0)
+            qr_acc_tile = pl.load(
+                qr_acc_diag,
+                [diag_t0, 0],
                 [TOPK_TILE, INDEXER_SCORE_CAP],
-                valid_shapes=[valid_rows, INDEXER_SCORE_CAP],
+                valid_shapes=[diag_valid_rows, INDEXER_SCORE_CAP],
                 target_memory=pl.MemorySpace.Vec,
             )
+            pl.store(qr_acc_tile, [diag_t0, 0], score_dyn)
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_indexer_dynamic_store",
+        deps=[diag_tid],
+    ):
+        for t0 in pl.range(0, num_tokens, TOPK_TILE):
+            valid_rows = pl.min(TOPK_TILE, num_tokens - t0)
             topk_tile = pl.load(
                 cmp_topk_indices,
                 [t0, 0],
@@ -371,7 +382,6 @@ def prefill_indexer(
                 valid_shapes=[valid_rows, IDX_TOPK],
                 target_memory=pl.MemorySpace.Vec,
             )
-            pl.store(score_tile, [t0, 0], score_dyn)
             pl.store(topk_tile, [t0, 0], cmp_topk_indices_dyn)
     return idx_kv_cache, idx_kv_scale, score_dyn, cmp_topk_indices_dyn
 
@@ -495,7 +505,9 @@ def golden_prefill_indexer(tensors):
     topk_idxs = torch.full((tensors["x"].shape[0], INDEXER_SCORE_CAP), -1, dtype=torch.int32)
     compare_cols = min(IDX_TOPK, INDEXER_SCORE_CAP)
     topk_idxs[:, 0:compare_cols] = cmp_topk_indices[:, 0:compare_cols]
-    tensors["score"][:] = score_full
+    qr = tensors["qr"]
+    wq_b = tensors["wq_b"]
+    tensors["score"][:] = (qr.to(torch.int32) @ wq_b.to(torch.int32))[:, :INDEXER_SCORE_CAP]
     tensors["topk_idxs"][:] = topk_idxs
 
 
@@ -747,7 +759,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
         TensorSpec("idx_kv_cache", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
         TensorSpec("idx_kv_scale", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
-        TensorSpec("score", [num_tokens, INDEXER_SCORE_CAP], torch.float32, is_output=True),
+        TensorSpec("score", [num_tokens, INDEXER_SCORE_CAP], torch.int32, is_output=True),
         TensorSpec("topk_idxs", [num_tokens, INDEXER_SCORE_CAP], torch.int32, is_output=True),
         TensorSpec("position_ids", [num_tokens], torch.int32, init_value=init_position_ids),
         TensorSpec("idx_slot_mapping", [num_tokens], torch.int64, init_value=init_idx_slot_mapping),
@@ -805,7 +817,7 @@ if __name__ == "__main__":
         atol=1e-3,
         compile_only=args.compile_only,
         compare_fn={
-            "score": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "score": ratio_allclose(atol=0, rtol=0),
             "topk_idxs": topk_idxs_compare,
             # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
