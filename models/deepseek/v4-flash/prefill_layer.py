@@ -122,7 +122,14 @@ TOK_TILE = T
 PREFILL_CHUNK_TOKENS = T
 DEFAULT_CHUNK_LENS = (T, T + T // 2)
 DEFAULT_USER_BATCH = len(DEFAULT_CHUNK_LENS)
-PREFILL_LAYER_RING_HEAP = (0, 512 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 0)
+# Dynamic attention scopes need the larger inner-ring heaps, and the packed
+# layer scope keeps more than the default ring-3 heap live until scope_end.
+PREFILL_LAYER_RING_HEAP = (
+    0,
+    512 * 1024 * 1024,
+    2 * 1024 * 1024 * 1024,
+    512 * 1024 * 1024,
+)
 
 # Per-request contiguous block/state counts (each request owns one such slice; the
 # packed buffer dim0 is ``user_batch * <count>``). The cache/state block tables are

@@ -126,8 +126,14 @@ LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 # Dynamic attention scopes exceed the default ring-1 heap, while the full
-# 43-layer prefill schedule still needs the larger ring-2 heap.
-PREFILL_RING_HEAP = (0, 512 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 0)
+# 43-layer prefill schedule still needs the larger ring-2 heap. Packed dynamic
+# scopes also retain more than the default ring-3 heap before scope_end.
+PREFILL_RING_HEAP = (
+    0,
+    512 * 1024 * 1024,
+    2 * 1024 * 1024 * 1024,
+    512 * 1024 * 1024,
+)
 
 # Replicated head weights (per-rank, not layer-stacked): hc_head projection and
 # the final RMSNorm gamma — mirrors decode_fwd.

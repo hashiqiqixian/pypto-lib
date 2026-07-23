@@ -312,10 +312,22 @@ def test_full_prefill_uses_physical_dynamic_token_shape_without_scalar_length() 
     assert "ScalarSpec('num_tokens'" not in fixture_source
 
 
-def test_full_prefill_sizes_both_active_runtime_rings() -> None:
-    source = (MODEL / "prefill_fwd.py").read_text(encoding="utf-8")
+def test_prefill_drivers_size_active_runtime_rings() -> None:
+    expected = "(0, 512 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 512 * 1024 * 1024)"
 
-    assert "PREFILL_RING_HEAP = (0, 512 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 0)" in source
+    for filename, name in (
+        ("prefill_layer.py", "PREFILL_LAYER_RING_HEAP"),
+        ("prefill_fwd.py", "PREFILL_RING_HEAP"),
+    ):
+        assignment = next(
+            node
+            for node in _tree(filename).body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        )
+        assert ast.unparse(assignment.value) == expected
 
 
 def test_full_prefill_reuses_fixed_capacity_buffers_across_layer_pairs() -> None:
