@@ -137,7 +137,7 @@ def prefill_indexer(
     work_tokens = ((num_tokens + TOPK_TILE - 1) // TOPK_TILE) * TOPK_TILE
     x = pl.create_tensor([work_tokens, D], dtype=pl.BF16)
     qr = pl.create_tensor([work_tokens, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([work_tokens, 1], dtype=pl.FP32)
+    qr_scale = pl.create_tensor([1, work_tokens], dtype=pl.FP32)
     cos = pl.create_tensor([work_tokens, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     sin = pl.create_tensor([work_tokens, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     score = pl.create_tensor([work_tokens, INDEXER_SCORE_CAP], dtype=pl.FP32)
@@ -148,23 +148,34 @@ def prefill_indexer(
         qr_row = pl.cast(qr_row_i16, target_type=pl.INT8, mode="trunc")
         cos_row = pl.tile.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_row = pl.tile.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        qr_scale_value = 0.0
         if pad_t < num_tokens:
             x_row = pl.load(x_in, [pad_t, 0], [1, D], target_memory=pl.MemorySpace.Vec)
             qr_row = pl.load(qr_in, [pad_t, 0], [1, Q_LORA], target_memory=pl.MemorySpace.Vec)
             cos_row = pl.load(cos_in, [pad_t, 0], [1, ROPE_HEAD_DIM // 2], target_memory=pl.MemorySpace.Vec)
             sin_row = pl.load(sin_in, [pad_t, 0], [1, ROPE_HEAD_DIM // 2], target_memory=pl.MemorySpace.Vec)
-            qr_scale_value = pl.read(qr_scale_in, [pad_t, 0])
         pl.store(x_row, [pad_t, 0], x)
         pl.store(qr_row, [pad_t, 0], qr)
         pl.store(cos_row, [pad_t, 0], cos)
         pl.store(sin_row, [pad_t, 0], sin)
-        pl.write(qr_scale, [pad_t, 0], qr_scale_value)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_indexer_dynamic_pad_scale") as qr_scale_tid:
+        for scale_t0 in pl.range(0, num_tokens, TOPK_TILE):
+            scale_valid_rows = pl.min(TOPK_TILE, num_tokens - scale_t0)
+            qr_scale_tile = pl.load(
+                qr_scale_in,
+                [scale_t0, 0],
+                [TOPK_TILE, 1],
+                valid_shapes=[scale_valid_rows, 1],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            qr_scale_row = pl.reshape(qr_scale_tile, [1, TOPK_TILE])
+            qr_scale_row = pl.fillpad(qr_scale_row, pad_value=pl.PadValue.zero)
+            pl.store(qr_scale_row, [0, scale_t0], qr_scale)
     # === Q projection: int8 qr x int8 wq_b -> dequant (mirrors decode_indexer qr_proj) ===
     qr_proj = pl.create_tensor([work_tokens, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
     qr_col_blocks = IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE
     qr_tasks = (work_tokens // QR_PROJ_ROW_TILE) * qr_col_blocks
-    for idx in pl.spmd(qr_tasks, name_hint="prefill_idx_qr_proj"):
+    with pl.spmd(qr_tasks, name_hint="prefill_idx_qr_proj", deps=[qr_scale_tid]) as _qr_proj_tid:
+        idx = pl.tile.get_block_idx()
         o_block = idx % qr_col_blocks
         r_block = idx // qr_col_blocks
         o0 = o_block * Q_OUT_TILE
@@ -179,7 +190,7 @@ def prefill_indexer(
             qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
         wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
         acc_fp32 = pl.cast(qr_acc, target_type=pl.FP32, mode="none")
-        scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
+        scale_dq = pl.reshape(qr_scale[:, r0 : r0 + QR_PROJ_ROW_TILE], [QR_PROJ_ROW_TILE, 1])
         qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
         qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
 
