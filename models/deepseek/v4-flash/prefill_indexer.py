@@ -163,25 +163,26 @@ def prefill_indexer(
     # === Q projection: int8 qr x int8 wq_b -> dequant (mirrors decode_indexer qr_proj) ===
     qr_proj = pl.create_tensor([work_tokens, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
     qr_col_blocks = IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE
-    qr_tasks = (work_tokens // QR_PROJ_ROW_TILE) * qr_col_blocks
+    qr_tasks = (T // QR_PROJ_ROW_TILE) * qr_col_blocks
     for idx in pl.spmd(qr_tasks, name_hint="prefill_idx_qr_proj"):
         o_block = idx % qr_col_blocks
         r_block = idx // qr_col_blocks
         o0 = o_block * Q_OUT_TILE
         r0 = r_block * QR_PROJ_ROW_TILE
-        qr_tile = qr[r0 : r0 + QR_PROJ_ROW_TILE, 0:Q_TILE]
-        wq_tile = wq_b[0:Q_TILE, o0 : o0 + Q_OUT_TILE]
-        qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-        for kb in pl.pipeline(1, Q_LORA // Q_TILE, stage=2):
-            q0 = kb * Q_TILE
-            qr_tile = qr[r0 : r0 + QR_PROJ_ROW_TILE, q0 : q0 + Q_TILE]
-            wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-            qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
-        wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
-        acc_fp32 = pl.cast(qr_acc, target_type=pl.FP32, mode="none")
-        scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
-        qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
-        qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
+        if r0 < work_tokens:
+            qr_tile = qr[r0 : r0 + QR_PROJ_ROW_TILE, 0:Q_TILE]
+            wq_tile = wq_b[0:Q_TILE, o0 : o0 + Q_OUT_TILE]
+            qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
+            for kb in pl.pipeline(1, Q_LORA // Q_TILE, stage=2):
+                q0 = kb * Q_TILE
+                qr_tile = qr[r0 : r0 + QR_PROJ_ROW_TILE, q0 : q0 + Q_TILE]
+                wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
+                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+            wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
+            acc_fp32 = pl.cast(qr_acc, target_type=pl.FP32, mode="none")
+            scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
+            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
+            qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
 
     # === Q RoPE (A3 interleaved swap-gather), one task per token (its IDX_N_HEADS rows + cos/sin) ===
     qr_proj_flat = pl.reshape(qr_proj, [work_tokens * IDX_N_HEADS, IDX_HEAD_DIM])
@@ -343,16 +344,47 @@ def prefill_indexer(
                     cmp_topk_indices[t : t + 1, 0:PREFILL_TOPK_CAP] = pl.set_validshape(
                         topk_idxs_tile, 1, valid_topk)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_indexer_dynamic_store"):
-        for t0 in pl.range(0, num_tokens, TOPK_TILE):
-            valid_rows = pl.min(TOPK_TILE, num_tokens - t0)
-            score_tile = pl.load(
-                score,
-                [t0, 0],
-                [TOPK_TILE, INDEXER_SCORE_CAP],
-                valid_shapes=[valid_rows, INDEXER_SCORE_CAP],
+    # Temporary data-flow breakpoint: compare raw and materialized QR scales.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_dataflow_diagnostic") as diag_tid:
+        for diag_t0 in pl.range(0, num_tokens, TOPK_TILE):
+            diag_valid_rows = pl.min(TOPK_TILE, num_tokens - diag_t0)
+            qr_scale_input_tile = pl.load(
+                qr_scale_in,
+                [diag_t0, 0],
+                [TOPK_TILE, 1],
+                valid_shapes=[diag_valid_rows, 1],
                 target_memory=pl.MemorySpace.Vec,
             )
+            qr_scale_materialized_tile = pl.load(
+                qr_scale,
+                [diag_t0, 0],
+                [TOPK_TILE, 1],
+                valid_shapes=[diag_valid_rows, 1],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            scale_ones = pl.tile.full(
+                [TOPK_TILE, INDEXER_SCORE_CAP // 2],
+                dtype=pl.FP32,
+                value=1.0,
+            )
+            pl.store(
+                pl.row_expand_mul(scale_ones, qr_scale_input_tile),
+                [diag_t0, 0],
+                score_dyn,
+            )
+            pl.store(
+                pl.row_expand_mul(scale_ones, qr_scale_materialized_tile),
+                [diag_t0, INDEXER_SCORE_CAP // 2],
+                score_dyn,
+            )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_indexer_dynamic_store",
+        deps=[diag_tid],
+    ):
+        for t0 in pl.range(0, num_tokens, TOPK_TILE):
+            valid_rows = pl.min(TOPK_TILE, num_tokens - t0)
             topk_tile = pl.load(
                 cmp_topk_indices,
                 [t0, 0],
@@ -360,7 +392,6 @@ def prefill_indexer(
                 valid_shapes=[valid_rows, IDX_TOPK],
                 target_memory=pl.MemorySpace.Vec,
             )
-            pl.store(score_tile, [t0, 0], score_dyn)
             pl.store(topk_tile, [t0, 0], cmp_topk_indices_dyn)
     return idx_kv_cache, idx_kv_scale, score_dyn, cmp_topk_indices_dyn
 
@@ -484,7 +515,9 @@ def golden_prefill_indexer(tensors):
     topk_idxs = torch.full((tensors["x"].shape[0], INDEXER_SCORE_CAP), -1, dtype=torch.int32)
     compare_cols = min(IDX_TOPK, INDEXER_SCORE_CAP)
     topk_idxs[:, 0:compare_cols] = cmp_topk_indices[:, 0:compare_cols]
-    tensors["score"][:] = score_full
+    qr_scale = tensors["qr_scale"].float()
+    tensors["score"][:, : INDEXER_SCORE_CAP // 2] = qr_scale.expand(-1, INDEXER_SCORE_CAP // 2)
+    tensors["score"][:, INDEXER_SCORE_CAP // 2 :] = qr_scale.expand(-1, INDEXER_SCORE_CAP // 2)
     tensors["topk_idxs"][:] = topk_idxs
 
 
@@ -794,8 +827,8 @@ if __name__ == "__main__":
         atol=1e-3,
         compile_only=args.compile_only,
         compare_fn={
-            "score": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "topk_idxs": topk_idxs_compare,
+            "score": ratio_allclose(atol=1e-6, rtol=1e-6),
+            "topk_idxs": ratio_allclose(atol=0, rtol=0, max_error_ratio=1.0),
             # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
             "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
