@@ -253,10 +253,8 @@ def prefill_sparse_attn(
             sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
             denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
             n_full = pl.row_expand_div(m_oi, denom)[0:QK_M_TILE, :]
-            n_nope_bf16 = pl.cast(n_full[0:QK_M_TILE, 0:NOPE_DIM], target_type=pl.BF16, mode="rint")
         else:
             n_full = pl.full([QK_M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-            n_nope_bf16 = pl.full([QK_M_TILE, NOPE_DIM], dtype=pl.BF16, value=0.0)
 
         attn_rope_stage[qk_rope_row:qk_rope_row + QK_M_TILE, :] = n_full[0:QK_M_TILE, NOPE_DIM:HEAD_DIM]
         for n_hi in pl.range(QK_M_TILE):
@@ -264,7 +262,8 @@ def prefill_sparse_attn(
             g = gh // HEADS_PER_GROUP
             pack_row = g * T + qk_t
             col = (gh - g * HEADS_PER_GROUP) * HEAD_DIM
-            o_packed[pack_row:pack_row + 1, col:col + NOPE_DIM] = n_nope_bf16[n_hi:n_hi + 1, :]
+            n_row_bf16 = pl.cast(n_full[n_hi:n_hi + 1, :], target_type=pl.BF16, mode="rint")
+            o_packed[pack_row:pack_row + 1, col:col + NOPE_DIM] = n_row_bf16[:, 0:NOPE_DIM]
 
     # Inverse RoPE fused with the rope-column pack: out[j] = x[j]*cos_il[j] + x[j^1]*sin_signed[j].
     # Precompute the head-invariant cos_il / sign-folded sin once, then rotate each head's rope
