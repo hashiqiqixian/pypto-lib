@@ -62,7 +62,9 @@ CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 
 # Kernel tiling (mirrors decode sparse-attn).
-QK_M_TILE = 8                        # persistent head rows per fused QK/PV/merge task
+QK_M_TILE = 16                       # persistent head rows per fused QK/PV/merge task
+PV_N_TILE = 256                      # output columns kept live across the online merge
+assert HEAD_DIM % PV_N_TILE == 0
 GATHER_TOKEN_TILE = 4
 BIAS_TOKEN_TILE = 16
 QUANT_TOKEN_TILE = 8
@@ -208,58 +210,79 @@ def prefill_sparse_attn(
             )
             qk_head_row = qk_t * H + qk_h0
             qk_q_tile = q_flat[qk_head_row:qk_head_row + QK_M_TILE, :]
-            # WIN occupies the first block, so every active token has at least one block.
-            # Peel it to initialize the online state without a padded [M, 1] full tile.
-            qk_s0 = qk_kv_base
-            qk_kv_k = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
-            qk_kv_v = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
-            qk_bias_row = sparse_bias[qk_t:qk_t + 1, 0:PREFILL_ATTN_TILE]
-            qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-            qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-            qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
-            m_mi = pl.row_max(qk_scores)
-            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, m_mi))
-            m_li = pl.row_sum(qk_exp)
-            qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-            m_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-
-            for qk_sb in pl.range(1, qk_active_blocks):
-                qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
+            sink_bias = attn_sink_col[qk_h0:qk_h0 + QK_M_TILE, :]
+            for pv_n0 in pl.range(0, HEAD_DIM, PV_N_TILE):
+                # WIN occupies the first block, so every active token has at least one block.
+                # Peel it to initialize the online state without a padded [M, 1] full tile.
+                qk_s0 = qk_kv_base
                 qk_kv_k = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
-                qk_kv_v = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
-                qk_bias_row = sparse_bias[qk_t:qk_t + 1, qk_sb * PREFILL_ATTN_TILE:qk_sb * PREFILL_ATTN_TILE + PREFILL_ATTN_TILE]
+                qk_kv_v = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, pv_n0:pv_n0 + PV_N_TILE]
+                qk_bias_row = sparse_bias[qk_t:qk_t + 1, 0:PREFILL_ATTN_TILE]
                 qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                # Broadcast-add the per-block bias directly (col_expand_add) instead of
-                # col_expand into a dead pl.full(0) base + a separate add (mirrors decode).
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
                 qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
-                cur_mi = pl.row_max(qk_scores)
-                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, cur_mi))
-                # li sums the FP32 exp; only the PV matmul uses the BF16 cast.
-                cur_li = pl.row_sum(qk_exp)
+                m_mi = pl.row_max(qk_scores)
+                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, m_mi))
+                m_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                cur_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                mi_new = pl.maximum(m_mi, cur_mi)
-                alpha = pl.exp(pl.sub(m_mi, mi_new))
-                beta = pl.exp(pl.sub(cur_mi, mi_new))
-                m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
-                m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
-                m_mi = mi_new
-            sink_bias = attn_sink_col[qk_h0:qk_h0 + QK_M_TILE, :]
-            sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
-            denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
-            n_full = pl.row_expand_div(m_oi, denom)[0:QK_M_TILE, :]
-        else:
-            n_full = pl.full([QK_M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                m_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
 
-        attn_rope_stage[qk_rope_row:qk_rope_row + QK_M_TILE, :] = n_full[0:QK_M_TILE, NOPE_DIM:HEAD_DIM]
-        for n_hi in pl.range(QK_M_TILE):
-            gh = qk_h0 + n_hi
-            g = gh // HEADS_PER_GROUP
-            pack_row = g * T + qk_t
-            col = (gh - g * HEADS_PER_GROUP) * HEAD_DIM
-            n_row_bf16 = pl.cast(n_full[n_hi:n_hi + 1, :], target_type=pl.BF16, mode="rint")
-            o_packed[pack_row:pack_row + 1, col:col + HEAD_DIM] = n_row_bf16
+                for qk_sb in pl.range(1, qk_active_blocks):
+                    qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
+                    qk_kv_k = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
+                    qk_kv_v = sparse_kv[
+                        qk_s0:qk_s0 + PREFILL_ATTN_TILE,
+                        pv_n0:pv_n0 + PV_N_TILE,
+                    ]
+                    qk_bias_row = sparse_bias[
+                        qk_t:qk_t + 1,
+                        qk_sb * PREFILL_ATTN_TILE:qk_sb * PREFILL_ATTN_TILE + PREFILL_ATTN_TILE,
+                    ]
+                    qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                    qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+                    qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
+                    cur_mi = pl.row_max(qk_scores)
+                    qk_exp = pl.exp(pl.row_expand_sub(qk_scores, cur_mi))
+                    cur_li = pl.row_sum(qk_exp)
+                    qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                    cur_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                    mi_new = pl.maximum(m_mi, cur_mi)
+                    alpha = pl.exp(pl.sub(m_mi, mi_new))
+                    beta = pl.exp(pl.sub(cur_mi, mi_new))
+                    m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
+                    m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
+                    m_mi = mi_new
+
+                sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
+                denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
+                n_chunk = pl.row_expand_div(m_oi, denom)[0:QK_M_TILE, :]
+                if pv_n0 == HEAD_DIM - PV_N_TILE:
+                    rope_c0 = NOPE_DIM - pv_n0
+                    attn_rope_stage[qk_rope_row:qk_rope_row + QK_M_TILE, :] = n_chunk[
+                        0:QK_M_TILE,
+                        rope_c0:rope_c0 + ROPE_DIM,
+                    ]
+                for n_hi in pl.range(QK_M_TILE):
+                    gh = qk_h0 + n_hi
+                    g = gh // HEADS_PER_GROUP
+                    pack_row = g * T + qk_t
+                    col = (gh - g * HEADS_PER_GROUP) * HEAD_DIM + pv_n0
+                    n_row_bf16 = pl.cast(n_chunk[n_hi:n_hi + 1, :], target_type=pl.BF16, mode="rint")
+                    o_packed[pack_row:pack_row + 1, col:col + PV_N_TILE] = n_row_bf16
+        else:
+            attn_rope_stage[qk_rope_row:qk_rope_row + QK_M_TILE, :] = pl.full(
+                [QK_M_TILE, ROPE_DIM],
+                dtype=pl.FP32,
+                value=0.0,
+            )
+            zero_row = pl.full([1, PV_N_TILE], dtype=pl.BF16, value=0.0)
+            for pv_n0 in pl.range(0, HEAD_DIM, PV_N_TILE):
+                for n_hi in pl.range(QK_M_TILE):
+                    gh = qk_h0 + n_hi
+                    g = gh // HEADS_PER_GROUP
+                    pack_row = g * T + qk_t
+                    col = (gh - g * HEADS_PER_GROUP) * HEAD_DIM + pv_n0
+                    o_packed[pack_row:pack_row + 1, col:col + PV_N_TILE] = zero_row
 
     # Inverse RoPE fused with the rope-column pack: out[j] = x[j]*cos_il[j] + x[j^1]*sin_signed[j].
     # Precompute the head-invariant cos_il / sign-folded sin once, then rotate each head's rope
