@@ -195,7 +195,13 @@ def prefill_sparse_attn(
     sparse_blk_li = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([blk_rows, HEAD_DIM], dtype=pl.FP32)
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    for qk_t in pl.spmd(T, name_hint="qk_pv"):
+    attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
+    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
+    # Keep QK/PV and the online merge in one per-token task. The scratch tensors retain
+    # the proven Acc/Vec layout handoff, while the fused task removes a dispatch barrier
+    # and consumes each token's block statistics immediately after producing them.
+    with pl.spmd(T, name_hint="qk_pv_merge") as merge_tid:
+        qk_t = pl.tile.get_block_idx()
         if qk_t < num_tokens:
             qk_kv_base = qk_t * PREFILL_SPARSE_PAD
             qk_token_base = qk_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
@@ -231,25 +237,18 @@ def prefill_sparse_attn(
                         sparse_blk_li[qk_row:qk_row + HEAD_TILE, :] = qk_li[qk_r0:qk_r0 + HEAD_TILE, :]
                         sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = qk_oi[qk_r0:qk_r0 + HEAD_TILE, :]
 
-    # Online-softmax merge across blocks, sink-norm, then pack NOPE into o_packed and the
-    # FP32 rope slice into attn_rope_stage (full precision for the inverse rotation). Padding
-    # tokens (t >= num_tokens) write zeros.
-    attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
-    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-    # with-form spmd so the dispatch TaskId (merge_tid) is an explicit dep of the
-    # manual-scope proj_a tasks below (which read merge_norm's o_packed NOPE cols).
-    with pl.spmd(T, name_hint="merge_norm") as merge_tid:
-        m_t = pl.tile.get_block_idx()
-        m_token_base = m_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
+        # Online-softmax merge across blocks, sink-norm, then pack NOPE into o_packed and
+        # the FP32 rope slice into attn_rope_stage. Padding tokens write zeros.
+        m_token_base = qk_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
         for m_h_idx in pl.range(H // HEAD_TILE):
             m_h0 = m_h_idx * HEAD_TILE
-            m_rope_row = m_t * H + m_h0
-            if m_t < num_tokens:
+            m_rope_row = qk_t * H + m_h0
+            if qk_t < num_tokens:
                 m_blk_base = m_token_base + m_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE
                 m_mi = sparse_blk_mi[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_li = sparse_blk_li[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_oi = sparse_blk_oi[m_blk_base:m_blk_base + HEAD_TILE, :]
-                m_cmp_count = pl.read(cmp_counts, [m_t, 0])
+                m_cmp_count = pl.read(cmp_counts, [qk_t, 0])
                 m_active_blocks = pl.min(
                     pl.cast(PREFILL_ATTN_BLOCKS, pl.INT32),
                     (WIN + m_cmp_count + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE,
@@ -278,7 +277,7 @@ def prefill_sparse_attn(
             for n_hi in pl.range(HEAD_TILE):
                 gh = m_h0 + n_hi
                 g = gh // HEADS_PER_GROUP
-                pack_row = g * T + m_t
+                pack_row = g * T + qk_t
                 col = (gh - g * HEADS_PER_GROUP) * HEAD_DIM
                 o_packed[pack_row:pack_row + 1, col:col + NOPE_DIM] = n_bf16[n_hi:n_hi + 1, 0:NOPE_DIM]
 
@@ -340,7 +339,7 @@ def prefill_sparse_attn(
     # Grouped INT8 output projection, decoupled per-group (mirrors decode_sparse_attn):
     # proj_a_mm (pure cube) -> quant (PER-GROUP amax, no global barrier) -> proj_b_mm
     # (pure cube INT32 partials) -> proj_b_act (pure vector dequant+sum). manual_scope
-    # SUPPRESSES auto-dep: proj_a reads o_packed (merge_norm NOPE + rope cols), so it
+    # SUPPRESSES auto-dep: proj_a reads o_packed (qk_pv_merge NOPE + rope cols), so it
     # deps=[merge_tid, rope_tid]; quant[g] deps on group g's proj_a; proj_b[g] deps on
     # quant[g] ONLY -> group g's proj_b cube overlaps proj_a/quant of later groups (the
     # back-to-back GEMM the per-row global amax barrier used to forbid).
