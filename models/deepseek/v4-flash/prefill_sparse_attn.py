@@ -225,7 +225,7 @@ def prefill_sparse_attn(
                 qk_exp = pl.exp(pl.row_expand_sub(qk_scores, m_mi))
                 m_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                m_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                m_oi = pl.muls(pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32), 1.0)
 
                 for qk_sb in pl.range(1, qk_active_blocks):
                     qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
