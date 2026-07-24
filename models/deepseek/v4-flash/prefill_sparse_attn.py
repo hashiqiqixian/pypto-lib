@@ -208,10 +208,22 @@ def prefill_sparse_attn(
             )
             qk_head_row = qk_t * H + qk_h0
             qk_q_tile = q_flat[qk_head_row:qk_head_row + QK_M_TILE, :]
-            m_mi = pl.full([QK_M_TILE, 1], dtype=pl.FP32, value=FP32_NEG_INF)
-            m_li = pl.full([QK_M_TILE, 1], dtype=pl.FP32, value=0.0)
-            m_oi = pl.full([QK_M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-            for qk_sb in pl.range(qk_active_blocks):
+            # WIN occupies the first block, so every active token has at least one block.
+            # Peel it to initialize the online state without a padded [M, 1] full tile.
+            qk_s0 = qk_kv_base
+            qk_kv_k = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
+            qk_kv_v = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
+            qk_bias_row = sparse_bias[qk_t:qk_t + 1, 0:PREFILL_ATTN_TILE]
+            qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+            qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+            qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
+            m_mi = pl.row_max(qk_scores)
+            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, m_mi))
+            m_li = pl.row_sum(qk_exp)
+            qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+            m_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+
+            for qk_sb in pl.range(1, qk_active_blocks):
                 qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
                 qk_kv_k = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
                 qk_kv_v = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
