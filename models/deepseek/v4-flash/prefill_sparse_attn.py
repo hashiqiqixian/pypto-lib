@@ -189,11 +189,13 @@ def prefill_sparse_attn(
 
     # Keep one persistent online-softmax state per (token, head-batch) task. Each task walks
     # its active sparse blocks and writes the normalized output directly, avoiding the
-    # sparse_blk_mi/li/oi global-memory round-trip and the separate merge dispatch.
+    # per-block sparse_blk_mi/li/oi round-trip and the separate merge dispatch. The first
+    # PV result uses a single 256-column GM staging tile to normalize Acc -> Vec layout.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
+    oi_layout_stage = pl.create_tensor([T * H, PV_N_TILE], dtype=pl.FP32)
     qk_head_batches = H // QK_M_TILE
     with pl.spmd(T * qk_head_batches, name_hint="qk_pv_merge") as merge_tid:
         qk_idx = pl.tile.get_block_idx()
@@ -225,10 +227,12 @@ def prefill_sparse_attn(
                 qk_exp = pl.exp(pl.row_expand_sub(qk_scores, m_mi))
                 m_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                m_oi = pl.add(
-                    pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32),
-                    pl.full([QK_M_TILE, PV_N_TILE], dtype=pl.FP32, value=0.0),
+                oi_layout_stage[qk_head_row:qk_head_row + QK_M_TILE, :] = pl.matmul(
+                    qk_exp_bf16,
+                    qk_kv_v,
+                    out_dtype=pl.FP32,
                 )
+                m_oi = oi_layout_stage[qk_head_row:qk_head_row + QK_M_TILE, :]
 
                 for qk_sb in pl.range(1, qk_active_blocks):
                     qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
