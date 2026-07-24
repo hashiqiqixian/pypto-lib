@@ -231,10 +231,9 @@ def prefill_sparse_attn(
                 else:
                     for qk_h_idx in pl.unroll(H // HEAD_TILE):
                         qk_row = qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE + qk_sb * HEAD_TILE
-                        empty_mi = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=FP32_NEG_INF)
-                        empty_li = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
-                        sparse_blk_mi[qk_row:qk_row + HEAD_TILE, :] = empty_mi[:, 0:1]
-                        sparse_blk_li[qk_row:qk_row + HEAD_TILE, :] = empty_li[:, 0:1]
+                        for qk_hr in pl.unroll(HEAD_TILE):
+                            pl.write(sparse_blk_mi, [qk_row + qk_hr, 0], FP32_NEG_INF)
+                            pl.write(sparse_blk_li, [qk_row + qk_hr, 0], 0.0)
                         sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = pl.full(
                             [HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
 
