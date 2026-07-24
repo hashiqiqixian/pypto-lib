@@ -257,7 +257,7 @@ def prefill_attention_csa(
             t_idx = topk_t0 + topk_dt
             swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
             cmp_row = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-            cmp_count = pl.full([1], dtype=pl.INT32, value=0)
+            pl.write(cmp_counts, [t_idx], pl.cast(0, pl.INT32))
             if t_idx < num_tokens:
                 abs_pos = pl.read(position_ids, [t_idx])
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
@@ -273,8 +273,8 @@ def prefill_attention_csa(
                             pl.write(swa_row, [0, win_col], row)
                 visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
                 pl.write(
-                    cmp_count,
-                    [0],
+                    cmp_counts,
+                    [t_idx],
                     pl.cast(
                         pl.min(pl.min(visible_cmp, IDX_TOPK), SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE),
                         pl.INT32,
@@ -289,7 +289,6 @@ def prefill_attention_csa(
                                 pl.write(cmp_row, [0, cmp_col], topk_raw)
             swa_indices = pl.assemble(swa_indices, swa_row, [t_idx, 0])
             cmp_indices = pl.assemble(cmp_indices, cmp_row, [t_idx, 0])
-            cmp_counts = pl.assemble(cmp_counts, cmp_count, [t_idx])
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     prefill_sparse_attn(
