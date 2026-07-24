@@ -200,8 +200,10 @@ def prefill_sparse_attn(
             qk_kv_base = qk_t * PREFILL_SPARSE_PAD
             qk_token_base = qk_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
             qk_cmp_count = pl.read(cmp_counts, [qk_t])
-            qk_active_blocks = (
-                WIN + qk_cmp_count + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
+            qk_active_blocks = pl.min(
+                pl.cast(PREFILL_ATTN_BLOCKS, pl.INT32),
+                (WIN + qk_cmp_count + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE,
+            )
             for qk_sb in pl.range(qk_active_blocks):
                 qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
                 qk_kv_k = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
@@ -248,8 +250,10 @@ def prefill_sparse_attn(
                 m_li = sparse_blk_li[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_oi = sparse_blk_oi[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_cmp_count = pl.read(cmp_counts, [m_t])
-                m_active_blocks = (
-                    WIN + m_cmp_count + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
+                m_active_blocks = pl.min(
+                    pl.cast(PREFILL_ATTN_BLOCKS, pl.INT32),
+                    (WIN + m_cmp_count + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE,
+                )
                 for m_sb in pl.range(1, m_active_blocks):
                     m_row = m_blk_base + m_sb * HEAD_TILE
                     cur_mi = sparse_blk_mi[m_row:m_row + HEAD_TILE, :]
