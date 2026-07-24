@@ -253,7 +253,7 @@ def prefill_sparse_attn(
                     alpha = pl.exp(pl.sub(m_mi, mi_new))
                     beta = pl.exp(pl.sub(cur_mi, mi_new))
                     m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
-                    m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
+                    m_oi = pl.add(pl.mul(m_oi, alpha), pl.mul(cur_oi, beta))
                     m_mi = mi_new
 
                 sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
