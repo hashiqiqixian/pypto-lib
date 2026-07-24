@@ -65,7 +65,9 @@ B = 1
 S = 128
 T = B * S
 START_POS = 0
+SCORE_TOKEN_TILE = 8
 TOPK_TILE = 16
+assert T % SCORE_TOKEN_TILE == 0
 assert T % TOPK_TILE == 0
 INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
 IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
@@ -91,10 +93,10 @@ ROPE_ROW_TILE = 32
 # is the confirmed fault-free width. The real score occupies only the first INDEXER_SCORE_CAP
 # columns; the rest stays -inf.
 SORT_LEN = 2048
-MRG_TOPK_RUN = 1024   # final mrgsort run length (>= IDX_TOPK so the top-IDX_TOPK land sorted in run 0)
 # topk_pairs (= 2*PREFILL_TOPK_CAP) must be a power of two aligned to the final mrgsort run: a
-# misaligned prefix (e.g. 2*192) faults like a narrow sort. valid_topk then clamps to the budget.
-PREFILL_TOPK_CAP = IDX_TOPK
+# misaligned prefix (e.g. 2*192) faults like a narrow sort. The real score cap is 256, so two
+# merge stages are sufficient: the only finite values are sorted within the first 512-value run.
+PREFILL_TOPK_CAP = INDEXER_TOPK_CAP
 assert PREFILL_TOPK_CAP < SORT_LEN and SORT_LEN >= INDEXER_SCORE_CAP
 SCORE_INIT_TILE = 16                   # rows per -inf init write (keep [tile, SORT_LEN] under the Vec-buffer limit)
 assert T % SCORE_INIT_TILE == 0
@@ -251,7 +253,9 @@ def prefill_indexer(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_init"):
             score_wide[si : si + SCORE_INIT_TILE, :] = pl.full([SCORE_INIT_TILE, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score"):
+    score_token_groups = T // SCORE_TOKEN_TILE
+    for score_idx in pl.spmd(score_token_groups, name_hint="prefill_idx_score"):
+        token0 = score_idx * SCORE_TOKEN_TILE
         last_pos = pl.read(position_ids, [num_tokens - 1])
         max_visible = pl.min((last_pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
         for cb in pl.range(INDEXER_SCORE_BLOCKS):
@@ -263,7 +267,8 @@ def prefill_indexer(
                 # both from the paged cache directly (no score-time re-quant).
                 kv_q_i8_full = kv_cache_i8_flat[kv_row0 : kv_row0 + CACHE_TILE, 0 : IDX_HEAD_DIM]
                 kv_cache_scale_dq = kv_scale_flat[kv_row0 : kv_row0 + CACHE_TILE, :]
-                for t in pl.range(T):
+                for token_offset in pl.range(SCORE_TOKEN_TILE):
+                    t = token0 + token_offset
                     if t < num_tokens:
                         q_s0 = t * IDX_N_HEADS
                         qr_hadamard_tile = qr_hadamard_i8[q_s0 : q_s0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
@@ -298,14 +303,13 @@ def prefill_indexer(
                 pos = pl.read(position_ids, [t])
                 visible_t = pl.min((pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
                 if visible_t > 0:
-                    # Sort the wide score row and gather the top-k indices (#505^'s exact wide+aligned
-                    # sort: 2048 width, mrgsort 64/256/1024, topk_pairs = 2*IDX_TOPK proper prefix).
+                    # Sort the wide score row and gather the top-k indices. Only the first 256
+                    # values can be finite, so the 64/256 merge stages fully order the useful run.
                     score_row = score_wide[t : t + 1, :]
                     idx_init = pl.arange(0, [1, SORT_LEN], dtype=pl.UINT32)
                     sorted_tile = pl.sort32(score_row, idx_init)
                     sorted_tile = pl.mrgsort(sorted_tile, block_len=64)
                     sorted_tile = pl.mrgsort(sorted_tile, block_len=256)
-                    sorted_tile = pl.mrgsort(sorted_tile, block_len=MRG_TOPK_RUN)
                     topk_pairs = sorted_tile[:, 0 : 2 * PREFILL_TOPK_CAP]
                     topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                     valid_topk = pl.min(PREFILL_TOPK_CAP, visible_t)
