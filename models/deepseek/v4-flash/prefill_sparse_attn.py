@@ -429,7 +429,7 @@ def prefill_sparse_attn(
             name_hint="proj_b_act",
             deps=[proj_b_tids[act_dc * O_GROUPS + g] for g in range(O_GROUPS)],
             allow_early_resolve=True,
-        ):
+        ) as act_tid:
             act_idx = pl.tile.get_block_idx()
             local_nreg = act_idx // PB_ACT_TBLKS
             tblk = act_idx - local_nreg * PB_ACT_TBLKS
