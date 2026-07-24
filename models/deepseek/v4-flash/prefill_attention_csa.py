@@ -249,7 +249,7 @@ def prefill_attention_csa(
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
     cmp_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    cmp_counts = pl.create_tensor([T, 1], dtype=pl.INT32)
+    cmp_counts = pl.create_tensor([T, 8], dtype=pl.INT32)
     for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
                               name_hint="prefill_csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
@@ -257,7 +257,7 @@ def prefill_attention_csa(
             t_idx = topk_t0 + topk_dt
             swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
             cmp_row = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-            cmp_count = pl.full([1, 1], dtype=pl.INT32, value=0)
+            cmp_count = pl.full([1, 8], dtype=pl.INT32, value=0)
             if t_idx < num_tokens:
                 abs_pos = pl.read(position_ids, [t_idx])
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)

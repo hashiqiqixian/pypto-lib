@@ -116,7 +116,7 @@ def prefill_sparse_attn(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
-    cmp_counts: pl.Tensor[[T, 1], pl.INT32],
+    cmp_counts: pl.Tensor[[T, 8], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -449,7 +449,7 @@ def prefill_sparse_attn_test(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
-    cmp_counts: pl.Tensor[[T, 1], pl.INT32],
+    cmp_counts: pl.Tensor[[T, 8], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -643,7 +643,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
                     idx[t, :comp_count] = torch.arange(comp_count, dtype=torch.int32)
         return idx
     def init_cmp_counts():
-        counts = torch.zeros(T, 1, dtype=torch.int32)
+        counts = torch.zeros(T, 8, dtype=torch.int32)
         if compress_ratio:
             for t in range(num_tokens):
                 counts[t, 0] = min(cmp_valid, (t + 1) // compress_ratio, IDX_TOPK)
@@ -668,7 +668,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_indices", [T, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
-        TensorSpec("cmp_counts", [T, 1], torch.int32, init_value=init_cmp_counts),
+        TensorSpec("cmp_counts", [T, 8], torch.int32, init_value=init_cmp_counts),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),

@@ -187,12 +187,12 @@ def prefill_attention_hca(
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
     cmp_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    cmp_counts = pl.create_tensor([T, 1], dtype=pl.INT32)
+    cmp_counts = pl.create_tensor([T, 8], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_sparse_indices"):
         for idx_t in pl.range(T):
             swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
             cmp_row = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-            cmp_count = pl.full([1, 1], dtype=pl.INT32, value=0)
+            cmp_count = pl.full([1, 8], dtype=pl.INT32, value=0)
             if idx_t < num_tokens:
                 abs_pos = pl.read(position_ids, [idx_t])
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
