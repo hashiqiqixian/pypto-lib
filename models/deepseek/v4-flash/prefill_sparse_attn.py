@@ -201,7 +201,8 @@ def prefill_sparse_attn(
     sparse_blk_li = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([blk_rows, HEAD_DIM], dtype=pl.FP32)
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    for qk_t in pl.spmd(T, name_hint="qk_pv"):
+    with pl.spmd(T, name_hint="qk_pv") as qk_tid:
+        qk_t = pl.tile.get_block_idx()
         if qk_t < num_tokens:
             qk_kv_base = qk_t * PREFILL_SPARSE_PAD
             qk_token_base = qk_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
@@ -238,13 +239,11 @@ def prefill_sparse_attn(
                         sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = qk_oi[qk_r0:qk_r0 + HEAD_TILE, :]
 
     # Online-softmax merge across blocks, sink-norm, then pack NOPE into o_packed and the
-    # FP32 rope slice into attn_rope_stage (full precision for the inverse rotation). Padding
-    # tokens (t >= num_tokens) write zeros.
+    # FP32 rope slice into attn_rope_stage. qk_tid publishes the AIC-produced PV statistics
+    # before the vector merge consumes them. Padding tokens write zeros.
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-    # with-form spmd so the dispatch TaskId (merge_tid) is an explicit dep of the
-    # manual-scope proj_a tasks below (which read merge_norm's o_packed NOPE cols).
-    with pl.spmd(T, name_hint="merge_norm") as merge_tid:
+    with pl.spmd(T, name_hint="merge_norm", deps=[qk_tid]) as merge_tid:
         m_t = pl.tile.get_block_idx()
         m_token_base = m_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
         for m_h_idx in pl.range(H // HEAD_TILE):
