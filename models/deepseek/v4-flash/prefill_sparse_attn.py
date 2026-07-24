@@ -118,6 +118,7 @@ def prefill_sparse_attn(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+    cmp_counts: pl.Tensor[[T, 8], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -145,10 +146,11 @@ def prefill_sparse_attn(
         gather_k0 = gather_sb * PREFILL_ATTN_TILE
         for gather_dt in pl.range(GATHER_TOKEN_TILE):
             gather_t = gather_t0 + gather_dt
-            if gather_t < T:
-                block_base = gather_t * PREFILL_SPARSE_PAD + gather_k0
-                stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                if gather_t < num_tokens:
+            if gather_t < num_tokens:
+                gather_cmp_count = pl.read(cmp_counts, [gather_t, 0])
+                if gather_sb * PREFILL_ATTN_TILE < WIN + gather_cmp_count:
+                    block_base = gather_t * PREFILL_SPARSE_PAD + gather_k0
+                    stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                     for gather_ki in pl.range(PREFILL_ATTN_TILE):
                         gather_k = gather_k0 + gather_ki
                         gather_raw = pl.cast(-1, pl.INT32)
@@ -167,7 +169,7 @@ def prefill_sparse_attn(
                                     blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
                                     src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
                                     stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
-                sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
+                    sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
 
     # Additive softmax bias: 0 for valid slots, FP32_NEG_INF for padding, so the QK softmax
     # masks invalid slots without rescanning validity per head. A slot is valid when its raw
@@ -203,7 +205,12 @@ def prefill_sparse_attn(
         if qk_t < num_tokens:
             qk_kv_base = qk_t * PREFILL_SPARSE_PAD
             qk_token_base = qk_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
-            for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
+            qk_cmp_count = pl.read(cmp_counts, [qk_t, 0])
+            qk_active_blocks = pl.min(
+                pl.cast(PREFILL_ATTN_BLOCKS, pl.INT32),
+                (WIN + qk_cmp_count + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE,
+            )
+            for qk_sb in pl.range(qk_active_blocks):
                 qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
                 qk_kv_k = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
                 qk_kv_v = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
@@ -248,7 +255,12 @@ def prefill_sparse_attn(
                 m_mi = sparse_blk_mi[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_li = sparse_blk_li[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_oi = sparse_blk_oi[m_blk_base:m_blk_base + HEAD_TILE, :]
-                for m_sb in pl.range(1, PREFILL_ATTN_BLOCKS):
+                m_cmp_count = pl.read(cmp_counts, [m_t, 0])
+                m_active_blocks = pl.min(
+                    pl.cast(PREFILL_ATTN_BLOCKS, pl.INT32),
+                    (WIN + m_cmp_count + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE,
+                )
+                for m_sb in pl.range(1, m_active_blocks):
                     m_row = m_blk_base + m_sb * HEAD_TILE
                     cur_mi = sparse_blk_mi[m_row:m_row + HEAD_TILE, :]
                     cur_li = sparse_blk_li[m_row:m_row + HEAD_TILE, :]
@@ -443,6 +455,7 @@ def prefill_sparse_attn_test(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+    cmp_counts: pl.Tensor[[T, 8], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -461,6 +474,7 @@ def prefill_sparse_attn_test(
         cmp_kv,
         cmp_block_table,
         cmp_indices,
+        cmp_counts,
         attn_sink,
         num_tokens,
         freqs_cos,
@@ -636,6 +650,12 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
                 if comp_count > 0:
                     idx[t, :comp_count] = torch.arange(comp_count, dtype=torch.int32)
         return idx
+    def init_cmp_counts():
+        counts = torch.zeros(T, 8, dtype=torch.int32)
+        if compress_ratio:
+            for t in range(num_tokens):
+                counts[t, 0] = min(cmp_valid, (t + 1) // compress_ratio, IDX_TOPK)
+        return counts
     def init_attn_sink():
         return torch.zeros(H)
     def init_freqs_cos():
@@ -656,6 +676,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_indices", [T, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
+        TensorSpec("cmp_counts", [T, 8], torch.int32, init_value=init_cmp_counts),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),

@@ -199,11 +199,12 @@ def prefill_attention_swa(
     )
     cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32, init_value=-1)
+    cmp_counts_dummy = pl.create_tensor([T, 8], dtype=pl.INT32, init_value=0)
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     prefill_sparse_attn(
         q, kv_cache, swa_indices,
         cmp_kv_dummy, cmp_block_table_dummy,
-        cmp_indices_dummy,
+        cmp_indices_dummy, cmp_counts_dummy,
         attn_sink, num_tokens,
         rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
