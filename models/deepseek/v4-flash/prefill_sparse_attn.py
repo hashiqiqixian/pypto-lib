@@ -228,6 +228,15 @@ def prefill_sparse_attn(
                             sparse_blk_mi[qk_row:qk_row + HEAD_TILE, :] = qk_mi[qk_r0:qk_r0 + HEAD_TILE, :]
                             sparse_blk_li[qk_row:qk_row + HEAD_TILE, :] = qk_li[qk_r0:qk_r0 + HEAD_TILE, :]
                             sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = qk_oi[qk_r0:qk_r0 + HEAD_TILE, :]
+                else:
+                    for qk_h_idx in pl.unroll(H // HEAD_TILE):
+                        qk_row = qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE + qk_sb * HEAD_TILE
+                        sparse_blk_mi[qk_row:qk_row + HEAD_TILE, :] = pl.full(
+                            [HEAD_TILE, 1], dtype=pl.FP32, value=FP32_NEG_INF)
+                        sparse_blk_li[qk_row:qk_row + HEAD_TILE, :] = pl.full(
+                            [HEAD_TILE, 1], dtype=pl.FP32, value=0.0)
+                        sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = pl.full(
+                            [HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
 
     # Online-softmax merge across blocks, sink-norm, then pack NOPE into o_packed and the
     # FP32 rope slice into attn_rope_stage (full precision for the inverse rotation). Padding
@@ -247,19 +256,17 @@ def prefill_sparse_attn(
                 m_mi = sparse_blk_mi[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_li = sparse_blk_li[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_oi = sparse_blk_oi[m_blk_base:m_blk_base + HEAD_TILE, :]
-                m_cmp_count = pl.read(cmp_counts, [m_t])
                 for m_sb in pl.range(1, PREFILL_ATTN_BLOCKS):
-                    if m_sb * PREFILL_ATTN_TILE < WIN + m_cmp_count:
-                        m_row = m_blk_base + m_sb * HEAD_TILE
-                        cur_mi = sparse_blk_mi[m_row:m_row + HEAD_TILE, :]
-                        cur_li = sparse_blk_li[m_row:m_row + HEAD_TILE, :]
-                        cur_oi = sparse_blk_oi[m_row:m_row + HEAD_TILE, :]
-                        mi_new = pl.maximum(m_mi, cur_mi)
-                        alpha = pl.exp(pl.sub(m_mi, mi_new))
-                        beta = pl.exp(pl.sub(cur_mi, mi_new))
-                        m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
-                        m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
-                        m_mi = mi_new
+                    m_row = m_blk_base + m_sb * HEAD_TILE
+                    cur_mi = sparse_blk_mi[m_row:m_row + HEAD_TILE, :]
+                    cur_li = sparse_blk_li[m_row:m_row + HEAD_TILE, :]
+                    cur_oi = sparse_blk_oi[m_row:m_row + HEAD_TILE, :]
+                    mi_new = pl.maximum(m_mi, cur_mi)
+                    alpha = pl.exp(pl.sub(m_mi, mi_new))
+                    beta = pl.exp(pl.sub(cur_mi, mi_new))
+                    m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
+                    m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
+                    m_mi = mi_new
                 sink_bias = pl.reshape(attn_sink[m_h0:m_h0 + HEAD_TILE], [HEAD_TILE, 1])
                 sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
                 denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
