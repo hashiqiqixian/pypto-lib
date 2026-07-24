@@ -116,6 +116,7 @@ def prefill_sparse_attn(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+    cmp_counts: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -143,24 +144,26 @@ def prefill_sparse_attn(
                 block_base = gather_t * PREFILL_SPARSE_PAD + gather_k0
                 stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                 if gather_t < num_tokens:
-                    for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                        gather_k = gather_k0 + gather_ki
-                        gather_raw = pl.cast(-1, pl.INT32)
-                        if gather_k < WIN:
-                            gather_raw = pl.read(swa_indices, [gather_t, gather_k])
-                            if gather_raw >= 0:
-                                src = pl.cast(gather_raw, pl.INDEX)
-                                stage[gather_ki:gather_ki + 1, :] = ori_kv_flat[src:src + 1, :]
-                        else:
-                            gather_cmp_k = gather_k - WIN
-                            if gather_cmp_k < IDX_TOPK:
-                                gather_raw = pl.read(cmp_indices, [gather_t, gather_cmp_k])
+                    gather_cmp_count = pl.read(cmp_counts, [gather_t])
+                    if gather_sb * PREFILL_ATTN_TILE < WIN + gather_cmp_count:
+                        for gather_ki in pl.range(PREFILL_ATTN_TILE):
+                            gather_k = gather_k0 + gather_ki
+                            gather_raw = pl.cast(-1, pl.INT32)
+                            if gather_k < WIN:
+                                gather_raw = pl.read(swa_indices, [gather_t, gather_k])
                                 if gather_raw >= 0:
-                                    cmp_slot = gather_raw
-                                    blk_slot = cmp_slot // BLOCK_SIZE
-                                    blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
-                                    src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
-                                    stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
+                                    src = pl.cast(gather_raw, pl.INDEX)
+                                    stage[gather_ki:gather_ki + 1, :] = ori_kv_flat[src:src + 1, :]
+                            else:
+                                gather_cmp_k = gather_k - WIN
+                                if gather_cmp_k < IDX_TOPK:
+                                    gather_raw = pl.read(cmp_indices, [gather_t, gather_cmp_k])
+                                    if gather_raw >= 0:
+                                        cmp_slot = gather_raw
+                                        blk_slot = cmp_slot // BLOCK_SIZE
+                                        blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
+                                        src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
+                                        stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
                 sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
 
     # Additive softmax bias: 0 for valid slots, FP32_NEG_INF for padding, so the QK softmax
@@ -197,32 +200,34 @@ def prefill_sparse_attn(
         if qk_t < num_tokens:
             qk_kv_base = qk_t * PREFILL_SPARSE_PAD
             qk_token_base = qk_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
+            qk_cmp_count = pl.read(cmp_counts, [qk_t])
             for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
-                qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
-                qk_kv_k = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
-                qk_kv_v = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
-                qk_bias_row = sparse_bias[qk_t:qk_t + 1, qk_sb * PREFILL_ATTN_TILE:qk_sb * PREFILL_ATTN_TILE + PREFILL_ATTN_TILE]
-                for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                    qk_head_row = qk_t * H + qk_hb * QK_M_TILE
-                    qk_q_tile = q_flat[qk_head_row:qk_head_row + QK_M_TILE, :]
-                    qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                    # Broadcast-add the per-block bias directly (col_expand_add) instead of
-                    # col_expand into a dead pl.full(0) base + a separate add (mirrors decode).
-                    qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                    qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
-                    qk_mi = pl.row_max(qk_scores)
-                    qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                    # li sums the FP32 exp; only the PV matmul uses the BF16 cast.
-                    qk_li = pl.row_sum(qk_exp)
-                    qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                    qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                    for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
-                        qk_h_idx = qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub
-                        qk_r0 = qk_sub * HEAD_TILE
-                        qk_row = qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE + qk_sb * HEAD_TILE
-                        sparse_blk_mi[qk_row:qk_row + HEAD_TILE, :] = qk_mi[qk_r0:qk_r0 + HEAD_TILE, :]
-                        sparse_blk_li[qk_row:qk_row + HEAD_TILE, :] = qk_li[qk_r0:qk_r0 + HEAD_TILE, :]
-                        sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = qk_oi[qk_r0:qk_r0 + HEAD_TILE, :]
+                if qk_sb * PREFILL_ATTN_TILE < WIN + qk_cmp_count:
+                    qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
+                    qk_kv_k = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
+                    qk_kv_v = sparse_kv[qk_s0:qk_s0 + PREFILL_ATTN_TILE, :]
+                    qk_bias_row = sparse_bias[qk_t:qk_t + 1, qk_sb * PREFILL_ATTN_TILE:qk_sb * PREFILL_ATTN_TILE + PREFILL_ATTN_TILE]
+                    for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                        qk_head_row = qk_t * H + qk_hb * QK_M_TILE
+                        qk_q_tile = q_flat[qk_head_row:qk_head_row + QK_M_TILE, :]
+                        qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                        # Broadcast-add the per-block bias directly (col_expand_add) instead of
+                        # col_expand into a dead pl.full(0) base + a separate add (mirrors decode).
+                        qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+                        qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
+                        qk_mi = pl.row_max(qk_scores)
+                        qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                        # li sums the FP32 exp; only the PV matmul uses the BF16 cast.
+                        qk_li = pl.row_sum(qk_exp)
+                        qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                        qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                        for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
+                            qk_h_idx = qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub
+                            qk_r0 = qk_sub * HEAD_TILE
+                            qk_row = qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE + qk_sb * HEAD_TILE
+                            sparse_blk_mi[qk_row:qk_row + HEAD_TILE, :] = qk_mi[qk_r0:qk_r0 + HEAD_TILE, :]
+                            sparse_blk_li[qk_row:qk_row + HEAD_TILE, :] = qk_li[qk_r0:qk_r0 + HEAD_TILE, :]
+                            sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = qk_oi[qk_r0:qk_r0 + HEAD_TILE, :]
 
     # Online-softmax merge across blocks, sink-norm, then pack NOPE into o_packed and the
     # FP32 rope slice into attn_rope_stage (full precision for the inverse rotation). Padding
@@ -242,17 +247,19 @@ def prefill_sparse_attn(
                 m_mi = sparse_blk_mi[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_li = sparse_blk_li[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_oi = sparse_blk_oi[m_blk_base:m_blk_base + HEAD_TILE, :]
+                m_cmp_count = pl.read(cmp_counts, [m_t])
                 for m_sb in pl.range(1, PREFILL_ATTN_BLOCKS):
-                    m_row = m_blk_base + m_sb * HEAD_TILE
-                    cur_mi = sparse_blk_mi[m_row:m_row + HEAD_TILE, :]
-                    cur_li = sparse_blk_li[m_row:m_row + HEAD_TILE, :]
-                    cur_oi = sparse_blk_oi[m_row:m_row + HEAD_TILE, :]
-                    mi_new = pl.maximum(m_mi, cur_mi)
-                    alpha = pl.exp(pl.sub(m_mi, mi_new))
-                    beta = pl.exp(pl.sub(cur_mi, mi_new))
-                    m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
-                    m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
-                    m_mi = mi_new
+                    if m_sb * PREFILL_ATTN_TILE < WIN + m_cmp_count:
+                        m_row = m_blk_base + m_sb * HEAD_TILE
+                        cur_mi = sparse_blk_mi[m_row:m_row + HEAD_TILE, :]
+                        cur_li = sparse_blk_li[m_row:m_row + HEAD_TILE, :]
+                        cur_oi = sparse_blk_oi[m_row:m_row + HEAD_TILE, :]
+                        mi_new = pl.maximum(m_mi, cur_mi)
+                        alpha = pl.exp(pl.sub(m_mi, mi_new))
+                        beta = pl.exp(pl.sub(cur_mi, mi_new))
+                        m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
+                        m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
+                        m_mi = mi_new
                 sink_bias = pl.reshape(attn_sink[m_h0:m_h0 + HEAD_TILE], [HEAD_TILE, 1])
                 sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
                 denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
@@ -437,6 +444,7 @@ def prefill_sparse_attn_test(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+    cmp_counts: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -453,6 +461,7 @@ def prefill_sparse_attn_test(
         cmp_kv,
         cmp_block_table,
         cmp_indices,
+        cmp_counts,
         attn_sink,
         num_tokens,
         freqs_cos,
@@ -628,6 +637,12 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
                 if comp_count > 0:
                     idx[t, :comp_count] = torch.arange(comp_count, dtype=torch.int32)
         return idx
+    def init_cmp_counts():
+        counts = torch.zeros(T, dtype=torch.int32)
+        if compress_ratio:
+            for t in range(num_tokens):
+                counts[t] = min(cmp_valid, (t + 1) // compress_ratio, IDX_TOPK)
+        return counts
     def init_attn_sink():
         return torch.zeros(H)
     def init_freqs_cos():
@@ -648,6 +663,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_indices", [T, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
+        TensorSpec("cmp_counts", [T], torch.int32, init_value=init_cmp_counts),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
