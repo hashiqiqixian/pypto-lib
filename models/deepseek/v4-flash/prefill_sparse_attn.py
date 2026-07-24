@@ -189,6 +189,7 @@ def prefill_sparse_attn(
     # its active sparse blocks and writes the normalized output directly, avoiding the
     # sparse_blk_mi/li/oi global-memory round-trip and the separate merge dispatch.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
+    attn_sink_col = pl.reshape(attn_sink, [H, 1])
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     qk_head_batches = H // QK_M_TILE
@@ -232,7 +233,7 @@ def prefill_sparse_attn(
                 m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
                 m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
                 m_mi = mi_new
-            sink_bias = pl.reshape(attn_sink[qk_h0:qk_h0 + QK_M_TILE], [QK_M_TILE, 1])
+            sink_bias = attn_sink_col[qk_h0:qk_h0 + QK_M_TILE, :]
             sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
             denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
             n_full = pl.row_expand_div(m_oi, denom)[0:QK_M_TILE, :]
