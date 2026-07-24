@@ -275,7 +275,10 @@ def prefill_attention_csa(
                 pl.write(
                     cmp_count,
                     [0],
-                    pl.min(pl.min(visible_cmp, IDX_TOPK), SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE),
+                    pl.cast(
+                        pl.min(pl.min(visible_cmp, IDX_TOPK), SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE),
+                        pl.INT32,
+                    ),
                 )
                 for cmp_col in pl.range(IDX_TOPK):
                     cmp_col_i32 = pl.cast(cmp_col, pl.INT32)
