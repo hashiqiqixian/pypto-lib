@@ -193,7 +193,7 @@ def prefill_sparse_attn(
     blk_rows = T * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
     sparse_blk_mi = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
-    sparse_blk_oi = pl.create_tensor([blk_rows, HEAD_DIM], dtype=pl.FP32)
+    sparse_blk_oi = pl.create_tensor([blk_rows, HEAD_DIM], dtype=pl.BF16)
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     for qk_t in pl.spmd(T, name_hint="qk_pv"):
         if qk_t < num_tokens:
@@ -229,7 +229,11 @@ def prefill_sparse_attn(
                         qk_row = qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE + qk_sb * HEAD_TILE
                         sparse_blk_mi[qk_row:qk_row + HEAD_TILE, :] = qk_mi[qk_r0:qk_r0 + HEAD_TILE, :]
                         sparse_blk_li[qk_row:qk_row + HEAD_TILE, :] = qk_li[qk_r0:qk_r0 + HEAD_TILE, :]
-                        sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = qk_oi[qk_r0:qk_r0 + HEAD_TILE, :]
+                        sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = pl.cast(
+                            qk_oi[qk_r0:qk_r0 + HEAD_TILE, :],
+                            target_type=pl.BF16,
+                            mode="rint",
+                        )
 
     # Online-softmax merge across blocks, sink-norm, then pack NOPE into o_packed and the
     # FP32 rope slice into attn_rope_stage (full precision for the inverse rotation). Padding
@@ -248,7 +252,10 @@ def prefill_sparse_attn(
                 m_blk_base = m_token_base + m_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE
                 m_mi = sparse_blk_mi[m_blk_base:m_blk_base + HEAD_TILE, :]
                 m_li = sparse_blk_li[m_blk_base:m_blk_base + HEAD_TILE, :]
-                m_oi = sparse_blk_oi[m_blk_base:m_blk_base + HEAD_TILE, :]
+                m_oi = pl.cast(
+                    sparse_blk_oi[m_blk_base:m_blk_base + HEAD_TILE, :],
+                    target_type=pl.FP32,
+                )
                 m_cmp_count = pl.read(cmp_counts, [m_t, 0])
                 m_active_blocks = pl.min(
                     pl.cast(PREFILL_ATTN_BLOCKS, pl.INT32),
@@ -258,7 +265,10 @@ def prefill_sparse_attn(
                     m_row = m_blk_base + m_sb * HEAD_TILE
                     cur_mi = sparse_blk_mi[m_row:m_row + HEAD_TILE, :]
                     cur_li = sparse_blk_li[m_row:m_row + HEAD_TILE, :]
-                    cur_oi = sparse_blk_oi[m_row:m_row + HEAD_TILE, :]
+                    cur_oi = pl.cast(
+                        sparse_blk_oi[m_row:m_row + HEAD_TILE, :],
+                        target_type=pl.FP32,
+                    )
                     mi_new = pl.maximum(m_mi, cur_mi)
                     alpha = pl.exp(pl.sub(m_mi, mi_new))
                     beta = pl.exp(pl.sub(cur_mi, mi_new))
