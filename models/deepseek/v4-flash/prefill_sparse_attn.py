@@ -62,7 +62,7 @@ CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 
 # Kernel tiling (mirrors decode sparse-attn).
-QK_M_TILE = 32                       # head rows cube-batched per QK/PV matmul
+QK_M_TILE = 16                       # persistent head rows per fused QK/PV/merge task
 GATHER_TOKEN_TILE = 4
 BIAS_TOKEN_TILE = 16
 QUANT_TOKEN_TILE = 8
