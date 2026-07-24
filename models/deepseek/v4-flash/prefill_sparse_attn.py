@@ -193,7 +193,11 @@ def prefill_sparse_attn(
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     qk_head_batches = H // QK_M_TILE
-    with pl.spmd(T * qk_head_batches, name_hint="qk_pv_merge") as merge_tid:
+    with pl.spmd(
+        T * qk_head_batches,
+        name_hint="qk_pv_merge",
+        optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
+    ) as merge_tid:
         qk_idx = pl.tile.get_block_idx()
         qk_t = qk_idx // qk_head_batches
         qk_hb = qk_idx - qk_t * qk_head_batches
