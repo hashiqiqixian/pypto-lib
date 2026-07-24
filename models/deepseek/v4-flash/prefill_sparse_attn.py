@@ -91,16 +91,15 @@ NUM_QUANT_T_CHUNKS = 4                    # quant split per (group, token-chunk)
 QUANT_T_CHUNK = T // NUM_QUANT_T_CHUNKS
 PROJ_B_ACT_T_TILE = 16                    # inner token tile for the O_GROUPS-way INT32->FP32 accumulate
 PROJ_B_ACT_TBLK = 32                      # proj_b_act token block per task
+PB_ACT_NREG = D // PROJ_B_ACT_N_TILE
 PB_ACT_TBLKS = T // PROJ_B_ACT_TBLK
-PB_ACT_NREG_PER_DCHUNK = PROJ_B_D_CHUNK // PROJ_B_ACT_N_TILE
 assert T % QUANT_TOKEN_TILE == 0
 assert O_GROUP_IN % A_K_TILE == 0    # proj_a_mm peels 0:A_K_TILE then covers O_GROUP_IN // A_K_TILE chunks
 assert O_LORA % B_K_TILE == 0        # proj_b_mm peels 0:B_K_TILE then covers O_LORA // B_K_TILE chunks
 assert D % PROJ_B_MM_N_TILE == 0 and D % PROJ_B_D_CHUNK == 0 and PROJ_B_D_CHUNK % PROJ_B_MM_N_TILE == 0
 assert T % NUM_QUANT_T_CHUNKS == 0 and QUANT_T_CHUNK % QUANT_TOKEN_TILE == 0
 assert T % PROJ_B_ACT_TBLK == 0 and PROJ_B_ACT_TBLK % PROJ_B_ACT_T_TILE == 0
-assert D % PROJ_B_ACT_N_TILE == 0 and PROJ_B_D_CHUNK % PROJ_B_ACT_N_TILE == 0
-assert O_LORA % QUANT_TILE == 0
+assert D % PROJ_B_ACT_N_TILE == 0 and O_LORA % QUANT_TILE == 0
 # Sparse K split into <=3 merge blocks of PREFILL_ATTN_TILE rows.
 PREFILL_ATTN_TILE = 128
 PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
@@ -420,46 +419,26 @@ def prefill_sparse_attn(
                         partials = pl.assemble(partials, acc_b, [0, g * D + n0])
                 proj_b_tids[dc * O_GROUPS + g] = pb_tid
 
-    # proj_b_act (PURE-VECTOR writers, auto region): each D-chunk waits only for
-    # the O_GROUPS proj_b_mm tasks that produced its partials. Splitting the former
-    # global barrier lets completed D-chunks overlap activation with later cube work.
-    for act_dc in pl.unroll(PB_DCHUNKS):
-        with pl.spmd(
-            PB_ACT_NREG_PER_DCHUNK * PB_ACT_TBLKS,
-            name_hint="proj_b_act",
-            deps=[proj_b_tids[act_dc * O_GROUPS + g] for g in range(O_GROUPS)],
-            allow_early_resolve=True,
-        ) as act_tid:
-            act_idx = pl.tile.get_block_idx()
-            local_nreg = act_idx // PB_ACT_TBLKS
-            tblk = act_idx - local_nreg * PB_ACT_TBLKS
-            nreg = act_dc * PB_ACT_NREG_PER_DCHUNK + local_nreg
-            ob_n0 = nreg * PROJ_B_ACT_N_TILE
-            t0 = tblk * PROJ_B_ACT_TBLK
-            wb_scale_chunk = pl.reshape(
-                wo_b_scale[ob_n0:ob_n0 + PROJ_B_ACT_N_TILE], [1, PROJ_B_ACT_N_TILE])
-            for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TBLK, PROJ_B_ACT_T_TILE):
-                acc = pl.full(
-                    [PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
-                for g in pl.range(O_GROUPS):
-                    p_g = partials[
-                        b_tb:b_tb + PROJ_B_ACT_T_TILE,
-                        g * D + ob_n0:g * D + ob_n0 + PROJ_B_ACT_N_TILE,
-                    ]
-                    g_scale = pl.reshape(
-                        act_scale_dq[g:g + 1, b_tb:b_tb + PROJ_B_ACT_T_TILE],
-                        [PROJ_B_ACT_T_TILE, 1],
-                    )
-                    acc = pl.add(
-                        acc,
-                        pl.row_expand_mul(
-                            pl.cast(p_g, target_type=pl.FP32, mode="none"), g_scale),
-                    )
-                out_t = pl.col_expand_mul(acc, wb_scale_chunk)
-                attn_out[
-                    b_tb:b_tb + PROJ_B_ACT_T_TILE,
-                    ob_n0:ob_n0 + PROJ_B_ACT_N_TILE,
-                ] = pl.cast(out_t, target_type=pl.BF16, mode="rint")
+    # proj_b_act (PURE-VECTOR consolidated writer, auto region): sum the O_GROUPS INT32
+    # partials -- each dequantized by its group's per-row act scale -- then apply the
+    # per-channel weight scale -> BF16. Explicit deps on all proj_b_mm tasks bridge
+    # manual_scope -> the return's auto-dep.
+    with pl.spmd(PB_ACT_NREG * PB_ACT_TBLKS, name_hint="proj_b_act",
+                 deps=[proj_b_tids[i] for i in range(PB_DCHUNKS * O_GROUPS)]) as act_tid:
+        act_idx = pl.tile.get_block_idx()
+        nreg = act_idx // PB_ACT_TBLKS
+        tblk = act_idx - nreg * PB_ACT_TBLKS
+        ob_n0 = nreg * PROJ_B_ACT_N_TILE
+        t0 = tblk * PROJ_B_ACT_TBLK
+        wb_scale_chunk = pl.reshape(wo_b_scale[ob_n0:ob_n0 + PROJ_B_ACT_N_TILE], [1, PROJ_B_ACT_N_TILE])
+        for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TBLK, PROJ_B_ACT_T_TILE):
+            acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
+            for g in pl.range(O_GROUPS):
+                p_g = partials[b_tb:b_tb + PROJ_B_ACT_T_TILE, g * D + ob_n0:g * D + ob_n0 + PROJ_B_ACT_N_TILE]
+                g_scale = pl.reshape(act_scale_dq[g:g + 1, b_tb:b_tb + PROJ_B_ACT_T_TILE], [PROJ_B_ACT_T_TILE, 1])
+                acc = pl.add(acc, pl.row_expand_mul(pl.cast(p_g, target_type=pl.FP32, mode="none"), g_scale))
+            out_t = pl.col_expand_mul(acc, wb_scale_chunk)
+            attn_out[b_tb:b_tb + PROJ_B_ACT_T_TILE, ob_n0:ob_n0 + PROJ_B_ACT_N_TILE] = pl.cast(out_t, target_type=pl.BF16, mode="rint")
 
     return attn_out
 
