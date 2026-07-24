@@ -62,7 +62,7 @@ CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 
 # Kernel tiling (mirrors decode sparse-attn).
-QK_M_TILE = 16                       # persistent head rows per fused QK/PV/merge task
+QK_M_TILE = 8                        # persistent head rows per fused QK/PV/merge task
 GATHER_TOKEN_TILE = 4
 BIAS_TOKEN_TILE = 16
 QUANT_TOKEN_TILE = 8
@@ -193,11 +193,7 @@ def prefill_sparse_attn(
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     qk_head_batches = H // QK_M_TILE
-    with pl.spmd(
-        T * qk_head_batches,
-        name_hint="qk_pv_merge",
-        optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
-    ) as merge_tid:
+    with pl.spmd(T * qk_head_batches, name_hint="qk_pv_merge") as merge_tid:
         qk_idx = pl.tile.get_block_idx()
         qk_t = qk_idx // qk_head_batches
         qk_hb = qk_idx - qk_t * qk_head_batches
@@ -263,7 +259,7 @@ def prefill_sparse_attn(
             pack_row = g * T + qk_t
             col = (gh - g * HEADS_PER_GROUP) * HEAD_DIM
             n_row_bf16 = pl.cast(n_full[n_hi:n_hi + 1, :], target_type=pl.BF16, mode="rint")
-            o_packed[pack_row:pack_row + 1, col:col + NOPE_DIM] = n_row_bf16[:, 0:NOPE_DIM]
+            o_packed[pack_row:pack_row + 1, col:col + HEAD_DIM] = n_row_bf16
 
     # Inverse RoPE fused with the rope-column pack: out[j] = x[j]*cos_il[j] + x[j^1]*sin_signed[j].
     # Precompute the head-invariant cos_il / sign-folded sin once, then rotate each head's rope
