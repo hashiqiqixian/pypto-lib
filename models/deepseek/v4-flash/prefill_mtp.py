@@ -38,6 +38,7 @@ from hc_head import (
     RMS_K_TILE as HC_HEAD_RMS_K_TILE,
     hc_head,
 )
+from lm_head import MAX_LOGIT_ROWS, TP_SIZE as LM_HEAD_TP_SIZE, VOCAB as LM_HEAD_VOCAB, VOCAB_PER_TP, golden_lm_head, lm_head
 from moe import (
     AUX_PAD,
     D,
@@ -80,6 +81,7 @@ from rmsnorm import golden_rms_norm, rms_norm
 T = PREFILL_TOKENS
 MTP_LAYER_ID = M.num_hidden_layers
 MTP_MOE_EPOCH = 1
+LM_HEAD_COMM_EPOCH = 1
 
 
 @pl.jit
@@ -250,8 +252,11 @@ def l3_mtp_prefill_fwd(
     mtp_hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     mtp_hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     mtp_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
+    logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -262,6 +267,10 @@ def l3_mtp_prefill_fwd(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    lm_head_hidden_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * D * 2)
+    lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
+    lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+    lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -296,6 +305,18 @@ def l3_mtp_prefill_fwd(
             routed_y_buf, combine_arrived,
             r, num_tokens,
             device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(lm_head_hidden_window_buf, [MAX_LOGIT_ROWS, D], dtype=pl.BF16)
+        hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
+        logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head(
+            hidden_out[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            hidden_window, hidden_done, logits_window, logits_done,
+            r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
+            LM_HEAD_COMM_EPOCH, device=r,
         )
 
 
@@ -391,6 +412,17 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
         for spec in build_single_layer_tensor_specs(start_pos=start_pos, num_tokens=num_tokens, layer_id=MTP_LAYER_ID)
         if isinstance(spec, TensorSpec)
     }
+
+    def init_lm_head_weight():
+        shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        return torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0)
+
+    def init_logit_row_indices():
+        indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices[:, :max(min(num_tokens, MAX_LOGIT_ROWS), 0)] = torch.arange(
+            max(min(num_tokens, MAX_LOGIT_ROWS), 0), dtype=torch.int32
+        )
+        return indices
     projection = {spec.name: spec for spec in _projection_specs()}
     mtp_head = {spec.name: spec for spec in _mtp_head_specs()}
     moe_specs = {spec.name: spec for spec in build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens) if isinstance(spec, TensorSpec)}
@@ -457,8 +489,11 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
         else:
             specs.append(_ranked(base[name], torch))
 
+    specs.append(TensorSpec("lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    specs.append(TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True))
+    specs.append(TensorSpec("logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 
@@ -571,6 +606,15 @@ def golden_mtp_prefill_fwd(tensors):
         )
         tensors["hidden_out"][rank] = golden_rms_norm(x_head, tensors["mtp_norm_w"][rank])
 
+    golden_lm_head(
+        {
+            "hidden_states": tensors["hidden_out"],
+            "lm_head_weight": tensors["lm_head_weight"],
+            "logit_row_indices": tensors["logit_row_indices"],
+            "logits": tensors["logits"],
+        }
+    )
+
 
 def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
     from golden import ratio_reldiff
@@ -630,6 +674,7 @@ def main():
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2, max_error_ratio=0.01),
             "hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
             "pre_hc_hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
+            "logits": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
         },
     )
     if not result.passed:
