@@ -261,7 +261,6 @@ def compressor_ratio4(
                     kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
                     cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
-    kv = pl.reshape(kv_flat, [B, S, HEAD_DIM])
     return kv
 
 

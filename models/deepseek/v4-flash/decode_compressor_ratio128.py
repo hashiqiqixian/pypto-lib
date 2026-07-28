@@ -290,7 +290,6 @@ def compressor_ratio128(
                     kv_flat[global_c_idx * s_dim : global_c_idx * s_dim + 1, :] = kv_row
                     cmp_kv_cache_flat[cmp_row : cmp_row + 1, :] = pl.cast(kv_row, target_type=pl.BF16, mode="rint")
 
-    kv = pl.reshape(kv_flat, [b_dim, s_dim, HEAD_DIM])
     return kv
 
 
