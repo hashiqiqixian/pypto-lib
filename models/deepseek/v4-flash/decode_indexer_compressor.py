@@ -300,7 +300,6 @@ def indexer_compressor(
                     # scale is one value per position; a [1,1] tile store is sub-32B, so scalar-write it
                     pl.write(idx_kv_scale_flat, [cache_row, 0], pl.read(kv_scale_dq_col, [inner, 0]))
 
-    kv = pl.reshape(kv_flat, [B, S, HEAD_DIM])
     return kv
 
 
