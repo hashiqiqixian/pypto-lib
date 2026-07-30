@@ -246,10 +246,6 @@ DECODE_START_POS = 8192
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
 PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
 PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
-# The leaf prefill program above remains B1/S128. The L3 serving program groups
-# four independent leaf invocations per DP rank, giving P=8DP*4B without
-# allowing compressor/indexer state to leak between requests.
-PREFILL_DISPATCH_BATCH = 4
 MOE_TOKENS = DECODE_TOKENS
 
 # Implementation constants
