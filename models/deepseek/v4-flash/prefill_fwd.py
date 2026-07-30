@@ -856,85 +856,252 @@ def l3_prefill_fwd(
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
-    # Each slot is an independent B1/S128 child forward. Running the full DP
-    # world for one slot before advancing to the next keeps collective order
-    # identical on every rank. The child forward and LM head clear their
-    # completion signals, so the same windows and epochs can be reused safely.
-    for slot in pl.range(PREFILL_DISPATCH_BATCH):
-        for r in pl.range(pld.world_size()):
-            recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(
-                recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32
-            )
-            recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(
-                recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8
-            )
-            recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(
-                recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32
-            )
-            recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(
-                recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
-            )
-            arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(
-                arrived_buf, [N_RANKS, 1], dtype=pl.INT32
-            )
-            data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(
-                data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
-            )
-            routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(
-                routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16
-            )
-            combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(
-                combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
-            )
-            prefill_fwd(
-                x_hc[r, slot], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
-                attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r],
-                gamma_ckv[r], kv_cache[r], attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
-                cmp_kv[r], hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
-                hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r],
-                csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r],
-                csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r],
-                csa_weights_proj[r], csa_inner_wkv[r], csa_inner_wgate[r],
-                csa_inner_ape[r], csa_inner_norm_w[r], csa_inner_compress_state[r],
-                idx_kv_cache[r], idx_kv_scale[r], hca_compress_state_block_table[r, slot],
-                csa_compress_state_block_table[r, slot],
-                csa_inner_compress_state_block_table[r, slot], freqs_cos[r], freqs_sin[r],
-                ori_block_table[r, slot], cmp_block_table[r, slot], idx_block_table[r, slot],
-                ori_slot_mapping[r, slot], position_ids[r, slot], input_ids[r, slot],
-                hca_cmp_slot_mapping[r, slot], hca_state_slot_mapping[r, slot],
-                csa_cmp_slot_mapping[r, slot], csa_idx_slot_mapping[r, slot],
-                csa_state_slot_mapping[r, slot], csa_inner_state_slot_mapping[r, slot],
-                hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
-                pre_hc_hidden_out[r, slot], hidden_out[r, slot], recv_meta, recv_x, recv_aux,
-                recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, hc_ffn_fn[r],
-                hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
-                routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
-                routed_w2[r], routed_w2_scale[r], shared_w1[r], shared_w1_scale[r],
-                shared_w3[r], shared_w3_scale[r], shared_w2[r], shared_w2_scale[r],
-                num_tokens_per_owner[slot], r, device=r,
-            )
+    # PyPTO host programs lower top-level device loops. Keep the four fixed
+    # B1/S128 slots explicitly unrolled so each rank observes the same
+    # collective order and the shared signal windows are cleared before reuse.
+    for r in pl.range(pld.world_size()):
+        recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(
+            recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32
+        )
+        recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(
+            recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8
+        )
+        recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(
+            recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32
+        )
+        recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(
+            recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
+        )
+        arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(
+            arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+        )
+        data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(
+            data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+        )
+        routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(
+            routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16
+        )
+        combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(
+            combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+        )
+        prefill_fwd(
+            x_hc[r, 0], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
+            attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r],
+            gamma_ckv[r], kv_cache[r], attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
+            cmp_kv[r], hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
+            hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r],
+            csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r],
+            csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r],
+            csa_weights_proj[r], csa_inner_wkv[r], csa_inner_wgate[r],
+            csa_inner_ape[r], csa_inner_norm_w[r], csa_inner_compress_state[r],
+            idx_kv_cache[r], idx_kv_scale[r], hca_compress_state_block_table[r, 0],
+            csa_compress_state_block_table[r, 0],
+            csa_inner_compress_state_block_table[r, 0], freqs_cos[r], freqs_sin[r],
+            ori_block_table[r, 0], cmp_block_table[r, 0], idx_block_table[r, 0],
+            ori_slot_mapping[r, 0], position_ids[r, 0], input_ids[r, 0],
+            hca_cmp_slot_mapping[r, 0], hca_state_slot_mapping[r, 0],
+            csa_cmp_slot_mapping[r, 0], csa_idx_slot_mapping[r, 0],
+            csa_state_slot_mapping[r, 0], csa_inner_state_slot_mapping[r, 0],
+            hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
+            pre_hc_hidden_out[r, 0], hidden_out[r, 0], recv_meta, recv_x, recv_aux,
+            recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, hc_ffn_fn[r],
+            hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
+            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
+            routed_w2[r], routed_w2_scale[r], shared_w1[r], shared_w1_scale[r],
+            shared_w3[r], shared_w3_scale[r], shared_w2[r], shared_w2_scale[r],
+            num_tokens_per_owner[0], r, device=r,
+        )
 
-        # Grouped LM head: every rank is both an owner and a TP rank within its
-        # local TP group. One slot is completed and cleared before the next.
-        for r in pl.range(pld.world_size()):
-            hidden_window = pld.window(
-                lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16
-            )
-            hidden_done = pld.window(
-                lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
-            )
-            logits_window = pld.window(
-                lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32
-            )
-            logits_done = pld.window(
-                lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
-            )
-            lm_head(
-                hidden_out[r, slot], lm_head_weight[r], logit_row_indices[r, slot],
-                logits[r, slot], hidden_window, hidden_done, logits_window, logits_done,
-                r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
-                LM_HEAD_COMM_EPOCH, device=r,
-            )
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(
+            lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16
+        )
+        hidden_done = pld.window(
+            lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
+        )
+        logits_window = pld.window(
+            lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32
+        )
+        logits_done = pld.window(
+            lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
+        )
+        lm_head(
+            hidden_out[r, 0], lm_head_weight[r], logit_row_indices[r, 0],
+            logits[r, 0], hidden_window, hidden_done, logits_window, logits_done,
+            r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
+            LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
+        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        prefill_fwd(
+            x_hc[r, 1], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
+            attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r],
+            gamma_ckv[r], kv_cache[r], attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
+            cmp_kv[r], hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
+            hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r],
+            csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r],
+            csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r],
+            csa_weights_proj[r], csa_inner_wkv[r], csa_inner_wgate[r],
+            csa_inner_ape[r], csa_inner_norm_w[r], csa_inner_compress_state[r],
+            idx_kv_cache[r], idx_kv_scale[r], hca_compress_state_block_table[r, 1],
+            csa_compress_state_block_table[r, 1],
+            csa_inner_compress_state_block_table[r, 1], freqs_cos[r], freqs_sin[r],
+            ori_block_table[r, 1], cmp_block_table[r, 1], idx_block_table[r, 1],
+            ori_slot_mapping[r, 1], position_ids[r, 1], input_ids[r, 1],
+            hca_cmp_slot_mapping[r, 1], hca_state_slot_mapping[r, 1],
+            csa_cmp_slot_mapping[r, 1], csa_idx_slot_mapping[r, 1],
+            csa_state_slot_mapping[r, 1], csa_inner_state_slot_mapping[r, 1],
+            hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
+            pre_hc_hidden_out[r, 1], hidden_out[r, 1], recv_meta, recv_x, recv_aux,
+            recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, hc_ffn_fn[r],
+            hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
+            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
+            routed_w2[r], routed_w2_scale[r], shared_w1[r], shared_w1_scale[r],
+            shared_w3[r], shared_w3_scale[r], shared_w2[r], shared_w2_scale[r],
+            num_tokens_per_owner[1], r, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(
+            lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16
+        )
+        hidden_done = pld.window(
+            lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
+        )
+        logits_window = pld.window(
+            lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32
+        )
+        logits_done = pld.window(
+            lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
+        )
+        lm_head(
+            hidden_out[r, 1], lm_head_weight[r], logit_row_indices[r, 1],
+            logits[r, 1], hidden_window, hidden_done, logits_window, logits_done,
+            r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
+            LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
+        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        prefill_fwd(
+            x_hc[r, 2], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
+            attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r],
+            gamma_ckv[r], kv_cache[r], attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
+            cmp_kv[r], hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
+            hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r],
+            csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r],
+            csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r],
+            csa_weights_proj[r], csa_inner_wkv[r], csa_inner_wgate[r],
+            csa_inner_ape[r], csa_inner_norm_w[r], csa_inner_compress_state[r],
+            idx_kv_cache[r], idx_kv_scale[r], hca_compress_state_block_table[r, 2],
+            csa_compress_state_block_table[r, 2],
+            csa_inner_compress_state_block_table[r, 2], freqs_cos[r], freqs_sin[r],
+            ori_block_table[r, 2], cmp_block_table[r, 2], idx_block_table[r, 2],
+            ori_slot_mapping[r, 2], position_ids[r, 2], input_ids[r, 2],
+            hca_cmp_slot_mapping[r, 2], hca_state_slot_mapping[r, 2],
+            csa_cmp_slot_mapping[r, 2], csa_idx_slot_mapping[r, 2],
+            csa_state_slot_mapping[r, 2], csa_inner_state_slot_mapping[r, 2],
+            hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
+            pre_hc_hidden_out[r, 2], hidden_out[r, 2], recv_meta, recv_x, recv_aux,
+            recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, hc_ffn_fn[r],
+            hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
+            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
+            routed_w2[r], routed_w2_scale[r], shared_w1[r], shared_w1_scale[r],
+            shared_w3[r], shared_w3_scale[r], shared_w2[r], shared_w2_scale[r],
+            num_tokens_per_owner[2], r, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(
+            lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16
+        )
+        hidden_done = pld.window(
+            lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
+        )
+        logits_window = pld.window(
+            lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32
+        )
+        logits_done = pld.window(
+            lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
+        )
+        lm_head(
+            hidden_out[r, 2], lm_head_weight[r], logit_row_indices[r, 2],
+            logits[r, 2], hidden_window, hidden_done, logits_window, logits_done,
+            r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
+            LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
+        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        prefill_fwd(
+            x_hc[r, 3], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
+            attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r],
+            gamma_ckv[r], kv_cache[r], attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
+            cmp_kv[r], hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
+            hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r],
+            csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r],
+            csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r],
+            csa_weights_proj[r], csa_inner_wkv[r], csa_inner_wgate[r],
+            csa_inner_ape[r], csa_inner_norm_w[r], csa_inner_compress_state[r],
+            idx_kv_cache[r], idx_kv_scale[r], hca_compress_state_block_table[r, 3],
+            csa_compress_state_block_table[r, 3],
+            csa_inner_compress_state_block_table[r, 3], freqs_cos[r], freqs_sin[r],
+            ori_block_table[r, 3], cmp_block_table[r, 3], idx_block_table[r, 3],
+            ori_slot_mapping[r, 3], position_ids[r, 3], input_ids[r, 3],
+            hca_cmp_slot_mapping[r, 3], hca_state_slot_mapping[r, 3],
+            csa_cmp_slot_mapping[r, 3], csa_idx_slot_mapping[r, 3],
+            csa_state_slot_mapping[r, 3], csa_inner_state_slot_mapping[r, 3],
+            hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
+            pre_hc_hidden_out[r, 3], hidden_out[r, 3], recv_meta, recv_x, recv_aux,
+            recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, hc_ffn_fn[r],
+            hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
+            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
+            routed_w2[r], routed_w2_scale[r], shared_w1[r], shared_w1_scale[r],
+            shared_w3[r], shared_w3_scale[r], shared_w2[r], shared_w2_scale[r],
+            num_tokens_per_owner[3], r, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(
+            lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16
+        )
+        hidden_done = pld.window(
+            lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
+        )
+        logits_window = pld.window(
+            lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32
+        )
+        logits_done = pld.window(
+            lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32
+        )
+        lm_head(
+            hidden_out[r, 3], lm_head_weight[r], logit_row_indices[r, 3],
+            logits[r, 3], hidden_window, hidden_done, logits_window, logits_done,
+            r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
+            LM_HEAD_COMM_EPOCH, device=r,
+        )
 
 
 # ---------------------------------------------------------------------------
