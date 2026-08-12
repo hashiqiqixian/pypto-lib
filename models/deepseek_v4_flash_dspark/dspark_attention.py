@@ -82,6 +82,8 @@ def dspark_attention(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cache_ready_tid: pl.Scalar[pl.TASK_ID],
+    metadata_ready_tid: pl.Scalar[pl.TASK_ID],
     slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[B, INDEX_WIDTH], pl.INT32],
     swa_lens: pl.Tensor[[B], pl.INT32],
@@ -109,7 +111,7 @@ def dspark_attention(
         q, qr, qr_scale,
     )
 
-    # Neutral fence: qr_proj and kv_proj share one input, nothing to defer behind.
+    # This no-work source task seeds the explicit kv_proj dependency chain.
     late_dep = pl.system.task_dummy(deps=[])
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x, wkv, gamma_ckv, rope_cos_il, rope_sin_signed, rope_swap_idx, kv, late_dep)
@@ -118,8 +120,13 @@ def dspark_attention(
     # gather below reads those rows back through swa_indices.
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
+    swa_lens_2d = pl.reshape(swa_lens, [B, 1])
     sparse_bias = pl.create_tensor([B, INDEX_WIDTH], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_kv_commit_valid_bias"):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_kv_commit_valid_bias",
+        deps=[cache_ready_tid, metadata_ready_tid],
+    ):
         for write_t in pl.range(T):
             write_row_i64 = pl.read(slot_mapping, [write_t])
             if write_row_i64 >= 0:
@@ -129,7 +136,10 @@ def dspark_attention(
         for v_blk in pl.range(B // BIAS_B_TILE):
             v_b0 = v_blk * BIAS_B_TILE
             v_col_m = pl.col_expand(pl.full([BIAS_B_TILE, INDEX_WIDTH], dtype=pl.FP32, value=0.0), v_col)
-            v_lens = pl.cast(pl.reshape(swa_lens[v_b0 : v_b0 + BIAS_B_TILE], [BIAS_B_TILE, 1]), target_type=pl.FP32)
+            v_lens = pl.cast(
+                swa_lens_2d[v_b0 : v_b0 + BIAS_B_TILE, 0:1],
+                target_type=pl.FP32,
+            )
             v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
             sparse_bias[v_b0 : v_b0 + BIAS_B_TILE, 0:INDEX_WIDTH] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
 
@@ -329,11 +339,13 @@ def dspark_attention_test(
     x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
+    cache_ready_tid = pl.system.task_dummy(deps=[])
+    metadata_ready_tid = pl.system.task_dummy(deps=[])
     return dspark_attention(
         x,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, position_ids,
-        kv_cache, slot_mapping, swa_indices, swa_lens,
+        kv_cache, cache_ready_tid, metadata_ready_tid, slot_mapping, swa_indices, swa_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out,
     )

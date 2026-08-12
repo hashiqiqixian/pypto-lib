@@ -412,13 +412,15 @@ def _hc_pre_syncall(
 
 @pl.jit.inline
 def _hc_pre_separate(
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    x_flat: pl.Tensor[[T_DYN, HC_DIM], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    inv_rms: pl.Tensor[[T_DYN, 1], pl.FP32],
+    start_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Multi-scope (separate-task) hc_pre -- the pre-#684 structure, applied to ALL T.
 
@@ -431,43 +433,61 @@ def _hc_pre_separate(
     buffers are sized to the dynamic t_linear (the 8->16 padded row count), not a static
     T_MAX. Kept as a switchable alternative to the fused kernel (perf is not the goal here).
     """
-    t_dim = pl.tensor.dim(x, 0)
+    t_dim = pl.tensor.dim(x_flat, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
-    x_flat = pl.reshape(x, [t_dim, HC_DIM])
     scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
     hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
 
-    inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     # x arrives as FP32 from the prior hc_post (the hc residual stream is FP32 end-to-end),
     # so the old BF16->FP32 cast scope + x_fp32 staging buffer are gone: linear / rms read
     # x_flat directly. The 8->16 pad rows of the cube tile are never materialized -- the
     # linear matmul masks them with valid_shape (zero-fill past t_dim), and rms only reads
     # the t_dim real rows.
-    mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32, init_value=0.0)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
-    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
+    with pl.spmd(
+        t_dim // T_TILE,
+        name_hint="hc_pre_rms",
+        deps=[start_dep],
+        allow_early_resolve=True,
+    ) as rms_tid:
+        t = pl.tile.get_block_idx()
         t0 = t * T_TILE
-        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        sq_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        row_sum_tmp = pl.create_tile(
+            [T_TILE, RMS_K_CHUNK],
+            dtype=pl.FP32,
+            target_memory=pl.MemorySpace.Vec,
+        )
         for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
             k0 = kb * RMS_K_CHUNK
-            x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
-            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
-        inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
-        inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
-
-    # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
-    # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
-    # On-core (not create_tensor init_value=0): AICPU init serializes on the scheduler and
-    # roughly doubles the decode orch window, whereas the on-core memset overlaps.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", allow_early_resolve=True):
-        for ts0 in pl.range(0, t_linear, T_TILE):
-            mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
+            x_chunk = pl.tile.load(
+                x_flat,
+                [t0, k0],
+                [T_TILE, RMS_K_CHUNK],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            chunk_sum = pl.tile.row_sum(pl.tile.mul(x_chunk, x_chunk), row_sum_tmp)
+            sq_sum = pl.tile.add(sq_sum, pl.tile.reshape(chunk_sum, [1, T_TILE]))
+        variance = pl.tile.reshape(
+            pl.tile.adds(pl.tile.muls(sq_sum, HC_DIM_INV), NORM_EPS),
+            [T_TILE, 1],
+        )
+        rsqrt_tmp = pl.create_tile([T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        inv = pl.tile.rsqrt(variance, rsqrt_tmp)
+        pl.tile.store(inv, [t0, 0], inv_rms)
 
     # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
-    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
+    with pl.spmd(
+        (t_linear // LINEAR_T_TILE) * LINEAR_OK,
+        name_hint="hc_pre_linear",
+        deps=[rms_tid],
+        allow_early_resolve=True,
+    ) as linear_tid:
+        task = pl.tile.get_block_idx()
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
         t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
@@ -487,7 +507,13 @@ def _hc_pre_separate(
     # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
     # lives in comb_sinkhorn.
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post", allow_early_resolve=True):
+    with pl.spmd(
+        t_dim // T_TILE,
+        name_hint="split_pre_post",
+        deps=[linear_tid],
+        allow_early_resolve=True,
+    ) as gate_tid:
+        ob = pl.tile.get_block_idx()
         t0 = ob * T_TILE
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
 
@@ -509,7 +535,13 @@ def _hc_pre_separate(
     # 20-iter Sinkhorn (column-first) -> comb. inv_rms is already a [t_linear,1] column buffer,
     # so the [T_TILE,1] inv tile loads directly (no transpose / no spill); the 4 comb groups
     # load pad-capable from mixes_raw at cols 8/12/16/20, then inv_rms * scale2 + group bias.
-    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn", allow_early_resolve=True):
+    with pl.spmd(
+        t_dim // COMB_T_TILE,
+        name_hint="comb_sinkhorn",
+        deps=[gate_tid],
+        allow_early_resolve=True,
+    ) as sinkhorn_tid:
+        ob = pl.tile.get_block_idx()
         t0 = ob * COMB_T_TILE
         inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
         comb_off = HC_MULT * 2
@@ -592,7 +624,13 @@ def _hc_pre_separate(
         pl.store(row3_out, [t0, 3 * HC_MULT], comb)
 
     # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D (D/D_SPMD tasks per tile).
-    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
+    with pl.spmd(
+        (t_dim // T_TILE) * (D // D_SPMD),
+        name_hint="mix_x",
+        deps=[sinkhorn_tid],
+        allow_early_resolve=True,
+    ) as _mix_tid:
+        blk = pl.tile.get_block_idx()
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
         pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
@@ -638,7 +676,11 @@ def _bind_hc_pre():
             post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
             comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
         ):
-            _hc_pre_separate(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+            t_dim = pl.tensor.dim(x, 0)
+            x_flat = pl.reshape(x, [t_dim, HC_DIM])
+            inv_rms = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
+            start_dep = pl.system.task_dummy(deps=[])
+            _hc_pre_separate(x_flat, hc_fn, hc_scale, hc_base, x_mixed, post, comb, inv_rms, start_dep)
             return x_mixed
     else:
         @pl.jit.inline
@@ -661,6 +703,41 @@ def _bind_hc_pre():
 hc_pre = _bind_hc_pre()
 
 
+@pl.jit.inline
+def hc_pre_flat(
+    x_flat: pl.Tensor[[T_DYN, HC_DIM], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    start_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Run the default separate HC pre-pass from its native flattened residual layout."""
+    t_dim = pl.tensor.dim(x_flat, 0)
+    inv_rms = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
+    _hc_pre_separate(x_flat, hc_fn, hc_scale, hc_base, x_mixed, post, comb, inv_rms, start_dep)
+    return x_mixed
+
+
+@pl.jit.inline
+def hc_pre_flat_with_inv_rms(
+    x_flat: pl.Tensor[[T_DYN, HC_DIM], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    inv_rms: pl.Tensor[[T_DYN, 1], pl.FP32],
+    start_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Run HC pre-pass with caller-owned RMS scratch for composed graphs."""
+    _hc_pre_separate(x_flat, hc_fn, hc_scale, hc_base, x_mixed, post, comb, inv_rms, start_dep)
+    return x_mixed
+
+
 @pl.jit
 def hc_pre_test(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -677,6 +754,47 @@ def hc_pre_test(
     comb.bind_dynamic(0, T_DYN)
 
     hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+    return x_mixed
+
+
+@pl.jit
+def hc_pre_external_scratch_test(
+    x_flat: pl.Tensor[[T_DYN, HC_DIM], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
+    inv_rms: pl.Out[pl.Tensor[[T_DYN, 1], pl.FP32]],
+):
+    x_flat.bind_dynamic(0, T_DYN)
+    x_mixed.bind_dynamic(0, T_DYN)
+    post.bind_dynamic(0, T_DYN)
+    comb.bind_dynamic(0, T_DYN)
+    inv_rms.bind_dynamic(0, T_DYN)
+    start_dep = pl.system.task_dummy(deps=[])
+    hc_pre_flat_with_inv_rms(
+        x_flat, hc_fn, hc_scale, hc_base, x_mixed, post, comb, inv_rms, start_dep
+    )
+    return x_mixed
+
+
+@pl.jit
+def hc_pre_static_external_scratch_test(
+    x_flat: pl.Tensor[[128, HC_DIM], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Out[pl.Tensor[[128, D], pl.BF16]],
+    post: pl.Out[pl.Tensor[[128, HC_MULT], pl.FP32]],
+    comb: pl.Out[pl.Tensor[[128, HC_MULT * HC_MULT], pl.FP32]],
+    inv_rms: pl.Out[pl.Tensor[[128, 1], pl.FP32]],
+):
+    start_dep = pl.system.task_dummy(deps=[])
+    hc_pre_flat_with_inv_rms(
+        x_flat, hc_fn, hc_scale, hc_base, x_mixed, post, comb, inv_rms, start_dep
+    )
     return x_mixed
 
 
@@ -715,7 +833,10 @@ def golden_hc_pre(tensors):
     """Torch reference matching the target HC-pre reduction and nonlinearities."""
     import torch
 
-    x = tensors["x"].float()  # [T, hc, D]
+    if "x_flat" in tensors:
+        x = tensors["x_flat"].float().reshape(-1, HC_MULT, D)
+    else:
+        x = tensors["x"].float()  # [T, hc, D]
     hc_fn = tensors["hc_fn"].float()  # [mix_hc, hc*D]
     hc_scale = tensors["hc_scale"].float()  # [3]
     hc_base = tensors["hc_base"].float()  # [mix_hc]
@@ -728,6 +849,8 @@ def golden_hc_pre(tensors):
         x_chunk = x_flat_2d[:, k0:k0 + RMS_K_CHUNK]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + NORM_EPS)
+    if "inv_rms" in tensors:
+        tensors["inv_rms"][:] = rsqrt
 
     # A2/A3 f32 Cube MAD accumulates four consecutive products before rounding
     # the updated accumulator to FP32.  Reproduce that target-defined reduction
@@ -759,7 +882,7 @@ def golden_hc_pre(tensors):
     tensors["comb"][:] = comb_t.reshape(t_dim, HC_MULT * HC_MULT)
 
 
-def build_tensor_specs(B, S):
+def build_tensor_specs(B, S, external_scratch=False):
     import torch
     from golden import TensorSpec
 
@@ -782,8 +905,13 @@ def build_tensor_specs(B, S):
             -3.5994, -2.7508, -3.3496, 3.1573,
         ])
 
-    return [
-        TensorSpec("x", [T, HC_MULT, D], torch.float32, init_value=init_x),
+    specs = [
+        TensorSpec(
+            "x_flat" if external_scratch else "x",
+            [T, HC_DIM] if external_scratch else [T, HC_MULT, D],
+            torch.float32,
+            init_value=lambda: init_x().reshape(T, HC_DIM) if external_scratch else init_x(),
+        ),
         TensorSpec("hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
         TensorSpec("hc_scale", [3], torch.float32, init_value=init_hc_scale),
         TensorSpec("hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
@@ -791,6 +919,9 @@ def build_tensor_specs(B, S):
         TensorSpec("post", [T, HC_MULT], torch.float32, is_output=True),
         TensorSpec("comb", [T, HC_MULT * HC_MULT], torch.float32, is_output=True),
     ]
+    if external_scratch:
+        specs.append(TensorSpec("inv_rms", [T, 1], torch.float32, is_output=True))
+    return specs
 
 
 if __name__ == "__main__":
@@ -813,6 +944,8 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--external-scratch", action="store_true")
+    parser.add_argument("--static-scratch", action="store_true")
     parser.add_argument("--no-dep-gen", action="store_true", default=False,
                         help="deprecated no-op: dep_gen is auto-selected per --impl (OFF for "
                              "'syncall' per pypto#1931, ON for 'separate'); kept for CLI / CI back-compat.")
@@ -850,8 +983,18 @@ if __name__ == "__main__":
         B, S = MODES[mode_name]
         print(f"--- hc_pre {mode_name}: B={B}, S={S} ---")
         result = run_jit(
-            fn=hc_pre_test,
-            specs=build_tensor_specs(B, S),
+            fn=(
+                hc_pre_static_external_scratch_test
+                if args.static_scratch
+                else hc_pre_external_scratch_test
+                if args.external_scratch
+                else hc_pre_test
+            ),
+            specs=build_tensor_specs(
+                B,
+                S,
+                external_scratch=args.external_scratch or args.static_scratch,
+            ),
             golden_fn=golden_hc_pre,
             runtime_dir=args.runtime_dir,
             golden_data=args.golden_data,

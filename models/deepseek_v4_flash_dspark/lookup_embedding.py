@@ -36,12 +36,12 @@ def lookup_embedding(
     input_ids: pl.Tensor[[T_DYN], pl.INT64],
     embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    x_hc_flat: pl.Tensor[[T_DYN, HC_MULT * D], pl.FP32],
 ):
     token_count = pl.tensor.dim(input_ids, 0)
-    x_hc_flat = pl.reshape(x_hc, [token_count * HC_MULT, D])
     work_items = token_count * (D // HIDDEN_TILE)
-    for block in pl.spmd(SPMD_BLOCKS, name_hint="lookup_embedding"):
+    with pl.spmd(SPMD_BLOCKS, name_hint="lookup_embedding") as lookup_tid:
+        block = pl.tile.get_block_idx()
         for work_idx in pl.range(block, work_items, SPMD_BLOCKS):
             token_idx = work_idx // (D // HIDDEN_TILE)
             hidden_block = work_idx % (D // HIDDEN_TILE)
@@ -52,10 +52,10 @@ def lookup_embedding(
             hidden_states[token_idx : token_idx + 1, hidden_offset : hidden_offset + HIDDEN_TILE] = hidden_chunk
             hc_chunk = pl.cast(hidden_chunk, target_type=pl.FP32, mode="none")
             for hc_idx in pl.range(HC_MULT):
-                hc_row = token_idx * HC_MULT + hc_idx
-                x_hc_flat[hc_row : hc_row + 1, hidden_offset : hidden_offset + HIDDEN_TILE] = hc_chunk
+                hc_offset = hc_idx * D + hidden_offset
+                x_hc_flat[token_idx : token_idx + 1, hc_offset : hc_offset + HIDDEN_TILE] = hc_chunk
 
-    return hidden_states, x_hc
+    return hidden_states, x_hc_flat, lookup_tid
 
 
 @pl.jit
@@ -70,7 +70,10 @@ def lookup_embedding_test(
     hidden_states.bind_dynamic(0, T_DYN)
     x_hc.bind_dynamic(0, T_DYN)
 
-    return lookup_embedding(input_ids, embed_weight, hidden_states, x_hc)
+    token_count = pl.tensor.dim(input_ids, 0)
+    x_hc_flat = pl.reshape(x_hc, [token_count, HC_MULT * D])
+    hidden_states, x_hc_flat, _ = lookup_embedding(input_ids, embed_weight, hidden_states, x_hc_flat)
+    return hidden_states, x_hc
 
 
 def golden_lookup_embedding_test(tensors):
