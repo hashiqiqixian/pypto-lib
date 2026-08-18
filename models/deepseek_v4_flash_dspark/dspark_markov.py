@@ -234,19 +234,18 @@ def greedy_markov_step(
 
     markov_bias = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
     markov_embedding = pl.create_tensor([batch, DSPARK_MARKOV_RANK], dtype=pl.BF16)
-    markov_logits_tid = markov_head(
+    markov_bias, markov_embedding = markov_head(
         previous_token_ids,
         markov_w1,
         markov_w2,
         markov_bias,
         markov_embedding,
-        previous_tokens_tid,
     )
 
     with pl.spmd(
         MARKOV_M_TILE,
         name_hint="dspark_markov_greedy",
-        deps=[base_logits_ready_tid, markov_logits_tid],
+        deps=[base_logits_ready_tid, previous_tokens_tid],
     ) as greedy_tid:
         request = pl.tile.get_block_idx()
         if request < batch:
