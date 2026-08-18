@@ -21,7 +21,6 @@ from config import (
     BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
-    DSPARK_QUERY_TOKENS,
     FLASH as M,
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
@@ -35,6 +34,9 @@ from qkv_proj_rope import kv_proj_rope, materialize_rope_rows, rope_prepare
 # Dynamic shape variables.
 T_DYN = pl.dynamic("DSPARK_CONTEXT_KV_T_DYN")
 ORI_BLOCK_NUM_DYN = pl.dynamic("DSPARK_CONTEXT_KV_ORI_BLOCK_NUM_DYN")
+
+# The public DSpark program supports at most 16 requests with 7 draft rows.
+DSPARK_QUERY_TOKENS = 16 * 7
 
 # model config
 D = M.hidden_size
@@ -96,7 +98,6 @@ def dspark_context_kv_query(
     position_ids: pl.Tensor[[DSPARK_QUERY_TOKENS], pl.INT32],
     slot_mapping: pl.Tensor[[DSPARK_QUERY_TOKENS], pl.INT64],
     kv_cache: pl.Tensor[[KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    start_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Project a padded DSpark query-width context without dynamic shape variables."""
     rope_cos_t = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.BF16)
@@ -116,6 +117,7 @@ def dspark_context_kv_query(
     rope_prepare(rope_cos_t, rope_sin_t, rope_cos_il, rope_sin_signed, rope_swap_idx)
 
     kv = pl.create_tensor([DSPARK_QUERY_TOKENS, HEAD_DIM], dtype=pl.BF16)
+    late_dep = pl.system.task_dummy(deps=[])
     kv_proj_rope(
         main_x,
         wkv,
@@ -124,18 +126,16 @@ def dspark_context_kv_query(
         rope_sin_signed,
         rope_swap_idx,
         kv,
-        start_dep,
+        late_dep,
     )
 
     kv_cache_flat = pl.reshape(kv_cache, [KV_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_context_kv_query_scatter") as scatter_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_context_kv_query_scatter"):
         for write_t in pl.range(DSPARK_QUERY_TOKENS):
             write_row_i64 = pl.read(slot_mapping, [write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
-
-    return scatter_tid
 
 
 @pl.jit
