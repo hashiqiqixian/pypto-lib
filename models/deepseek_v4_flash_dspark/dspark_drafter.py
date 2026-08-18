@@ -220,8 +220,6 @@ def draft_layer(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     query_positions: pl.Tensor[[T_QUERY], pl.INT32],
     kv_cache: pl.Tensor[[KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    context_cache_ready_tid: pl.Scalar[pl.TASK_ID],
-    metadata_ready_tid: pl.Scalar[pl.TASK_ID],
     query_slot_mapping: pl.Tensor[[T_QUERY], pl.INT64],
     swa_indices: pl.Tensor[[DSPARK_MAX_BATCH, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     swa_lens: pl.Tensor[[DSPARK_MAX_BATCH], pl.INT32],
@@ -282,14 +280,13 @@ def draft_layer(
         [T_QUERY, D],
         [0, 0],
     )
-    query_ready_tid = rms_norm(query_mixed_active, attn_norm_w, query_normed)
+    rms_norm(query_mixed_active, attn_norm_w, query_normed)
     attention_output = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
     dspark_attention(
         query_normed,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, query_positions,
-        kv_cache, query_ready_tid, context_cache_ready_tid, metadata_ready_tid,
-        query_slot_mapping, swa_indices, swa_lens,
+        kv_cache, query_slot_mapping, swa_indices, swa_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
         attention_output,
     )
@@ -578,17 +575,13 @@ def dspark_drafter(
     swa_lens_0 = swa_lens[0]
     swa_lens_1 = swa_lens[1]
     swa_lens_2 = swa_lens[2]
-    metadata_ready_tid = pl.system.task_dummy(
-        deps=[query_metadata_tid, visible_metadata_tid]
-    )
     hidden_1 = intermediate_hidden[0]
     draft_layer(
         initial_hidden,
         hc_attn_fn_0, hc_attn_scale_0, hc_attn_base_0,
         attn_norm_w_0, wq_a_0, wq_b_0, wq_b_scale_0, wkv_0, gamma_cq_0, gamma_ckv_0,
         freqs_cos, freqs_sin, query_positions,
-        kv_cache_0, context_kv_0_tid, metadata_ready_tid,
-        query_slot_mapping_0, swa_indices_0, swa_lens_0,
+        kv_cache_0, query_slot_mapping_0, swa_indices_0, swa_lens_0,
         attn_sink_0, wo_a_0, wo_b_0, wo_b_scale_0,
         hc_ffn_fn_0, hc_ffn_scale_0, hc_ffn_base_0, ffn_norm_w_0,
         gate_w_0, gate_bias_0, tid2eid_0, query_token_ids,
@@ -607,8 +600,7 @@ def dspark_drafter(
         hc_attn_fn_1, hc_attn_scale_1, hc_attn_base_1,
         attn_norm_w_1, wq_a_1, wq_b_1, wq_b_scale_1, wkv_1, gamma_cq_1, gamma_ckv_1,
         freqs_cos, freqs_sin, query_positions,
-        kv_cache_1, context_kv_1_tid, metadata_ready_tid,
-        query_slot_mapping_1, swa_indices_1, swa_lens_1,
+        kv_cache_1, query_slot_mapping_1, swa_indices_1, swa_lens_1,
         attn_sink_1, wo_a_1, wo_b_1, wo_b_scale_1,
         hc_ffn_fn_1, hc_ffn_scale_1, hc_ffn_base_1, ffn_norm_w_1,
         gate_w_1, gate_bias_1, tid2eid_1, query_token_ids,
@@ -627,8 +619,7 @@ def dspark_drafter(
         hc_attn_fn_2, hc_attn_scale_2, hc_attn_base_2,
         attn_norm_w_2, wq_a_2, wq_b_2, wq_b_scale_2, wkv_2, gamma_cq_2, gamma_ckv_2,
         freqs_cos, freqs_sin, query_positions,
-        kv_cache_2, context_kv_2_tid, metadata_ready_tid,
-        query_slot_mapping_2, swa_indices_2, swa_lens_2,
+        kv_cache_2, query_slot_mapping_2, swa_indices_2, swa_lens_2,
         attn_sink_2, wo_a_2, wo_b_2, wo_b_scale_2,
         hc_ffn_fn_2, hc_ffn_scale_2, hc_ffn_base_2, ffn_norm_w_2,
         gate_w_2, gate_bias_2, tid2eid_2, query_token_ids,

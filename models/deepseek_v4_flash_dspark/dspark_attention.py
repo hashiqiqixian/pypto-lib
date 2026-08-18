@@ -81,9 +81,6 @@ def dspark_attention(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    query_ready_tid: pl.Scalar[pl.TASK_ID],
-    cache_ready_tid: pl.Scalar[pl.TASK_ID],
-    metadata_ready_tid: pl.Scalar[pl.TASK_ID],
     slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[B, INDEX_WIDTH], pl.INT32],
     swa_lens: pl.Tensor[[B], pl.INT32],
@@ -112,16 +109,8 @@ def dspark_attention(
     )
 
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(
-        x,
-        wkv,
-        gamma_ckv,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-        kv,
-        query_ready_tid,
-    )
+    late_dep = pl.system.task_dummy(deps=[])
+    kv_proj_rope(x, wkv, gamma_ckv, rope_cos_il, rope_sin_signed, rope_swap_idx, kv, late_dep)
 
     # Commit the block's own KV and build the visible-length mask in one task; the
     # gather below reads those rows back through swa_indices.
@@ -129,11 +118,7 @@ def dspark_attention(
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     swa_lens_2d = pl.reshape(swa_lens, [B, 1])
     sparse_bias = pl.create_tensor([B, INDEX_WIDTH], dtype=pl.FP32)
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="dspark_kv_commit_valid_bias",
-        deps=[cache_ready_tid, metadata_ready_tid],
-    ):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_kv_commit_valid_bias"):
         for write_t in pl.range(T):
             write_row_i64 = pl.read(slot_mapping, [write_t])
             if write_row_i64 >= 0:
@@ -153,12 +138,7 @@ def dspark_attention(
     # One index row per request: build_dspark_swa_indices repeats it across the
     # block's query rows, so the gather runs B times, not T.
     visible_kv = pl.create_tensor([B * INDEX_WIDTH, HEAD_DIM], dtype=pl.BF16)
-    with pl.spmd(
-        B * SPARSE_BLOCKS,
-        deps=[metadata_ready_tid],
-        name_hint="dspark_gather_kv",
-    ) as _gather_tid:
-        g_task = pl.tile.get_block_idx()
+    for g_task in pl.spmd(B * SPARSE_BLOCKS, name_hint="dspark_gather_kv"):
         g_b = g_task // SPARSE_BLOCKS
         g_c0 = (g_task % SPARSE_BLOCKS) * ATTN_K_TILE
         g_base = g_b * INDEX_WIDTH
@@ -351,15 +331,11 @@ def dspark_attention_test(
     x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
-    query_ready_tid = pl.system.task_dummy(deps=[])
-    cache_ready_tid = pl.system.task_dummy(deps=[])
-    metadata_ready_tid = pl.system.task_dummy(deps=[])
     return dspark_attention(
         x,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, position_ids,
-        kv_cache, query_ready_tid, cache_ready_tid, metadata_ready_tid,
-        slot_mapping, swa_indices, swa_lens,
+        kv_cache, slot_mapping, swa_indices, swa_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out,
     )
