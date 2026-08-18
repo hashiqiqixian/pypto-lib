@@ -124,12 +124,15 @@ def prepare_dspark_inputs(
                     token_id = pl.read(anchor_token_ids, [request])
             pl.write(query_token_ids, [token], token_id)
 
-    lookup_tid = lookup_embedding(
+    lookup_hidden = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
+    query_hc = pl.reshape(query_hc_flat, [DSPARK_MOE_TOKENS, HC_MULT, D])
+    lookup_embedding(
         query_token_ids,
         embedding_weight,
-        query_hc_flat,
+        lookup_hidden,
+        query_hc,
     )
-    return main_x, query_token_ids, query_hc_flat, lookup_tid
+    return main_x, query_token_ids, query_hc_flat
 
 @pl.jit.inline
 def build_dspark_metadata(
@@ -555,7 +558,7 @@ def dspark_drafter(
     main_x = pl.create_tensor([target_tokens, D], dtype=pl.BF16)
     query_token_ids = pl.create_tensor([T], dtype=pl.INT64)
     hidden_0_flat = pl.reshape(initial_hidden, [T, HC_MULT * D])
-    main_x, query_token_ids, hidden_0_flat, lookup_tid = prepare_dspark_inputs(
+    main_x, query_token_ids, hidden_0_flat = prepare_dspark_inputs(
         target_hidden,
         main_proj_weight,
         main_norm_weight,
@@ -565,6 +568,7 @@ def dspark_drafter(
         query_token_ids,
         hidden_0_flat,
     )
+    context_start_tid = pl.system.task_dummy(deps=[])
 
     context_main_x = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
     context_positions = pl.create_tensor([T_QUERY], dtype=pl.INT32)
@@ -598,7 +602,7 @@ def dspark_drafter(
 
     context_kv_0_tid = dspark_context_kv_query(
         context_main_x, wkv_0, gamma_ckv_0, freqs_cos, freqs_sin,
-        context_positions, context_slots_0, kv_cache_0, lookup_tid,
+        context_positions, context_slots_0, kv_cache_0, context_start_tid,
     )
     context_kv_1_tid = dspark_context_kv_query(
         context_main_x, wkv_1, gamma_ckv_1, freqs_cos, freqs_sin,
