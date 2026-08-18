@@ -345,52 +345,6 @@ def rebase_moe_signals(
     return rebase_tid
 
 
-@pl.jit.inline
-def dspark_moe_barrier(
-    signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-    expected: pl.Scalar[pl.INT32],
-    rebase_tid: pl.Scalar[pl.TASK_ID],
-):
-    """Keep a faster rank from publishing the next epoch before all rebases."""
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="dspark_moe_epoch_barrier",
-        deps=[rebase_tid],
-    ) as barrier_tid:
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=signal,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for source in pl.range(N_RANKS):
-            if source != my_rank:
-                pld.system.wait(
-                    signal=signal,
-                    offsets=[source, 0],
-                    expected=expected,
-                    cmp=pld.WaitCmp.Ge,
-                )
-    return barrier_tid
-
-
-@pl.jit.inline
-def clear_dspark_moe_barrier(
-    completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-):
-    """Reset the barrier window after the final draft layer completes."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_moe_barrier_clear"):
-        _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
-        zero = pl.cast(0, pl.INT32)
-        for source in pl.range(N_RANKS):
-            pl.write(signal, [source, 0], zero)
-
-
 @pl.jit
 def dspark_drafter(
     target_hidden: pl.Tensor[[T_MAIN_DYN, MAIN_IN], pl.BF16],
@@ -525,7 +479,6 @@ def dspark_drafter(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    moe_barrier_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     target_hidden.bind_dynamic(0, T_MAIN_DYN)
@@ -666,8 +619,7 @@ def dspark_drafter(
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
         pl.const(40, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(1, pl.INT32),
     )
-    rebase_1_tid = rebase_moe_signals(hidden_1, arrived, data_arrived, combine_arrived, pl.const(1, pl.INT32))
-    barrier_1_tid = dspark_moe_barrier(moe_barrier_signal, my_rank, pl.const(1, pl.INT32), rebase_1_tid)
+    rebase_moe_signals(hidden_1, arrived, data_arrived, combine_arrived, pl.const(1, pl.INT32))
 
     hidden_2 = intermediate_hidden[1]
     draft_layer(
@@ -688,8 +640,7 @@ def dspark_drafter(
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
         pl.const(41, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(2, pl.INT32),
     )
-    rebase_2_tid = rebase_moe_signals(hidden_2, arrived, data_arrived, combine_arrived, pl.const(2, pl.INT32))
-    barrier_2_tid = dspark_moe_barrier(moe_barrier_signal, my_rank, pl.const(2, pl.INT32), rebase_2_tid)
+    rebase_moe_signals(hidden_2, arrived, data_arrived, combine_arrived, pl.const(2, pl.INT32))
 
     hidden_3 = intermediate_hidden[2]
     draft_layer(
@@ -711,7 +662,6 @@ def dspark_drafter(
         pl.const(42, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(3, pl.INT32),
     )
     clear_moe_signals(hidden_3, arrived, data_arrived, combine_arrived)
-    clear_dspark_moe_barrier(hidden_3, moe_barrier_signal)
 
     padded_head_hidden = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_head(hidden_3, hc_head_fn, hc_head_scale, hc_head_base, padded_head_hidden)
@@ -872,7 +822,6 @@ def l3_dspark_drafter(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    moe_barrier_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -883,7 +832,6 @@ def l3_dspark_drafter(
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        moe_barrier_signal = pld.window(moe_barrier_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         dspark_drafter(
             target_hidden[rank], main_proj_weight[rank], main_norm_weight[rank],
             anchor_token_ids[rank], embedding_weight[rank],
@@ -919,7 +867,7 @@ def l3_dspark_drafter(
             hc_head_fn[rank], hc_head_scale[rank], hc_head_base[rank], initial_hidden[rank],
             intermediate_hidden[rank], head_hidden[rank],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-            moe_barrier_signal, rank,
+            rank,
             device=rank,
         )
 
