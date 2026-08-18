@@ -29,7 +29,6 @@ MAIN_HIDDEN_DIM = TARGET_LAYERS * D
 
 # tiling
 T_TILE = 16                              # cube M-tile; matmul rows must be a multiple of 16
-CAST_T_TILE = 8                          # vector rows per FP32-to-BF16 conversion task
 N_TILE = 128                             # 32 output blocks over D
 K_TILE = 512                             # 24 reduction steps over MAIN_HIDDEN_DIM
 
@@ -44,7 +43,7 @@ def dspark_proj(
     t_dim = pl.tensor.dim(main_hidden, 0)
     t_matmul = ((t_dim + T_TILE - 1) // T_TILE) * T_TILE
 
-    projected_fp32 = pl.create_tensor([t_dim, D], dtype=pl.FP32)
+    projected = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     for proj_idx in pl.spmd(
         (t_matmul // T_TILE) * (D // N_TILE), name_hint="dspark_main_proj", allow_early_resolve=True
     ):
@@ -58,18 +57,9 @@ def dspark_proj(
             hidden_k = pl.slice(main_hidden, [T_TILE, K_TILE], [t0, k0], valid_shape=[proj_rows, K_TILE])
             weight_k = main_proj_w[n0 : n0 + N_TILE, k0 : k0 + K_TILE]
             proj_acc = pl.matmul_acc(proj_acc, hidden_k, weight_k, b_trans=True)
-        proj_valid = pl.set_validshape(proj_acc, proj_rows, N_TILE)
-        projected_fp32[t0 : t0 + T_TILE, n0 : n0 + N_TILE] = proj_valid
-
-    projected = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    for cast_idx in pl.spmd((t_dim // CAST_T_TILE) * (D // N_TILE), name_hint="dspark_main_proj_cast"):
-        token = (cast_idx // (D // N_TILE)) * CAST_T_TILE
-        n0 = (cast_idx % (D // N_TILE)) * N_TILE
-        projected[token : token + CAST_T_TILE, n0 : n0 + N_TILE] = pl.cast(
-            projected_fp32[token : token + CAST_T_TILE, n0 : n0 + N_TILE],
-            target_type=pl.BF16,
-            mode="rint",
-        )
+        proj_bf16 = pl.cast(proj_acc, target_type=pl.BF16, mode="rint")
+        proj_valid = pl.set_validshape(proj_bf16, proj_rows, N_TILE)
+        projected[t0 : t0 + T_TILE, n0 : n0 + N_TILE] = proj_valid
 
     rms_norm(projected, main_norm_w, main_x)
     return main_x
