@@ -21,6 +21,7 @@ from config import (
     BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
+    DSPARK_QUERY_TOKENS,
     FLASH as M,
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
@@ -68,7 +69,7 @@ def dspark_context_kv(
     rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
     rope_prepare(rope_cos_t, rope_sin_t, rope_cos_il, rope_sin_signed, rope_swap_idx)
 
-    # Neutral fence: no earlier producer to defer the kv_proj matmul behind here.
+    # This no-work source task seeds the explicit kv_proj dependency chain.
     late_dep = pl.system.task_dummy(deps=[])
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(main_x, wkv, gamma_ckv, rope_cos_il, rope_sin_signed, rope_swap_idx, kv, late_dep)
@@ -83,6 +84,58 @@ def dspark_context_kv(
                 kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
 
     return kv_cache
+
+
+@pl.jit.inline
+def dspark_context_kv_query(
+    main_x: pl.Tensor[[DSPARK_QUERY_TOKENS, D], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    position_ids: pl.Tensor[[DSPARK_QUERY_TOKENS], pl.INT32],
+    slot_mapping: pl.Tensor[[DSPARK_QUERY_TOKENS], pl.INT64],
+    kv_cache: pl.Tensor[[KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    start_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Project a padded DSpark query-width context without dynamic shape variables."""
+    rope_cos_t = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.BF16)
+    rope_sin_t = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.BF16)
+    materialize_rope_rows(
+        freqs_cos,
+        freqs_sin,
+        position_ids,
+        DSPARK_QUERY_TOKENS,
+        rope_cos_t,
+        rope_sin_t,
+    )
+
+    rope_cos_il = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.INT32)
+    rope_prepare(rope_cos_t, rope_sin_t, rope_cos_il, rope_sin_signed, rope_swap_idx)
+
+    kv = pl.create_tensor([DSPARK_QUERY_TOKENS, HEAD_DIM], dtype=pl.BF16)
+    kv_proj_rope(
+        main_x,
+        wkv,
+        gamma_ckv,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+        kv,
+        start_dep,
+    )
+
+    kv_cache_flat = pl.reshape(kv_cache, [KV_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_context_kv_query_scatter") as scatter_tid:
+        for write_t in pl.range(DSPARK_QUERY_TOKENS):
+            write_row_i64 = pl.read(slot_mapping, [write_t])
+            if write_row_i64 >= 0:
+                write_row = pl.cast(write_row_i64, pl.INDEX)
+                kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
+
+    return scatter_tid
 
 
 @pl.jit
