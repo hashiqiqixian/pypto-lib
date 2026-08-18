@@ -284,15 +284,14 @@ def kv_proj_rope(
     # Split-K kv_proj: KV_N_TILE N-groups expanded KV_OK-fold into cube blocks that
     # atomic-add their K partials into a zero-seeded output.
     kv_fp32 = pl.create_tensor([t_matmul, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed", deps=[late_dep]) as kv_seed_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
         for kts0 in pl.range(0, t_matmul, KV_M_TILE):
             for kvseed0 in pl.range(0, HEAD_DIM, KV_N_TILE):
                 kv_seed = pl.full([KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0)
                 kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = kv_seed
 
-    # The explicit seed edge prevents the split-K atomic adds from racing the
-    # zero fill when this inline kernel is composed into a larger task graph.
-    with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[kv_seed_tid]) as _kv_tid:
+    # `late_dep` fences kv_proj one hop behind rms_norm so qr_proj_matmul takes the cores first.
+    with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
         kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
         kv_k_base = (kbg % KV_OK) * KV_SPLIT_K_TILE
