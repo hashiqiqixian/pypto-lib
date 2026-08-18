@@ -145,8 +145,7 @@ def build_dspark_metadata(
 ):
     batch = pl.tensor.dim(anchor_positions, 0)
     active_tokens = batch * DSPARK_QUERY_WIDTH
-    with pl.spmd(1, name_hint="dspark_query_metadata") as query_metadata_tid:
-        metadata_core = pl.tile.get_block_idx()
+    for metadata_core in pl.spmd(1, name_hint="dspark_query_metadata"):
         for token in pl.range(metadata_core, DSPARK_QUERY_TOKENS):
             pl.write(query_positions, [token], pl.cast(0, pl.INT32))
             for layer in pl.range(DSPARK_DRAFT_LAYERS):
@@ -166,8 +165,7 @@ def build_dspark_metadata(
                     query_slot = physical_block * BLOCK_SIZE + block_offset
                     pl.write(query_slot_mapping, [layer, token], pl.cast(query_slot, pl.INT64))
 
-    with pl.spmd(DSPARK_MAX_BATCH, name_hint="dspark_visible_metadata") as visible_metadata_tid:
-        request = pl.tile.get_block_idx()
+    for request in pl.spmd(DSPARK_MAX_BATCH, name_hint="dspark_visible_metadata"):
         start_position = pl.cast(0, pl.INT32)
         visible_len = pl.cast(0, pl.INT32)
         if request < batch:
@@ -199,9 +197,8 @@ def build_dspark_metadata(
         swa_indices,
         swa_lens,
         query_positions,
-        query_metadata_tid,
-        visible_metadata_tid,
     )
+
 
 @pl.jit.inline(auto_scope=False)
 def draft_layer(
@@ -499,8 +496,6 @@ def dspark_drafter(
         query_token_ids,
         hidden_0_flat,
     )
-    context_start_tid = pl.system.task_dummy(deps=[])
-
     context_main_x = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
     context_positions = pl.create_tensor([T_QUERY], dtype=pl.INT32)
     context_slots_0 = pl.create_tensor([T_QUERY], dtype=pl.INT64)
@@ -531,17 +526,17 @@ def dspark_drafter(
                 value = main_x[context_row : context_row + 1, d0 : d0 + 512]
             context_main_x[token : token + 1, d0 : d0 + 512] = value
 
-    context_kv_0_tid = dspark_context_kv_query(
+    dspark_context_kv_query(
         context_main_x, wkv_0, gamma_ckv_0, freqs_cos, freqs_sin,
-        context_positions, context_slots_0, kv_cache_0, context_start_tid,
+        context_positions, context_slots_0, kv_cache_0,
     )
-    context_kv_1_tid = dspark_context_kv_query(
+    dspark_context_kv_query(
         context_main_x, wkv_1, gamma_ckv_1, freqs_cos, freqs_sin,
-        context_positions, context_slots_1, kv_cache_1, context_kv_0_tid,
+        context_positions, context_slots_1, kv_cache_1,
     )
-    context_kv_2_tid = dspark_context_kv_query(
+    dspark_context_kv_query(
         context_main_x, wkv_2, gamma_ckv_2, freqs_cos, freqs_sin,
-        context_positions, context_slots_2, kv_cache_2, context_kv_1_tid,
+        context_positions, context_slots_2, kv_cache_2,
     )
 
     query_slot_mapping = pl.create_tensor([DSPARK_DRAFT_LAYERS, T_QUERY], dtype=pl.INT64)
@@ -556,8 +551,6 @@ def dspark_drafter(
         swa_indices,
         swa_lens,
         query_positions,
-        query_metadata_tid,
-        visible_metadata_tid,
     ) = build_dspark_metadata(
         anchor_positions,
         block_tables,
