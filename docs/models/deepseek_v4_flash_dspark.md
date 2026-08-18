@@ -65,8 +65,9 @@ block without an intra-block causal mask. The list width is 192: the 135
 possible visible rows are padded to the 64-row attention tile boundary.
 
 Each draft layer owns a distinct slice of one stacked paged KV-cache argument.
-The three MoE calls use epochs 1, 2, and 3, with signal rebasing and a
-cross-rank barrier between layers.
+The three MoE calls reuse the same signal windows with monotonically increasing
+epochs 1, 2, and 3. The composed layer data flow supplies the required ordering,
+so no DSpark-specific signal rebasing or cross-rank barrier is needed.
 
 ## Markov sampling
 
