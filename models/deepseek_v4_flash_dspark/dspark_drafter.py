@@ -28,7 +28,7 @@ from dspark_context_kv import dspark_context_kv_query
 from dspark_proj import dspark_proj
 from hc_head import hc_head
 from hc_post import hc_post_prefill
-from hc_pre import hc_pre_with_start_dep
+from hc_pre import hc_pre
 from lookup_embedding import lookup_embedding
 from rmsnorm import rms_norm
 from moe import (
@@ -259,12 +259,11 @@ def draft_layer(
     active_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
-    start_tid: pl.Scalar[pl.TASK_ID],
 ):
     query_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     combine = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre_with_start_dep(
+    hc_pre(
         query_hc,
         hc_attn_fn,
         hc_attn_scale,
@@ -272,7 +271,6 @@ def draft_layer(
         query_mixed,
         post,
         combine,
-        start_tid,
     )
 
     query_normed = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
@@ -662,7 +660,7 @@ def dspark_drafter(
         shared_w2_0, shared_w2_scale_0,
         hidden_1,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-        pl.const(40, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(1, pl.INT32), lookup_tid,
+        pl.const(40, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(1, pl.INT32),
     )
     rebase_1_tid = rebase_moe_signals(hidden_1, arrived, data_arrived, combine_arrived, pl.const(1, pl.INT32))
     barrier_1_tid = dspark_moe_barrier(moe_barrier_signal, my_rank, pl.const(1, pl.INT32), rebase_1_tid)
@@ -684,7 +682,7 @@ def dspark_drafter(
         shared_w2_1, shared_w2_scale_1,
         hidden_2,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-        pl.const(41, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(2, pl.INT32), barrier_1_tid,
+        pl.const(41, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(2, pl.INT32),
     )
     rebase_2_tid = rebase_moe_signals(hidden_2, arrived, data_arrived, combine_arrived, pl.const(2, pl.INT32))
     barrier_2_tid = dspark_moe_barrier(moe_barrier_signal, my_rank, pl.const(2, pl.INT32), rebase_2_tid)
@@ -706,7 +704,7 @@ def dspark_drafter(
         shared_w2_2, shared_w2_scale_2,
         hidden_3,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-        pl.const(42, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(3, pl.INT32), barrier_2_tid,
+        pl.const(42, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(3, pl.INT32),
     )
     clear_moe_signals(hidden_3, arrived, data_arrived, combine_arrived)
     clear_dspark_moe_barrier(hidden_3, moe_barrier_signal)
