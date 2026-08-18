@@ -326,25 +326,6 @@ def draft_layer(
     )
     return output_hc
 
-@pl.jit.inline
-def rebase_moe_signals(
-    completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    completed_epoch: pl.Scalar[pl.INT32],
-):
-    """Clear stale credits while preserving the monotonic epoch baseline."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_moe_rebase") as rebase_tid:
-        _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
-        data_epoch = pl.cast(completed_epoch * N_LOCAL, pl.INT32)
-        for source in pl.range(N_RANKS):
-            pl.write(arrived, [source, 0], completed_epoch)
-            pl.write(data_arrived, [source, 0], data_epoch)
-            pl.write(combine_arrived, [source, 0], data_epoch)
-    return rebase_tid
-
-
 @pl.jit
 def dspark_drafter(
     target_hidden: pl.Tensor[[T_MAIN_DYN, MAIN_IN], pl.BF16],
@@ -619,7 +600,6 @@ def dspark_drafter(
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
         pl.const(40, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(1, pl.INT32),
     )
-    rebase_moe_signals(hidden_1, arrived, data_arrived, combine_arrived, pl.const(1, pl.INT32))
 
     hidden_2 = intermediate_hidden[1]
     draft_layer(
@@ -640,7 +620,6 @@ def dspark_drafter(
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
         pl.const(41, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(2, pl.INT32),
     )
-    rebase_moe_signals(hidden_2, arrived, data_arrived, combine_arrived, pl.const(2, pl.INT32))
 
     hidden_3 = intermediate_hidden[2]
     draft_layer(
