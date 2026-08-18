@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-"""Multi-rank synthetic validation harness for the three-layer DSpark draft backbone."""
+"""Compose the validated three-layer DeepSeek-V4-Flash DSpark drafter."""
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -15,62 +15,637 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import (
     BLOCK_SIZE,
+    DECODE_BATCH,
     DECODE_SEQ,
-    DSPARK_DRAFT_LAYERS,
-    DSPARK_MAX_BATCH,
-    DSPARK_NOISE_TOKEN_ID,
-    DSPARK_QUERY_TOKENS,
-    DSPARK_QUERY_WIDTH,
-    DSPARK_SUPPORTED_BATCHES,
     FLASH as M,
+    KV_ORI_BLOCK_NUM,
+    KV_ORI_MAX_BLOCKS,
+    MOE_TOKENS,
+    TP,
 )
-from draft_backbone import (
+from dspark_attention import dspark_attention
+from dspark_context_kv import dspark_context_kv_query
+from dspark_proj import dspark_proj
+from hc_head import hc_head
+from hc_post import hc_post_prefill
+from hc_pre import hc_pre
+from lookup_embedding import lookup_embedding
+from rmsnorm import rms_norm
+from moe import (
     AUX_PAD,
-    B_DYN,
-    D,
-    HEAD_DIM,
-    HC_DIM,
-    HC_MULT,
-    H,
     IDX_PAD,
-    MAIN_IN,
-    MAX_SEQ_LEN,
-    MIX_HC,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
     N_RANKS,
     N_ROUTES,
-    ORI_BLOCK_NUM,
-    ORI_MAX_BLOCKS,
-    O_GROUP_IN,
-    O_GROUPS,
-    O_LORA,
-    Q_LORA,
     RECV_MAX,
-    ROPE_DIM,
-    T_MAIN_DYN,
     TOPK,
     VOCAB,
-    draft_backbone,
+    clear_moe_signals,
+    moe,
 )
 from qkv_proj_rope import T_DYN as QKV_Q_T_DYN
 
+
+T_MAIN_DYN = pl.dynamic("DSPARK_BACKBONE_T_MAIN_DYN")
+B_DYN = pl.dynamic("DSPARK_BACKBONE_B_DYN")
+PREPARE_T_MAIN_DYN = pl.dynamic("DSPARK_PREPARE_T_MAIN_DYN")
+PREPARE_B_DYN = pl.dynamic("DSPARK_PREPARE_B_DYN")
+METADATA_B_DYN = pl.dynamic("DSPARK_METADATA_B_DYN")
+
+# DSpark program contract.
+DSPARK_DRAFT_LAYERS = 3
+DSPARK_QUERY_WIDTH = 7
+DSPARK_QUERY_PAD = 8
+DSPARK_NOISE_TOKEN_ID = 128799
+DSPARK_SUPPORTED_BATCHES = (4, 8, 12, 16)
+DSPARK_MAX_BATCH = max(DSPARK_SUPPORTED_BATCHES)
+DSPARK_QUERY_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH
+DSPARK_MOE_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_PAD
+DSPARK_SWA_INDEX_WIDTH = (M.sliding_window + DSPARK_QUERY_WIDTH + 63) // 64 * 64
+
+assert DECODE_SEQ == 1 + DSPARK_QUERY_WIDTH
+assert DSPARK_QUERY_WIDTH < DSPARK_QUERY_PAD
+assert DSPARK_MAX_BATCH == DECODE_BATCH // TP
+assert DSPARK_MOE_TOKENS == MOE_TOKENS
+assert DSPARK_NOISE_TOKEN_ID < M.vocab_size
+assert DSPARK_SWA_INDEX_WIDTH >= M.sliding_window + DSPARK_QUERY_WIDTH
+
+# model config
+T = DSPARK_MOE_TOKENS
+T_QUERY = DSPARK_QUERY_TOKENS
+D = M.hidden_size
+H = M.num_attention_heads
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+Q_LORA = M.q_lora_rank
+MAX_SEQ_LEN = M.max_position_embeddings
+HC_MULT = M.hc_mult
+MIX_HC = M.mix_hc
+HC_DIM = M.hc_dim
+O_LORA = M.o_lora_rank
+O_GROUPS = M.o_groups
+O_GROUP_IN = H * HEAD_DIM // O_GROUPS
+ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
+ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+MAIN_IN = DSPARK_DRAFT_LAYERS * D
+
+WIN = M.sliding_window
+PAD_D_TILE = 512
 
 # Three draft layers plus their MoE communication graph exceed the runtime's
 # default per-ring heap. Match the established large-model harness allocation.
 _DSPARK_RING_HEAP = (4 * 1024 * 1024 * 1024,) * 4
 
+@pl.jit.inline
+def prepare_dspark_inputs(
+    target_hidden: pl.Tensor[[PREPARE_T_MAIN_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[D, MAIN_IN], pl.BF16],
+    main_norm_weight: pl.Tensor[[D], pl.BF16],
+    anchor_token_ids: pl.Tensor[[PREPARE_B_DYN], pl.INT64],
+    embedding_weight: pl.Tensor[[VOCAB, D], pl.BF16],
+    main_x: pl.Tensor[[PREPARE_T_MAIN_DYN, D], pl.BF16],
+    query_token_ids: pl.Tensor[[DSPARK_MOE_TOKENS], pl.INT64],
+    query_hc_flat: pl.Tensor[[DSPARK_MOE_TOKENS, HC_MULT * D], pl.FP32],
+):
+    dspark_proj(target_hidden, main_proj_weight, main_norm_weight, main_x)
+
+    batch = pl.tensor.dim(anchor_token_ids, 0)
+    active_tokens = batch * DSPARK_QUERY_WIDTH
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_query_ids"):
+        for token in pl.range(DSPARK_MOE_TOKENS):
+            token_id = pl.cast(0, pl.INT64)
+            if token < active_tokens:
+                request = token // DSPARK_QUERY_WIDTH
+                query_offset = token % DSPARK_QUERY_WIDTH
+                token_id = pl.cast(DSPARK_NOISE_TOKEN_ID, pl.INT64)
+                if query_offset == 0:
+                    token_id = pl.read(anchor_token_ids, [request])
+            pl.write(query_token_ids, [token], token_id)
+
+    lookup_hidden = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
+    query_hc = pl.reshape(query_hc_flat, [DSPARK_MOE_TOKENS, HC_MULT, D])
+    lookup_embedding(
+        query_token_ids,
+        embedding_weight,
+        lookup_hidden,
+        query_hc,
+    )
+    return main_x, query_token_ids, query_hc_flat
+
+@pl.jit.inline
+def build_dspark_metadata(
+    anchor_positions: pl.Tensor[[METADATA_B_DYN], pl.INT32],
+    block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, METADATA_B_DYN, ORI_MAX_BLOCKS], pl.INT32],
+    query_slot_mapping: pl.Tensor[[DSPARK_DRAFT_LAYERS, DSPARK_QUERY_TOKENS], pl.INT64],
+    swa_indices: pl.Tensor[[DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    swa_lens: pl.Tensor[[DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH], pl.INT32],
+    query_positions: pl.Tensor[[DSPARK_QUERY_TOKENS], pl.INT32],
+):
+    batch = pl.tensor.dim(anchor_positions, 0)
+    active_tokens = batch * DSPARK_QUERY_WIDTH
+    for metadata_core in pl.spmd(1, name_hint="dspark_query_metadata"):
+        for token in pl.range(metadata_core, DSPARK_QUERY_TOKENS):
+            pl.write(query_positions, [token], pl.cast(0, pl.INT32))
+            for layer in pl.range(DSPARK_DRAFT_LAYERS):
+                pl.write(query_slot_mapping, [layer, token], pl.cast(-1, pl.INT64))
+            if token < active_tokens:
+                request = token // DSPARK_QUERY_WIDTH
+                query_offset = token % DSPARK_QUERY_WIDTH
+                anchor_position = pl.read(anchor_positions, [request])
+                query_position = anchor_position + 1 + query_offset
+                pl.write(query_positions, [token], pl.cast(query_position, pl.INT32))
+                for layer in pl.range(DSPARK_DRAFT_LAYERS):
+                    logical_block = query_position // BLOCK_SIZE
+                    block_offset = query_position % BLOCK_SIZE
+                    physical_block = pl.read(
+                        block_tables, [layer, request, pl.cast(logical_block, pl.INDEX)]
+                    )
+                    query_slot = physical_block * BLOCK_SIZE + block_offset
+                    pl.write(query_slot_mapping, [layer, token], pl.cast(query_slot, pl.INT64))
+
+    for request in pl.spmd(DSPARK_MAX_BATCH, name_hint="dspark_visible_metadata"):
+        start_position = pl.cast(0, pl.INT32)
+        visible_len = pl.cast(0, pl.INT32)
+        if request < batch:
+            anchor_position = pl.read(anchor_positions, [request])
+            prefix_len = anchor_position + 1
+            start_position = pl.cast(pl.max(prefix_len - WIN, 0), pl.INT32)
+            visible_len = pl.cast(
+                prefix_len + DSPARK_QUERY_WIDTH - start_position,
+                pl.INT32,
+            )
+        for layer in pl.range(DSPARK_DRAFT_LAYERS):
+            pl.write(swa_lens, [layer, request], visible_len)
+            for visible_offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
+                visible_slot = pl.cast(-1, pl.INT32)
+                if visible_offset < visible_len:
+                    visible_position = start_position + visible_offset
+                    logical_block = visible_position // BLOCK_SIZE
+                    block_offset = visible_position % BLOCK_SIZE
+                    physical_block = pl.read(
+                        block_tables, [layer, request, pl.cast(logical_block, pl.INDEX)]
+                    )
+                    visible_slot = pl.cast(
+                        physical_block * BLOCK_SIZE + block_offset,
+                        pl.INT32,
+                    )
+                pl.write(swa_indices, [layer, request, visible_offset], visible_slot)
+    return (
+        query_slot_mapping,
+        swa_indices,
+        swa_lens,
+        query_positions,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def draft_layer(
+    query_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    query_positions: pl.Tensor[[T_QUERY], pl.INT32],
+    kv_cache: pl.Tensor[[KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    query_slot_mapping: pl.Tensor[[T_QUERY], pl.INT64],
+    swa_indices: pl.Tensor[[DSPARK_MAX_BATCH, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    swa_lens: pl.Tensor[[DSPARK_MAX_BATCH], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    ffn_norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    query_token_ids: pl.Tensor[[T], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    output_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    layer_id: pl.Scalar[pl.INT32],
+    active_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+):
+    query_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+    combine = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    hc_pre(
+        query_hc,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        query_mixed,
+        post,
+        combine,
+    )
+
+    query_normed = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
+    query_mixed_active: pl.Tensor[[T_QUERY, D], pl.BF16] = pl.slice(
+        query_mixed,
+        [T_QUERY, D],
+        [0, 0],
+    )
+    rms_norm(query_mixed_active, attn_norm_w, query_normed)
+    attention_output = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
+    dspark_attention(
+        query_normed,
+        wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin, query_positions,
+        kv_cache, query_slot_mapping, swa_indices, swa_lens,
+        attn_sink, wo_a, wo_b, wo_b_scale,
+        attention_output,
+    )
+
+    padded_attention = pl.create_tensor([T, D], dtype=pl.BF16)
+    for pad_idx in pl.spmd(T * (D // PAD_D_TILE), name_hint="dspark_attention_pad"):
+        pad_token = pad_idx // (D // PAD_D_TILE)
+        pad_col = (pad_idx % (D // PAD_D_TILE)) * PAD_D_TILE
+        output_tile = pl.full([1, PAD_D_TILE], dtype=pl.BF16, value=0.0)
+        if pad_token < T_QUERY:
+            output_tile = attention_output[pad_token : pad_token + 1, pad_col : pad_col + PAD_D_TILE]
+        padded_attention[pad_token : pad_token + 1, pad_col : pad_col + PAD_D_TILE] = output_tile
+
+    attention_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    hc_post_prefill(
+        padded_attention,
+        query_hc,
+        post,
+        combine,
+        attention_hc,
+        active_tokens,
+    )
+
+    moe(
+        attention_hc,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        ffn_norm_w, gate_w, gate_bias, tid2eid, query_token_ids,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+        output_hc,
+        recv_meta, recv_x, recv_aux, recv_route,
+        arrived, data_arrived, routed_y_buf, combine_arrived,
+        layer_id, active_tokens, my_rank, moe_epoch,
+    )
+    return output_hc
+
+@pl.jit
+def dspark_drafter(
+    target_hidden: pl.Tensor[[T_MAIN_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[D, MAIN_IN], pl.BF16],
+    main_norm_weight: pl.Tensor[[D], pl.BF16],
+    anchor_token_ids: pl.Tensor[[B_DYN], pl.INT64],
+    embedding_weight: pl.Tensor[[VOCAB, D], pl.BF16],
+    context_position_ids: pl.Tensor[[QKV_Q_T_DYN], pl.INT32],
+    context_slot_mapping: pl.Tensor[[DSPARK_DRAFT_LAYERS, QKV_Q_T_DYN], pl.INT64],
+    anchor_positions: pl.Tensor[[B_DYN], pl.INT32],
+    block_tables: pl.Tensor[
+        [DSPARK_DRAFT_LAYERS, B_DYN, ORI_MAX_BLOCKS],
+        pl.INT32,
+    ],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    hc_attn_fn_0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale_0: pl.Tensor[[3], pl.FP32],
+    hc_attn_base_0: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w_0: pl.Tensor[[D], pl.BF16],
+    wq_a_0: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b_0: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale_0: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv_0: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq_0: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv_0: pl.Tensor[[HEAD_DIM], pl.BF16],
+    kv_caches: pl.InOut[
+        pl.Tensor[[DSPARK_DRAFT_LAYERS * ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]
+    ],
+    attn_sink_0: pl.Tensor[[H], pl.FP32],
+    wo_a_0: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_0: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale_0: pl.Tensor[[D], pl.FP32],
+    hc_ffn_fn_0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale_0: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base_0: pl.Tensor[[MIX_HC], pl.FP32],
+    ffn_norm_w_0: pl.Tensor[[D], pl.BF16],
+    gate_w_0: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias_0: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid_0: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    routed_w1_0: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale_0: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3_0: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale_0: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2_0: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale_0: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1_0: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale_0: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3_0: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale_0: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2_0: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale_0: pl.Tensor[[D], pl.FP32],
+    hc_attn_fn_1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale_1: pl.Tensor[[3], pl.FP32],
+    hc_attn_base_1: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w_1: pl.Tensor[[D], pl.BF16],
+    wq_a_1: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b_1: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale_1: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv_1: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq_1: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv_1: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink_1: pl.Tensor[[H], pl.FP32],
+    wo_a_1: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_1: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale_1: pl.Tensor[[D], pl.FP32],
+    hc_ffn_fn_1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale_1: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base_1: pl.Tensor[[MIX_HC], pl.FP32],
+    ffn_norm_w_1: pl.Tensor[[D], pl.BF16],
+    gate_w_1: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias_1: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid_1: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    routed_w1_1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale_1: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3_1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale_1: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2_1: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale_1: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1_1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale_1: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3_1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale_1: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2_1: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale_1: pl.Tensor[[D], pl.FP32],
+    hc_attn_fn_2: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale_2: pl.Tensor[[3], pl.FP32],
+    hc_attn_base_2: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w_2: pl.Tensor[[D], pl.BF16],
+    wq_a_2: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b_2: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale_2: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv_2: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq_2: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv_2: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink_2: pl.Tensor[[H], pl.FP32],
+    wo_a_2: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_2: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale_2: pl.Tensor[[D], pl.FP32],
+    hc_ffn_fn_2: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale_2: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base_2: pl.Tensor[[MIX_HC], pl.FP32],
+    ffn_norm_w_2: pl.Tensor[[D], pl.BF16],
+    gate_w_2: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias_2: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid_2: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    routed_w1_2: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale_2: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3_2: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale_2: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2_2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale_2: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1_2: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale_2: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3_2: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale_2: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2_2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale_2: pl.Tensor[[D], pl.FP32],
+    hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
+    hc_head_scale: pl.Tensor[[1], pl.FP32],
+    hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
+    initial_hidden: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    intermediate_hidden: pl.Out[
+        pl.Tensor[[DSPARK_DRAFT_LAYERS, T, HC_MULT, D], pl.FP32]
+    ],
+    head_hidden: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16]],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    target_hidden.bind_dynamic(0, T_MAIN_DYN)
+    context_position_ids.bind_dynamic(0, QKV_Q_T_DYN)
+    context_slot_mapping.bind_dynamic(1, QKV_Q_T_DYN)
+    anchor_token_ids.bind_dynamic(0, B_DYN)
+    anchor_positions.bind_dynamic(0, B_DYN)
+    block_tables.bind_dynamic(1, B_DYN)
+    head_hidden.bind_dynamic(0, B_DYN)
+    batch = pl.tensor.dim(anchor_token_ids, 0)
+    target_tokens = pl.tensor.dim(target_hidden, 0)
+    active_tokens = batch * DSPARK_QUERY_WIDTH
+
+    kv_cache_0 = pl.slice(
+        kv_caches,
+        [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+        [0, 0, 0, 0],
+    )
+    kv_cache_1 = pl.slice(
+        kv_caches,
+        [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+        [ORI_BLOCK_NUM, 0, 0, 0],
+    )
+    kv_cache_2 = pl.slice(
+        kv_caches,
+        [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+        [2 * ORI_BLOCK_NUM, 0, 0, 0],
+    )
+
+    main_x = pl.create_tensor([target_tokens, D], dtype=pl.BF16)
+    query_token_ids = pl.create_tensor([T], dtype=pl.INT64)
+    hidden_0_flat = pl.reshape(initial_hidden, [T, HC_MULT * D])
+    main_x, query_token_ids, hidden_0_flat = prepare_dspark_inputs(
+        target_hidden,
+        main_proj_weight,
+        main_norm_weight,
+        anchor_token_ids,
+        embedding_weight,
+        main_x,
+        query_token_ids,
+        hidden_0_flat,
+    )
+    context_main_x = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
+    context_positions = pl.create_tensor([T_QUERY], dtype=pl.INT32)
+    context_slots_0 = pl.create_tensor([T_QUERY], dtype=pl.INT64)
+    context_slots_1 = pl.create_tensor([T_QUERY], dtype=pl.INT64)
+    context_slots_2 = pl.create_tensor([T_QUERY], dtype=pl.INT64)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_context_pad"):
+        for token in pl.range(T_QUERY):
+            position = pl.cast(0, pl.INT32)
+            if token < batch:
+                position = pl.read(context_position_ids, [token])
+            pl.write(context_positions, [token], position)
+            slot_0 = pl.cast(-1, pl.INT64)
+            slot_1 = pl.cast(-1, pl.INT64)
+            slot_2 = pl.cast(-1, pl.INT64)
+            if token < batch:
+                slot_0 = pl.read(context_slot_mapping, [0, token])
+                slot_1 = pl.read(context_slot_mapping, [1, token])
+                slot_2 = pl.read(context_slot_mapping, [2, token])
+            pl.write(context_slots_0, [token], slot_0)
+            pl.write(context_slots_1, [token], slot_1)
+            pl.write(context_slots_2, [token], slot_2)
+        for token_d in pl.range(T_QUERY * (D // 512)):
+            token = token_d // (D // 512)
+            d0 = (token_d % (D // 512)) * 512
+            value = pl.full([1, 512], dtype=pl.BF16, value=0.0)
+            if token < batch:
+                context_row = (token + 1) * DECODE_SEQ - 1
+                value = main_x[context_row : context_row + 1, d0 : d0 + 512]
+            context_main_x[token : token + 1, d0 : d0 + 512] = value
+
+    dspark_context_kv_query(
+        context_main_x, wkv_0, gamma_ckv_0, freqs_cos, freqs_sin,
+        context_positions, context_slots_0, kv_cache_0,
+    )
+    dspark_context_kv_query(
+        context_main_x, wkv_1, gamma_ckv_1, freqs_cos, freqs_sin,
+        context_positions, context_slots_1, kv_cache_1,
+    )
+    dspark_context_kv_query(
+        context_main_x, wkv_2, gamma_ckv_2, freqs_cos, freqs_sin,
+        context_positions, context_slots_2, kv_cache_2,
+    )
+
+    query_slot_mapping = pl.create_tensor([DSPARK_DRAFT_LAYERS, T_QUERY], dtype=pl.INT64)
+    swa_indices = pl.create_tensor(
+        [DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH, DSPARK_SWA_INDEX_WIDTH],
+        dtype=pl.INT32,
+    )
+    swa_lens = pl.create_tensor([DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH], dtype=pl.INT32)
+    query_positions = pl.create_tensor([T_QUERY], dtype=pl.INT32)
+    (
+        query_slot_mapping,
+        swa_indices,
+        swa_lens,
+        query_positions,
+    ) = build_dspark_metadata(
+        anchor_positions,
+        block_tables,
+        query_slot_mapping,
+        swa_indices,
+        swa_lens,
+        query_positions,
+    )
+    query_slot_mapping_0 = query_slot_mapping[0]
+    query_slot_mapping_1 = query_slot_mapping[1]
+    query_slot_mapping_2 = query_slot_mapping[2]
+    swa_indices_0 = swa_indices[0]
+    swa_indices_1 = swa_indices[1]
+    swa_indices_2 = swa_indices[2]
+    swa_lens_0 = swa_lens[0]
+    swa_lens_1 = swa_lens[1]
+    swa_lens_2 = swa_lens[2]
+    hidden_1 = intermediate_hidden[0]
+    draft_layer(
+        initial_hidden,
+        hc_attn_fn_0, hc_attn_scale_0, hc_attn_base_0,
+        attn_norm_w_0, wq_a_0, wq_b_0, wq_b_scale_0, wkv_0, gamma_cq_0, gamma_ckv_0,
+        freqs_cos, freqs_sin, query_positions,
+        kv_cache_0, query_slot_mapping_0, swa_indices_0, swa_lens_0,
+        attn_sink_0, wo_a_0, wo_b_0, wo_b_scale_0,
+        hc_ffn_fn_0, hc_ffn_scale_0, hc_ffn_base_0, ffn_norm_w_0,
+        gate_w_0, gate_bias_0, tid2eid_0, query_token_ids,
+        routed_w1_0, routed_w1_scale_0, routed_w3_0, routed_w3_scale_0,
+        routed_w2_0, routed_w2_scale_0,
+        shared_w1_0, shared_w1_scale_0, shared_w3_0, shared_w3_scale_0,
+        shared_w2_0, shared_w2_scale_0,
+        hidden_1,
+        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
+        pl.const(40, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(1, pl.INT32),
+    )
+
+    hidden_2 = intermediate_hidden[1]
+    draft_layer(
+        hidden_1,
+        hc_attn_fn_1, hc_attn_scale_1, hc_attn_base_1,
+        attn_norm_w_1, wq_a_1, wq_b_1, wq_b_scale_1, wkv_1, gamma_cq_1, gamma_ckv_1,
+        freqs_cos, freqs_sin, query_positions,
+        kv_cache_1, query_slot_mapping_1, swa_indices_1, swa_lens_1,
+        attn_sink_1, wo_a_1, wo_b_1, wo_b_scale_1,
+        hc_ffn_fn_1, hc_ffn_scale_1, hc_ffn_base_1, ffn_norm_w_1,
+        gate_w_1, gate_bias_1, tid2eid_1, query_token_ids,
+        routed_w1_1, routed_w1_scale_1, routed_w3_1, routed_w3_scale_1,
+        routed_w2_1, routed_w2_scale_1,
+        shared_w1_1, shared_w1_scale_1, shared_w3_1, shared_w3_scale_1,
+        shared_w2_1, shared_w2_scale_1,
+        hidden_2,
+        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
+        pl.const(41, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(2, pl.INT32),
+    )
+
+    hidden_3 = intermediate_hidden[2]
+    draft_layer(
+        hidden_2,
+        hc_attn_fn_2, hc_attn_scale_2, hc_attn_base_2,
+        attn_norm_w_2, wq_a_2, wq_b_2, wq_b_scale_2, wkv_2, gamma_cq_2, gamma_ckv_2,
+        freqs_cos, freqs_sin, query_positions,
+        kv_cache_2, query_slot_mapping_2, swa_indices_2, swa_lens_2,
+        attn_sink_2, wo_a_2, wo_b_2, wo_b_scale_2,
+        hc_ffn_fn_2, hc_ffn_scale_2, hc_ffn_base_2, ffn_norm_w_2,
+        gate_w_2, gate_bias_2, tid2eid_2, query_token_ids,
+        routed_w1_2, routed_w1_scale_2, routed_w3_2, routed_w3_scale_2,
+        routed_w2_2, routed_w2_scale_2,
+        shared_w1_2, shared_w1_scale_2, shared_w3_2, shared_w3_scale_2,
+        shared_w2_2, shared_w2_scale_2,
+        hidden_3,
+        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
+        pl.const(42, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(3, pl.INT32),
+    )
+    clear_moe_signals(hidden_3, arrived, data_arrived, combine_arrived)
+
+    padded_head_hidden = pl.create_tensor([T, D], dtype=pl.BF16)
+    hc_head(hidden_3, hc_head_fn, hc_head_scale, hc_head_base, padded_head_hidden)
+    head_hidden_flat = pl.reshape(head_hidden, [batch * DSPARK_QUERY_WIDTH, D])
+    for token in pl.spmd(T, name_hint="dspark_head_unpad"):
+        if token < active_tokens:
+            head_hidden_flat[token : token + 1, :] = padded_head_hidden[
+                token : token + 1,
+                :,
+            ]
+    return head_hidden
 
 @pl.jit.host
-def l3_draft_backbone(
+def l3_dspark_drafter(
     target_hidden: pl.Tensor[[N_RANKS, T_MAIN_DYN, MAIN_IN], pl.BF16],
     initial_hidden: pl.Out[
-        pl.Tensor[[N_RANKS, DSPARK_MAX_BATCH * 8, HC_MULT, D], pl.FP32]
+        pl.Tensor[[N_RANKS, DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, HC_MULT, D], pl.FP32]
     ],
     intermediate_hidden: pl.Out[
         pl.Tensor[
-            [N_RANKS, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH * 8, HC_MULT, D],
+            [N_RANKS, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, HC_MULT, D],
             pl.FP32,
         ]
     ],
@@ -210,7 +785,6 @@ def l3_draft_backbone(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    moe_barrier_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -221,8 +795,7 @@ def l3_draft_backbone(
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        moe_barrier_signal = pld.window(moe_barrier_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
-        draft_backbone(
+        dspark_drafter(
             target_hidden[rank], main_proj_weight[rank], main_norm_weight[rank],
             anchor_token_ids[rank], embedding_weight[rank],
             context_position_ids[rank], context_slot_mapping[rank], anchor_positions[rank], block_tables[rank],
@@ -257,7 +830,7 @@ def l3_draft_backbone(
             hc_head_fn[rank], hc_head_scale[rank], hc_head_base[rank], initial_hidden[rank],
             intermediate_hidden[rank], head_hidden[rank],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-            moe_barrier_signal, rank,
+            rank,
             device=rank,
         )
 
@@ -404,13 +977,13 @@ def build_tensor_specs(batch):
         ranked("target_hidden", [batch * DECODE_SEQ, MAIN_IN], torch.bfloat16, init_value=init_target_hidden),
         TensorSpec(
             "initial_hidden",
-            [N_RANKS, DSPARK_MAX_BATCH * 8, HC_MULT, D],
+            [N_RANKS, DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, HC_MULT, D],
             torch.float32,
             is_output=True,
         ),
         TensorSpec(
             "intermediate_hidden",
-            [N_RANKS, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH * 8, HC_MULT, D],
+            [N_RANKS, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, HC_MULT, D],
             torch.float32,
             is_output=True,
         ),
@@ -500,7 +1073,7 @@ def build_tensor_specs(batch):
     return specs
 
 
-def golden_draft_backbone(tensors):
+def golden_dspark_drafter(tensors):
     import torch
 
     def rms_norm(hidden):
@@ -548,7 +1121,7 @@ def golden_draft_backbone(tensors):
     context_slots = tensors["context_slot_mapping"]
     for rank in range(N_RANKS):
         main_x = rms_norm(tensors["target_hidden"][rank, :, :D])
-        query_ids = torch.zeros(DSPARK_MAX_BATCH * 8, dtype=torch.int64)
+        query_ids = torch.zeros(DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, dtype=torch.int64)
         for request in range(positions.shape[1]):
             row = request * DSPARK_QUERY_WIDTH
             query_ids[row] = tensors["anchor_token_ids"][rank, request]
@@ -605,7 +1178,7 @@ if __name__ == "__main__":
     import argparse
     from golden import run_jit
 
-    parser = argparse.ArgumentParser(description="Validate the multi-rank DeepSeek V4 DSpark draft backbone.")
+    parser = argparse.ArgumentParser(description="Validate the multi-rank DeepSeek V4 DSpark drafter.")
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
     parser.add_argument("--ep", type=int, choices=(2, 4, 8, 16), default=2)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
@@ -618,9 +1191,9 @@ if __name__ == "__main__":
     assert args.ep == N_RANKS
     assert len(device_ids) >= N_RANKS
     result = run_jit(
-        fn=l3_draft_backbone,
+        fn=l3_dspark_drafter,
         specs=build_tensor_specs(args.batch),
-        golden_fn=golden_draft_backbone,
+        golden_fn=golden_dspark_drafter,
         compile_only=args.compile_only,
         compile_cfg=dict(
             dump_passes=args.dump_passes,
