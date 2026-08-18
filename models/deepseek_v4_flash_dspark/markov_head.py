@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from config import DECODE_BATCH, DSPARK_MARKOV_RANK, TP
+from config import DECODE_BATCH, TP
 
 
 # Dynamic shape variables.
@@ -18,7 +18,7 @@ T_DYN = pl.dynamic("MARKOV_HEAD_T_DYN")
 VOCAB_DYN = pl.dynamic("MARKOV_HEAD_VOCAB_DYN")
 
 # model config
-MARKOV_RANK = DSPARK_MARKOV_RANK
+MARKOV_RANK = 256
 
 # tiling
 T_TILE = 16

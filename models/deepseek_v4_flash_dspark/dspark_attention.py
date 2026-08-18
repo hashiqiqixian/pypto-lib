@@ -20,7 +20,6 @@ import pypto.language as pl
 from config import (
     BLOCK_SIZE,
     DECODE_BATCH,
-    DSPARK_SPEC_TOKENS,
     FLASH as M,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
@@ -36,7 +35,7 @@ ORI_BLOCK_NUM_DYN = pl.dynamic("DSPARK_ATTENTION_ORI_BLOCK_NUM_DYN")
 
 # model config
 B = DECODE_BATCH // TP
-S = DSPARK_SPEC_TOKENS                   # anchor-first draft query rows per request
+S = 7                                    # anchor-first draft query rows per request
 T = B * S
 D = M.hidden_size
 H = M.num_attention_heads

@@ -21,7 +21,6 @@ from config import (
     BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
-    DSPARK_QUERY_TOKENS,
     FLASH as M,
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
@@ -35,6 +34,9 @@ from qkv_proj_rope import kv_proj_rope, materialize_rope_rows, rope_prepare
 # Dynamic shape variables.
 T_DYN = pl.dynamic("DSPARK_CONTEXT_KV_T_DYN")
 ORI_BLOCK_NUM_DYN = pl.dynamic("DSPARK_CONTEXT_KV_ORI_BLOCK_NUM_DYN")
+
+# The public DSpark program supports at most 16 requests with 7 draft rows.
+DSPARK_QUERY_TOKENS = 16 * 7
 
 # model config
 D = M.hidden_size

@@ -6,23 +6,25 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Shared target LM head plus rank-256 sequential DSpark Markov sampling."""
+"""Compose the shared target LM head and rank-256 sequential Markov sampler."""
 
 import pypto.language as pl
 
-from config import (
-    DSPARK_MARKOV_RANK,
-    DSPARK_MAX_BATCH,
-    DSPARK_MOE_TOKENS,
-    DSPARK_QUERY_PAD,
-    DSPARK_QUERY_WIDTH,
-    DSPARK_SUPPORTED_BATCHES,
-    FLASH as M,
-)
+from config import FLASH as M
 from markov_head import markov_head
 
 
 B_DYN = pl.dynamic("DSPARK_MARKOV_B_DYN")
+
+# DSpark Markov program contract.
+DSPARK_MARKOV_RANK = 256
+DSPARK_QUERY_WIDTH = 7
+DSPARK_QUERY_PAD = 8
+DSPARK_SUPPORTED_BATCHES = (4, 8, 12, 16)
+DSPARK_MAX_BATCH = max(DSPARK_SUPPORTED_BATCHES)
+DSPARK_MOE_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_PAD
+
+assert DSPARK_QUERY_WIDTH < DSPARK_QUERY_PAD
 
 # model config
 D = M.hidden_size
