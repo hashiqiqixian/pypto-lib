@@ -6,23 +6,25 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Shared target LM head plus rank-256 sequential DSpark Markov sampling."""
+"""Compose the shared target LM head and rank-256 sequential Markov sampler."""
 
 import pypto.language as pl
 
-from config import (
-    DSPARK_MARKOV_RANK,
-    DSPARK_MAX_BATCH,
-    DSPARK_MOE_TOKENS,
-    DSPARK_QUERY_PAD,
-    DSPARK_QUERY_WIDTH,
-    DSPARK_SUPPORTED_BATCHES,
-    FLASH as M,
-)
+from config import FLASH as M
 from markov_head import markov_head
 
 
 B_DYN = pl.dynamic("DSPARK_MARKOV_B_DYN")
+
+# DSpark Markov program contract.
+DSPARK_MARKOV_RANK = 256
+DSPARK_QUERY_WIDTH = 7
+DSPARK_QUERY_PAD = 8
+DSPARK_SUPPORTED_BATCHES = (4, 8, 12, 16)
+DSPARK_MAX_BATCH = max(DSPARK_SUPPORTED_BATCHES)
+DSPARK_MOE_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_PAD
+
+assert DSPARK_QUERY_WIDTH < DSPARK_QUERY_PAD
 
 # model config
 D = M.hidden_size
@@ -232,19 +234,18 @@ def greedy_markov_step(
 
     markov_bias = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
     markov_embedding = pl.create_tensor([batch, DSPARK_MARKOV_RANK], dtype=pl.BF16)
-    markov_logits_tid = markov_head(
+    markov_bias, markov_embedding = markov_head(
         previous_token_ids,
         markov_w1,
         markov_w2,
         markov_bias,
         markov_embedding,
-        previous_tokens_tid,
     )
 
     with pl.spmd(
         MARKOV_M_TILE,
         name_hint="dspark_markov_greedy",
-        deps=[base_logits_ready_tid, markov_logits_tid],
+        deps=[base_logits_ready_tid, previous_tokens_tid],
     ) as greedy_tid:
         request = pl.tile.get_block_idx()
         if request < batch:

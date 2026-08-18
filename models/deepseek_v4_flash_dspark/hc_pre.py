@@ -153,7 +153,6 @@ def _hc_pre_syncall(
     x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    start_dep: pl.Scalar[pl.TASK_ID],
 ):
     t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
@@ -193,13 +192,7 @@ def _hc_pre_syncall(
     mixx_n = tt_n * MIXX_DS           # mix_x fans over token-tile x D-slice
     pool_d = 2 * tt_n + mixx_n        # phase-D flattened pool: sinkhorn(tt_n)|mix_x(mixx_n)|write_post(tt_n)
 
-    with pl.spmd(
-        NUM_CORES,
-        name_hint="hc_pre_fused",
-        deps=[start_dep],
-        sync_start=True,
-        allow_early_resolve=True,
-    ) as _hc_tid:  # inline form requires the TaskId capture
+    with pl.spmd(NUM_CORES, name_hint="hc_pre_fused", sync_start=True, allow_early_resolve=True) as _hc_tid:  # inline form requires the TaskId capture
         core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
         # Cube linear partials and vector RMS partials run concurrently.
@@ -440,15 +433,13 @@ def _hc_pre_syncall(
 
 @pl.jit.inline
 def _hc_pre_separate(
-    x_flat: pl.Tensor[[T_DYN, HC_DIM], pl.FP32],
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    inv_rms: pl.Tensor[[T_DYN, 1], pl.FP32],
-    start_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Multi-scope (separate-task) hc_pre -- the pre-#684 structure, applied to ALL T.
 
@@ -461,13 +452,15 @@ def _hc_pre_separate(
     buffers are sized to the dynamic t_linear (the 8->16 padded row count), not a static
     T_MAX. Kept as a switchable alternative to the fused kernel (perf is not the goal here).
     """
-    t_dim = pl.tensor.dim(x_flat, 0)
+    t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
+    x_flat = pl.reshape(x, [t_dim, HC_DIM])
     scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
     hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
 
+    inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     # x arrives as FP32 from the prior hc_post (the hc residual stream is FP32 end-to-end),
     # so the old BF16->FP32 cast scope + x_fp32 staging buffer are gone: linear / rms read
     # x_flat directly. The 8->16 pad rows of the cube tile are never materialized -- the
@@ -478,13 +471,7 @@ def _hc_pre_separate(
     mixes_partials = pl.create_tensor([linear_partial_rows, MIX_PAD], dtype=pl.FP32)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
-    with pl.spmd(
-        t_dim // T_TILE,
-        name_hint="hc_pre_rms",
-        deps=[start_dep],
-        allow_early_resolve=True,
-    ) as rms_tid:
-        t = pl.tile.get_block_idx()
+    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
         t0 = t * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
@@ -495,13 +482,7 @@ def _hc_pre_separate(
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
     # Linear split-K partials are reduced in ascending K order.
-    with pl.spmd(
-        (t_linear // LINEAR_T_TILE) * LINEAR_OK,
-        name_hint="hc_pre_linear",
-        deps=[rms_tid],
-        allow_early_resolve=True,
-    ) as linear_tid:
-        task = pl.tile.get_block_idx()
+    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         linear_split = task % LINEAR_OK
         k_base = linear_split * LINEAR_K_PER_SPLIT
@@ -517,13 +498,11 @@ def _hc_pre_separate(
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
         mixes_partials = pl.assemble(mixes_partials, acc, [linear_split * t_linear + t0, 0])
 
-    with pl.spmd(
+    for linear_block in pl.spmd(
         t_linear // LINEAR_T_TILE,
         name_hint="hc_pre_linear_reduce",
-        deps=[linear_tid],
         allow_early_resolve=True,
-    ) as linear_reduce_tid:
-        linear_block = pl.tile.get_block_idx()
+    ):
         linear_t0 = linear_block * LINEAR_T_TILE
         mixes_total = mixes_partials[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD]
         for linear_split in pl.range(1, LINEAR_OK):
@@ -539,13 +518,7 @@ def _hc_pre_separate(
     # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
     # lives in comb_sinkhorn.
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    with pl.spmd(
-        t_dim // T_TILE,
-        name_hint="split_pre_post",
-        deps=[linear_reduce_tid],
-        allow_early_resolve=True,
-    ) as gate_tid:
-        ob = pl.tile.get_block_idx()
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post", allow_early_resolve=True):
         t0 = ob * T_TILE
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
 
@@ -567,13 +540,7 @@ def _hc_pre_separate(
     # 20-iter Sinkhorn (column-first) -> comb. inv_rms is already a [t_linear,1] column buffer,
     # so the [T_TILE,1] inv tile loads directly (no transpose / no spill); the 4 comb groups
     # load pad-capable from mixes_raw at cols 8/12/16/20, then inv_rms * scale2 + group bias.
-    with pl.spmd(
-        t_dim // COMB_T_TILE,
-        name_hint="comb_sinkhorn",
-        deps=[gate_tid],
-        allow_early_resolve=True,
-    ) as sinkhorn_tid:
-        ob = pl.tile.get_block_idx()
+    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn", allow_early_resolve=True):
         t0 = ob * COMB_T_TILE
         inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
         comb_off = HC_MULT * 2
@@ -656,13 +623,7 @@ def _hc_pre_separate(
         pl.store(row3_out, [t0, 3 * HC_MULT], comb)
 
     # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D (D/D_SPMD tasks per tile).
-    with pl.spmd(
-        (t_dim // T_TILE) * (D // D_SPMD),
-        name_hint="mix_x",
-        deps=[sinkhorn_tid],
-        allow_early_resolve=True,
-    ) as _mix_tid:
-        blk = pl.tile.get_block_idx()
+    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
         pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
@@ -686,7 +647,7 @@ def _hc_pre_separate(
 
 
 def _bind_hc_pre():
-    """Define public HC-pre entries for the selected HC_PRE_IMPL.
+    """Define and return the public `hc_pre` inline kernel for the selected HC_PRE_IMPL.
 
     pypto constrains how the choice can be expressed:
       * a kernel-body branch on the module-global string (``if HC_PRE_IMPL == ...``) fails
@@ -708,28 +669,7 @@ def _bind_hc_pre():
             post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
             comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
         ):
-            t_dim = pl.tensor.dim(x, 0)
-            x_flat = pl.reshape(x, [t_dim, HC_DIM])
-            inv_rms = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
-            start_dep = pl.system.task_dummy(deps=[])
-            _hc_pre_separate(x_flat, hc_fn, hc_scale, hc_base, x_mixed, post, comb, inv_rms, start_dep)
-            return x_mixed
-
-        @pl.jit.inline
-        def hc_pre_with_start_dep(
-            x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-            hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-            hc_scale: pl.Tensor[[3], pl.FP32],
-            hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-            x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
-            post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-            comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-            start_dep: pl.Scalar[pl.TASK_ID],
-        ):
-            t_dim = pl.tensor.dim(x, 0)
-            x_flat = pl.reshape(x, [t_dim, HC_DIM])
-            inv_rms = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
-            _hc_pre_separate(x_flat, hc_fn, hc_scale, hc_base, x_mixed, post, comb, inv_rms, start_dep)
+            _hc_pre_separate(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
             return x_mixed
     else:
         @pl.jit.inline
@@ -742,30 +682,14 @@ def _bind_hc_pre():
             post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
             comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
         ):
-            start_dep = pl.system.task_dummy(deps=[])
-            _hc_pre_syncall(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, start_dep)
+            _hc_pre_syncall(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
             return x_mixed
-
-        @pl.jit.inline
-        def hc_pre_with_start_dep(
-            x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-            hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-            hc_scale: pl.Tensor[[3], pl.FP32],
-            hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-            x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
-            post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-            comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-            start_dep: pl.Scalar[pl.TASK_ID],
-        ):
-            _hc_pre_syncall(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, start_dep)
-            return x_mixed
-    return hc_pre, hc_pre_with_start_dep
+    return hc_pre
 
 
-# Public entries. Ordinary callers use `hc_pre`; composed graphs use
-# `hc_pre_with_start_dep` to preserve an external happens-before edge. Both honor
-# DSV4_HC_PRE_IMPL (or the __main__ --impl flag) at import time.
-hc_pre, hc_pre_with_start_dep = _bind_hc_pre()
+# Public entry point. Callers do `from hc_pre import hc_pre`; env DSV4_HC_PRE_IMPL (or the
+# __main__ --impl flag, which rebinds) picks the implementation at import time.
+hc_pre = _bind_hc_pre()
 
 
 @pl.jit
@@ -832,6 +756,7 @@ def golden_hc_pre(tensors):
         x_chunk = x_flat_2d[:, k0:k0 + RMS_K_CHUNK]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + NORM_EPS)
+
     # A2/A3 f32 Cube MAD accumulates four consecutive products before rounding
     # the updated accumulator to FP32.  Reproduce that target-defined reduction
     # instead of using Torch's different reduction tree.
@@ -929,7 +854,7 @@ if __name__ == "__main__":
     # `hc_pre` to the chosen inline kernel BEFORE run_jit traces hc_pre_test (which resolves
     # `hc_pre` from the module namespace at trace time).
     HC_PRE_IMPL = args.impl
-    hc_pre, hc_pre_with_start_dep = _bind_hc_pre()
+    hc_pre = _bind_hc_pre()
     print(f"hc_pre implementation: {HC_PRE_IMPL}")
 
     # hc_pre "syncall" is specialized to Ascend 910B: it sets NUM_CORES=24 == the physical
