@@ -17,9 +17,9 @@ from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREF
 
 # Dynamic shape variables. The q branch, the kv branch and the rope tables each
 # carry their own token axis.
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
-KV_T_DYN = pl.dynamic("KV_T_DYN")
-ROPE_T_DYN = pl.dynamic("ROPE_T_DYN")
+T_DYN = pl.dynamic("QKV_Q_T_DYN")  # T = B * S
+KV_T_DYN = pl.dynamic("QKV_KV_T_DYN")
+ROPE_T_DYN = pl.dynamic("QKV_ROPE_T_DYN")
 
 
 # model config
