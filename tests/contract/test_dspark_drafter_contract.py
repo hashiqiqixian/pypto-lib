@@ -33,6 +33,8 @@ from dspark_drafter import (  # noqa: E402
     DSPARK_QUERY_WIDTH,
     DSPARK_SUPPORTED_BATCHES,
     DSPARK_SWA_INDEX_WIDTH,
+    HC_DIM,
+    MIX_HC,
     N_RANKS,
     ORI_BLOCK_NUM,
     _anchor_position_set,
@@ -398,10 +400,13 @@ def test_backbone_runtime_specs_cover_multirank_public_outputs() -> None:
             4096,
         ]
         assert specs["intermediate_hidden"].is_output
+        assert specs["hc_attn_fn"].shape == [N_RANKS, DSPARK_DRAFT_LAYERS * MIX_HC, HC_DIM]
+        assert specs["wkv"].shape == [N_RANKS, DSPARK_DRAFT_LAYERS * 4096, 512]
         cache = specs["kv_caches"]
         assert cache.shape == [
             N_RANKS,
-            DSPARK_DRAFT_LAYERS * ORI_BLOCK_NUM,
+            DSPARK_DRAFT_LAYERS,
+            ORI_BLOCK_NUM,
             BLOCK_SIZE,
             1,
             512,

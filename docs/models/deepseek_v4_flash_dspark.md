@@ -64,7 +64,13 @@ seven-token block sees the valid historical window and the entire current
 block without an intra-block causal mask. The list width is 192: the 135
 possible visible rows are padded to the 64-row attention tile boundary.
 
-Each draft layer owns a distinct slice of one stacked paged KV-cache argument.
+All layer-local HC, attention, and MoE weights pack their three copies along
+the leading tensor axis. Each explicit layer call selects its range before the
+leaf operators run, so stacking reduces the public ABI without changing the
+sequential model graph.
+
+Each draft layer owns a distinct slice of a paged KV cache with layout
+`[layer, block, block_offset, head, head_dim]`.
 The three MoE calls reuse the same signal windows with monotonically increasing
 epochs 1, 2, and 3. The composed layer data flow supplies the required ordering,
 so no DSpark-specific signal rebasing or cross-rank barrier is needed.
