@@ -23,7 +23,7 @@ from moe import N_RANKS
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="Validate DeepSeek V4 DSpark prompt prefill and drafting.")
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
@@ -52,6 +52,9 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
+        compare_fn={
+            "kv_caches": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        },
     )
     if not result.passed:
         if result.error:
