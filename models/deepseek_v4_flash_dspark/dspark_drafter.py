@@ -21,10 +21,11 @@ from config import (
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
     MOE_TOKENS,
+    PREFILL_SEQ,
     TP,
 )
 from dspark_attention import dspark_attention
-from dspark_context_kv import dspark_context_kv_query
+from dspark_context_kv import dspark_context_kv
 from dspark_proj import dspark_proj
 from hc_head import hc_head
 from hc_post import hc_post_prefill
@@ -45,9 +46,6 @@ from moe import (
     clear_moe_signals,
     moe,
 )
-from qkv_proj_rope import T_DYN as QKV_Q_T_DYN
-
-
 T_MAIN_DYN = pl.dynamic("DSPARK_BACKBONE_T_MAIN_DYN")
 B_DYN = pl.dynamic("DSPARK_BACKBONE_B_DYN")
 PREPARE_T_MAIN_DYN = pl.dynamic("DSPARK_PREPARE_T_MAIN_DYN")
@@ -362,8 +360,8 @@ def dspark_drafter(
     main_norm_weight: pl.Tensor[[D], pl.BF16],
     anchor_token_ids: pl.Tensor[[B_DYN], pl.INT64],
     embedding_weight: pl.Tensor[[VOCAB, D], pl.BF16],
-    context_position_ids: pl.Tensor[[QKV_Q_T_DYN], pl.INT32],
-    context_slot_mapping: pl.Tensor[[DSPARK_DRAFT_LAYERS, QKV_Q_T_DYN], pl.INT64],
+    context_position_ids: pl.Tensor[[T_MAIN_DYN], pl.INT32],
+    context_slot_mapping: pl.Tensor[[DSPARK_DRAFT_LAYERS, T_MAIN_DYN], pl.INT64],
     anchor_positions: pl.Tensor[[B_DYN], pl.INT32],
     block_tables: pl.Tensor[
         [DSPARK_DRAFT_LAYERS, B_DYN, ORI_MAX_BLOCKS],
@@ -426,8 +424,8 @@ def dspark_drafter(
     my_rank: pl.Scalar[pl.INT32],
 ):
     target_hidden.bind_dynamic(0, T_MAIN_DYN)
-    context_position_ids.bind_dynamic(0, QKV_Q_T_DYN)
-    context_slot_mapping.bind_dynamic(1, QKV_Q_T_DYN)
+    context_position_ids.bind_dynamic(0, T_MAIN_DYN)
+    context_slot_mapping.bind_dynamic(1, T_MAIN_DYN)
     anchor_token_ids.bind_dynamic(0, B_DYN)
     anchor_positions.bind_dynamic(0, B_DYN)
     block_tables.bind_dynamic(1, B_DYN)
@@ -458,47 +456,26 @@ def dspark_drafter(
         query_token_ids,
         hidden_0_flat,
     )
-    context_main_x = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
-    context_positions = pl.create_tensor([T_QUERY], dtype=pl.INT32)
-    context_slots_0 = pl.create_tensor([T_QUERY], dtype=pl.INT64)
-    context_slots_1 = pl.create_tensor([T_QUERY], dtype=pl.INT64)
-    context_slots_2 = pl.create_tensor([T_QUERY], dtype=pl.INT64)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_context_pad"):
-        for token in pl.range(T_QUERY):
-            position = pl.cast(0, pl.INT32)
-            if token < batch:
-                position = pl.read(context_position_ids, [token])
-            pl.write(context_positions, [token], position)
-            slot_0 = pl.cast(-1, pl.INT64)
-            slot_1 = pl.cast(-1, pl.INT64)
-            slot_2 = pl.cast(-1, pl.INT64)
-            if token < batch:
-                slot_0 = pl.read(context_slot_mapping, [0, token])
-                slot_1 = pl.read(context_slot_mapping, [1, token])
-                slot_2 = pl.read(context_slot_mapping, [2, token])
-            pl.write(context_slots_0, [token], slot_0)
-            pl.write(context_slots_1, [token], slot_1)
-            pl.write(context_slots_2, [token], slot_2)
-        for token_d in pl.range(T_QUERY * (D // 512)):
-            token = token_d // (D // 512)
-            d0 = (token_d % (D // 512)) * 512
-            value = pl.full([1, 512], dtype=pl.BF16, value=0.0)
-            if token < batch:
-                context_row = (token + 1) * DECODE_SEQ - 1
-                value = main_x[context_row : context_row + 1, d0 : d0 + 512]
-            context_main_x[token : token + 1, d0 : d0 + 512] = value
+    context_slots_0 = pl.create_tensor([target_tokens], dtype=pl.INT64)
+    context_slots_1 = pl.create_tensor([target_tokens], dtype=pl.INT64)
+    context_slots_2 = pl.create_tensor([target_tokens], dtype=pl.INT64)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_context_slots"):
+        for token in pl.range(target_tokens):
+            pl.write(context_slots_0, [token], pl.read(context_slot_mapping, [0, token]))
+            pl.write(context_slots_1, [token], pl.read(context_slot_mapping, [1, token]))
+            pl.write(context_slots_2, [token], pl.read(context_slot_mapping, [2, token]))
 
-    dspark_context_kv_query(
-        context_main_x, wkv_0, gamma_ckv_0, freqs_cos, freqs_sin,
-        context_positions, context_slots_0, kv_cache_0,
+    dspark_context_kv(
+        main_x, wkv_0, gamma_ckv_0, freqs_cos, freqs_sin,
+        context_position_ids, context_slots_0, kv_cache_0,
     )
-    dspark_context_kv_query(
-        context_main_x, wkv_1, gamma_ckv_1, freqs_cos, freqs_sin,
-        context_positions, context_slots_1, kv_cache_1,
+    dspark_context_kv(
+        main_x, wkv_1, gamma_ckv_1, freqs_cos, freqs_sin,
+        context_position_ids, context_slots_1, kv_cache_1,
     )
-    dspark_context_kv_query(
-        context_main_x, wkv_2, gamma_ckv_2, freqs_cos, freqs_sin,
-        context_positions, context_slots_2, kv_cache_2,
+    dspark_context_kv(
+        main_x, wkv_2, gamma_ckv_2, freqs_cos, freqs_sin,
+        context_position_ids, context_slots_2, kv_cache_2,
     )
 
     query_slot_mapping = pl.create_tensor([DSPARK_DRAFT_LAYERS, T_QUERY], dtype=pl.INT64)
@@ -615,8 +592,8 @@ def l3_dspark_drafter(
     main_norm_weight: pl.Tensor[[N_RANKS, D], pl.BF16],
     anchor_token_ids: pl.Tensor[[N_RANKS, B_DYN], pl.INT64],
     embedding_weight: pl.Tensor[[N_RANKS, VOCAB, D], pl.BF16],
-    context_position_ids: pl.Tensor[[N_RANKS, QKV_Q_T_DYN], pl.INT32],
-    context_slot_mapping: pl.Tensor[[N_RANKS, DSPARK_DRAFT_LAYERS, QKV_Q_T_DYN], pl.INT64],
+    context_position_ids: pl.Tensor[[N_RANKS, T_MAIN_DYN], pl.INT32],
+    context_slot_mapping: pl.Tensor[[N_RANKS, DSPARK_DRAFT_LAYERS, T_MAIN_DYN], pl.INT64],
     anchor_positions: pl.Tensor[[N_RANKS, B_DYN], pl.INT32],
     block_tables: pl.Tensor[[N_RANKS, DSPARK_DRAFT_LAYERS, B_DYN, ORI_MAX_BLOCKS], pl.INT32],
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
@@ -663,8 +640,8 @@ def l3_dspark_drafter(
     head_hidden: pl.Out[pl.Tensor[[N_RANKS, B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16]],
 ):
     target_hidden.bind_dynamic(1, T_MAIN_DYN)
-    context_position_ids.bind_dynamic(1, QKV_Q_T_DYN)
-    context_slot_mapping.bind_dynamic(2, QKV_Q_T_DYN)
+    context_position_ids.bind_dynamic(1, T_MAIN_DYN)
+    context_slot_mapping.bind_dynamic(2, T_MAIN_DYN)
     anchor_token_ids.bind_dynamic(1, B_DYN)
     anchor_positions.bind_dynamic(1, B_DYN)
     block_tables.bind_dynamic(2, B_DYN)
@@ -745,16 +722,17 @@ def _block_tables(batch):
     return tables
 
 
-def _context_slots(tables, positions):
+def _context_slots(tables, positions, tokens_per_request):
     import torch
 
     slots = torch.empty(N_RANKS, DSPARK_DRAFT_LAYERS, positions.shape[1], dtype=torch.int64)
     for rank in range(N_RANKS):
         for layer in range(DSPARK_DRAFT_LAYERS):
-            for request in range(positions.shape[1]):
-                position = int(positions[rank, request])
+            for token in range(positions.shape[1]):
+                request = token // tokens_per_request
+                position = int(positions[rank, token])
                 physical_block = int(tables[rank, layer, request, position // BLOCK_SIZE])
-                slots[rank, layer, request] = physical_block * BLOCK_SIZE + position % BLOCK_SIZE
+                slots[rank, layer, token] = physical_block * BLOCK_SIZE + position % BLOCK_SIZE
     return slots
 
 
@@ -767,24 +745,26 @@ def _balanced_routes():
     return routes.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
 
-def build_tensor_specs(batch):
+def build_tensor_specs(batch, *, mode="decode"):
     import torch
     from golden import TensorSpec
 
     if batch not in DSPARK_SUPPORTED_BATCHES:
         raise ValueError(f"unsupported DSpark batch {batch}; expected one of {DSPARK_SUPPORTED_BATCHES}")
+    if mode not in ("decode", "prefill"):
+        raise ValueError(f"unsupported DSpark mode {mode!r}; expected 'decode' or 'prefill'")
 
-    positions = _anchor_position_set(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
+    target_seq = 1 if mode == "decode" else PREFILL_SEQ
+    context_seq = 1 if mode == "decode" else PREFILL_SEQ
+    if mode == "decode":
+        positions = _anchor_position_set(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        context_positions = positions
+    else:
+        position_row = torch.arange(PREFILL_SEQ, dtype=torch.int32)
+        context_positions = position_row.repeat(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        positions = torch.full((N_RANKS, batch), PREFILL_SEQ - 1, dtype=torch.int32)
     tables = _block_tables(batch)
-    context_slots = _context_slots(tables, positions)
-    context_positions_padded = torch.zeros(N_RANKS, DSPARK_QUERY_TOKENS, dtype=torch.int32)
-    context_positions_padded[:, :batch] = positions
-    context_slots_padded = torch.full(
-        (N_RANKS, DSPARK_DRAFT_LAYERS, DSPARK_QUERY_TOKENS),
-        -1,
-        dtype=torch.int64,
-    )
-    context_slots_padded[:, :, :batch] = context_slots
+    context_slots = _context_slots(tables, context_positions, context_seq)
     anchors = torch.arange(batch, dtype=torch.int64).unsqueeze(0).expand(N_RANKS, -1).contiguous()
     anchors = (anchors + 1) % VOCAB
     routes = _balanced_routes().unsqueeze(1)
@@ -792,13 +772,13 @@ def build_tensor_specs(batch):
     routes = routes.reshape(N_RANKS, DSPARK_DRAFT_LAYERS * VOCAB, TOPK).contiguous()
 
     def init_target_hidden():
-        values = torch.zeros(N_RANKS, batch * DECODE_SEQ, MAIN_IN, dtype=torch.bfloat16)
+        values = torch.zeros(N_RANKS, batch * target_seq, MAIN_IN, dtype=torch.bfloat16)
         columns = torch.arange(D, dtype=torch.float32)
         base = ((columns % 31) - 15) * 0.002
         for rank in range(N_RANKS):
             for request in range(batch):
-                for offset in range(DECODE_SEQ):
-                    row = request * DECODE_SEQ + offset
+                for offset in range(target_seq):
+                    row = request * target_seq + offset
                     values[rank, row, :D] = (
                         base + 0.01 * (rank + request + 1) + 0.001 * offset
                     ).to(torch.bfloat16)
@@ -850,7 +830,7 @@ def build_tensor_specs(batch):
         return cache
 
     specs = [
-        ranked("target_hidden", [batch * DECODE_SEQ, MAIN_IN], torch.bfloat16, init_value=init_target_hidden),
+        ranked("target_hidden", [batch * target_seq, MAIN_IN], torch.bfloat16, init_value=init_target_hidden),
         TensorSpec(
             "initial_hidden",
             [N_RANKS, DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, HC_MULT, D],
@@ -869,15 +849,15 @@ def build_tensor_specs(batch):
         ranked("embedding_weight", [VOCAB, D], torch.bfloat16, init_value=init_embedding_weight, resident=True),
         ranked(
             "context_position_ids",
-            [DSPARK_QUERY_TOKENS],
+            [batch * context_seq],
             torch.int32,
-            init_value=lambda: context_positions_padded,
+            init_value=lambda: context_positions,
         ),
         ranked(
             "context_slot_mapping",
-            [DSPARK_DRAFT_LAYERS, DSPARK_QUERY_TOKENS],
+            [DSPARK_DRAFT_LAYERS, batch * context_seq],
             torch.int64,
-            init_value=lambda: context_slots_padded,
+            init_value=lambda: context_slots,
         ),
         ranked("anchor_positions", [batch], torch.int32, init_value=lambda: positions),
         ranked("block_tables", [DSPARK_DRAFT_LAYERS, batch, ORI_MAX_BLOCKS], torch.int32, init_value=lambda: tables),
@@ -1013,8 +993,7 @@ def golden_dspark_drafter(tensors):
             cache = tensors["kv_caches"][rank, layer].view(-1, HEAD_DIM)
             layer_context_slots = context_slots[rank, layer]
             valid_context_slots = layer_context_slots[layer_context_slots >= 0].long()
-            context_x = main_x[DECODE_SEQ - 1 :: DECODE_SEQ]
-            cache[valid_context_slots] = project_kv(context_x[: valid_context_slots.numel()])
+            cache[valid_context_slots] = project_kv(main_x[: valid_context_slots.numel()])
             query_slots = []
             for request in range(positions.shape[1]):
                 anchor = int(positions[rank, request])
