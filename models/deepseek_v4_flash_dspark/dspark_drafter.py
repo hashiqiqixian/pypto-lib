@@ -722,14 +722,21 @@ def _block_tables(batch):
     return tables
 
 
-def _context_slots(tables, positions, tokens_per_request):
+def _context_slots(tables, positions, tokens_per_request, valid_counts=None):
     import torch
 
-    slots = torch.empty(N_RANKS, DSPARK_DRAFT_LAYERS, positions.shape[1], dtype=torch.int64)
+    slots = torch.full(
+        (N_RANKS, DSPARK_DRAFT_LAYERS, positions.shape[1]),
+        -1,
+        dtype=torch.int64,
+    )
     for rank in range(N_RANKS):
         for layer in range(DSPARK_DRAFT_LAYERS):
             for token in range(positions.shape[1]):
                 request = token // tokens_per_request
+                request_offset = token % tokens_per_request
+                if valid_counts is not None and request_offset >= int(valid_counts[request]):
+                    continue
                 position = int(positions[rank, token])
                 physical_block = int(tables[rank, layer, request, position // BLOCK_SIZE])
                 slots[rank, layer, token] = physical_block * BLOCK_SIZE + position % BLOCK_SIZE
@@ -754,17 +761,29 @@ def build_tensor_specs(batch, *, mode="decode"):
     if mode not in ("decode", "prefill"):
         raise ValueError(f"unsupported DSpark mode {mode!r}; expected 'decode' or 'prefill'")
 
-    target_seq = 1 if mode == "decode" else PREFILL_SEQ
-    context_seq = 1 if mode == "decode" else PREFILL_SEQ
     if mode == "decode":
+        target_seq = DECODE_SEQ
+        context_seq = DECODE_SEQ
         positions = _anchor_position_set(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
-        context_positions = positions
+        valid_pattern = torch.tensor([1, 4, 7, 2, 5, 8, 3, 6], dtype=torch.int32)
+        valid_counts = valid_pattern.repeat((batch + valid_pattern.numel() - 1) // valid_pattern.numel())[:batch]
+        context_positions = torch.zeros(N_RANKS, batch * context_seq, dtype=torch.int32)
+        for request in range(batch):
+            valid_count = int(valid_counts[request])
+            context_start = int(positions[0, request]) - valid_count + 1
+            context_positions[
+                :,
+                request * context_seq : request * context_seq + valid_count,
+            ] = torch.arange(context_start, context_start + valid_count, dtype=torch.int32)
     else:
+        target_seq = PREFILL_SEQ
+        context_seq = PREFILL_SEQ
+        valid_counts = None
         position_row = torch.arange(PREFILL_SEQ, dtype=torch.int32)
         context_positions = position_row.repeat(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
         positions = torch.full((N_RANKS, batch), PREFILL_SEQ - 1, dtype=torch.int32)
     tables = _block_tables(batch)
-    context_slots = _context_slots(tables, context_positions, context_seq)
+    context_slots = _context_slots(tables, context_positions, context_seq, valid_counts)
     anchors = torch.arange(batch, dtype=torch.int64).unsqueeze(0).expand(N_RANKS, -1).contiguous()
     anchors = (anchors + 1) % VOCAB
     routes = _balanced_routes().unsqueeze(1)
@@ -992,8 +1011,9 @@ def golden_dspark_drafter(tensors):
         for layer in range(DSPARK_DRAFT_LAYERS):
             cache = tensors["kv_caches"][rank, layer].view(-1, HEAD_DIM)
             layer_context_slots = context_slots[rank, layer]
-            valid_context_slots = layer_context_slots[layer_context_slots >= 0].long()
-            cache[valid_context_slots] = project_kv(main_x[: valid_context_slots.numel()])
+            valid_context = layer_context_slots >= 0
+            valid_context_slots = layer_context_slots[valid_context].long()
+            cache[valid_context_slots] = project_kv(main_x[valid_context])
             query_slots = []
             for request in range(positions.shape[1]):
                 anchor = int(positions[rank, request])
