@@ -69,6 +69,11 @@ assert DSPARK_MAX_BATCH == DECODE_BATCH // TP
 assert DSPARK_MOE_TOKENS == MOE_TOKENS
 assert DSPARK_NOISE_TOKEN_ID < M.vocab_size
 assert DSPARK_SWA_INDEX_WIDTH >= M.sliding_window + DSPARK_QUERY_WIDTH
+assert KV_ORI_BLOCK_NUM % DSPARK_MAX_BATCH == 0
+assert PREFILL_SEQ + DSPARK_QUERY_WIDTH <= (
+    KV_ORI_BLOCK_NUM // DSPARK_MAX_BATCH * BLOCK_SIZE
+)
+assert PREFILL_SEQ + DSPARK_QUERY_WIDTH <= KV_ORI_MAX_BLOCKS * BLOCK_SIZE
 
 # model config
 T = DSPARK_MOE_TOKENS
@@ -101,7 +106,9 @@ def prepare_dspark_inputs(
     target_hidden: pl.Tensor[[PREPARE_T_MAIN_DYN, MAIN_IN], pl.BF16],
     main_proj_weight: pl.Tensor[[D, MAIN_IN], pl.BF16],
     main_norm_weight: pl.Tensor[[D], pl.BF16],
-    anchor_token_ids: pl.Tensor[[PREPARE_B_DYN], pl.INT64],
+    num_sampled: pl.Tensor[[PREPARE_B_DYN], pl.INT32],
+    last_sampled: pl.Tensor[[PREPARE_B_DYN], pl.INT64],
+    next_prefill_tokens: pl.Tensor[[PREPARE_B_DYN], pl.INT64],
     embedding_weight: pl.Tensor[[VOCAB, D], pl.BF16],
     main_x: pl.Tensor[[PREPARE_T_MAIN_DYN, D], pl.BF16],
     query_token_ids: pl.Tensor[[DSPARK_MOE_TOKENS], pl.INT64],
@@ -109,7 +116,7 @@ def prepare_dspark_inputs(
 ):
     dspark_proj(target_hidden, main_proj_weight, main_norm_weight, main_x)
 
-    batch = pl.tensor.dim(anchor_token_ids, 0)
+    batch = pl.tensor.dim(num_sampled, 0)
     active_tokens = batch * DSPARK_QUERY_WIDTH
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_query_ids"):
         for token in pl.range(DSPARK_MOE_TOKENS):
@@ -119,7 +126,9 @@ def prepare_dspark_inputs(
                 query_offset = token % DSPARK_QUERY_WIDTH
                 token_id = pl.cast(DSPARK_NOISE_TOKEN_ID, pl.INT64)
                 if query_offset == 0:
-                    token_id = pl.read(anchor_token_ids, [request])
+                    token_id = pl.read(next_prefill_tokens, [request])
+                    if pl.read(num_sampled, [request]) > 0:
+                        token_id = pl.read(last_sampled, [request])
             pl.write(query_token_ids, [token], token_id)
 
     lookup_hidden = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
@@ -358,7 +367,9 @@ def dspark_drafter(
     target_hidden: pl.Tensor[[T_MAIN_DYN, MAIN_IN], pl.BF16],
     main_proj_weight: pl.Tensor[[D, MAIN_IN], pl.BF16],
     main_norm_weight: pl.Tensor[[D], pl.BF16],
-    anchor_token_ids: pl.Tensor[[B_DYN], pl.INT64],
+    num_sampled: pl.Tensor[[B_DYN], pl.INT32],
+    last_sampled: pl.Tensor[[B_DYN], pl.INT64],
+    next_prefill_tokens: pl.Tensor[[B_DYN], pl.INT64],
     embedding_weight: pl.Tensor[[VOCAB, D], pl.BF16],
     context_position_ids: pl.Tensor[[T_MAIN_DYN], pl.INT32],
     context_slot_mapping: pl.Tensor[[DSPARK_DRAFT_LAYERS, T_MAIN_DYN], pl.INT64],
@@ -426,11 +437,13 @@ def dspark_drafter(
     target_hidden.bind_dynamic(0, T_MAIN_DYN)
     context_position_ids.bind_dynamic(0, T_MAIN_DYN)
     context_slot_mapping.bind_dynamic(1, T_MAIN_DYN)
-    anchor_token_ids.bind_dynamic(0, B_DYN)
+    num_sampled.bind_dynamic(0, B_DYN)
+    last_sampled.bind_dynamic(0, B_DYN)
+    next_prefill_tokens.bind_dynamic(0, B_DYN)
     anchor_positions.bind_dynamic(0, B_DYN)
     block_tables.bind_dynamic(1, B_DYN)
     head_hidden.bind_dynamic(0, B_DYN)
-    batch = pl.tensor.dim(anchor_token_ids, 0)
+    batch = pl.tensor.dim(num_sampled, 0)
     target_tokens = pl.tensor.dim(target_hidden, 0)
     active_tokens = batch * DSPARK_QUERY_WIDTH
 
@@ -450,7 +463,9 @@ def dspark_drafter(
         target_hidden,
         main_proj_weight,
         main_norm_weight,
-        anchor_token_ids,
+        num_sampled,
+        last_sampled,
+        next_prefill_tokens,
         embedding_weight,
         main_x,
         query_token_ids,
@@ -590,7 +605,9 @@ def l3_dspark_drafter(
     ],
     main_proj_weight: pl.Tensor[[N_RANKS, D, MAIN_IN], pl.BF16],
     main_norm_weight: pl.Tensor[[N_RANKS, D], pl.BF16],
-    anchor_token_ids: pl.Tensor[[N_RANKS, B_DYN], pl.INT64],
+    num_sampled: pl.Tensor[[N_RANKS, B_DYN], pl.INT32],
+    last_sampled: pl.Tensor[[N_RANKS, B_DYN], pl.INT64],
+    next_prefill_tokens: pl.Tensor[[N_RANKS, B_DYN], pl.INT64],
     embedding_weight: pl.Tensor[[N_RANKS, VOCAB, D], pl.BF16],
     context_position_ids: pl.Tensor[[N_RANKS, T_MAIN_DYN], pl.INT32],
     context_slot_mapping: pl.Tensor[[N_RANKS, DSPARK_DRAFT_LAYERS, T_MAIN_DYN], pl.INT64],
@@ -642,7 +659,9 @@ def l3_dspark_drafter(
     target_hidden.bind_dynamic(1, T_MAIN_DYN)
     context_position_ids.bind_dynamic(1, T_MAIN_DYN)
     context_slot_mapping.bind_dynamic(2, T_MAIN_DYN)
-    anchor_token_ids.bind_dynamic(1, B_DYN)
+    num_sampled.bind_dynamic(1, B_DYN)
+    last_sampled.bind_dynamic(1, B_DYN)
+    next_prefill_tokens.bind_dynamic(1, B_DYN)
     anchor_positions.bind_dynamic(1, B_DYN)
     block_tables.bind_dynamic(2, B_DYN)
     head_hidden.bind_dynamic(1, B_DYN)
@@ -667,7 +686,8 @@ def l3_dspark_drafter(
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         dspark_drafter(
             target_hidden[rank], main_proj_weight[rank], main_norm_weight[rank],
-            anchor_token_ids[rank], embedding_weight[rank],
+            num_sampled[rank], last_sampled[rank], next_prefill_tokens[rank],
+            embedding_weight[rank],
             context_position_ids[rank], context_slot_mapping[rank], anchor_positions[rank], block_tables[rank],
             freqs_cos[rank], freqs_sin[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_w[rank],
@@ -782,10 +802,27 @@ def build_tensor_specs(batch, *, mode="decode"):
         position_row = torch.arange(PREFILL_SEQ, dtype=torch.int32)
         context_positions = position_row.repeat(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
         positions = torch.full((N_RANKS, batch), PREFILL_SEQ - 1, dtype=torch.int32)
+    if int(context_positions.min()) < 0 or int(context_positions.max()) >= ORI_MAX_BLOCKS * BLOCK_SIZE:
+        raise ValueError("DSpark context positions exceed the logical KV block table")
+    if int((positions + DSPARK_QUERY_WIDTH).max()) >= ORI_MAX_BLOCKS * BLOCK_SIZE:
+        raise ValueError("DSpark query positions exceed the logical KV block table")
     tables = _block_tables(batch)
+    if int(tables.min()) < 0 or int(tables.max()) >= ORI_BLOCK_NUM:
+        raise ValueError("DSpark block table references a physical KV block outside the cache")
     context_slots = _context_slots(tables, context_positions, context_seq, valid_counts)
-    anchors = torch.arange(batch, dtype=torch.int64).unsqueeze(0).expand(N_RANKS, -1).contiguous()
-    anchors = (anchors + 1) % VOCAB
+    last_sampled = torch.arange(1, batch + 1, dtype=torch.int64)
+    last_sampled = last_sampled.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+    next_prefill_tokens = torch.arange(
+        DSPARK_MAX_BATCH + 1,
+        DSPARK_MAX_BATCH + batch + 1,
+        dtype=torch.int64,
+    )
+    next_prefill_tokens = next_prefill_tokens.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+    num_sampled = torch.full(
+        (N_RANKS, batch),
+        1 if mode == "decode" else 0,
+        dtype=torch.int32,
+    )
     routes = _balanced_routes().unsqueeze(1)
     routes = routes.expand(-1, DSPARK_DRAFT_LAYERS, -1, -1)
     routes = routes.reshape(N_RANKS, DSPARK_DRAFT_LAYERS * VOCAB, TOPK).contiguous()
@@ -816,8 +853,11 @@ def build_tensor_specs(batch, *, mode="decode"):
         for rank in range(N_RANKS):
             weight[rank, 0] = (base + 0.005 * rank).to(torch.bfloat16)
             weight[rank, DSPARK_NOISE_TOKEN_ID] = (base + 0.03 + 0.005 * rank).to(torch.bfloat16)
-            for token in range(1, batch + 1):
-                weight[rank, token] = (base + 0.01 * token + 0.005 * rank).to(torch.bfloat16)
+            for request in range(batch):
+                last_token = int(last_sampled[rank, request])
+                next_token = int(next_prefill_tokens[rank, request])
+                weight[rank, last_token] = (base + 0.01 * (request + 1) + 0.005 * rank).to(torch.bfloat16)
+                weight[rank, next_token] = (base + 0.02 * (request + 1) + 0.005 * rank).to(torch.bfloat16)
         return weight
 
     def init_wkv():
@@ -864,7 +904,14 @@ def build_tensor_specs(batch, *, mode="decode"):
         ),
         ranked("main_proj_weight", [D, MAIN_IN], torch.bfloat16, init_value=init_main_proj_weight, resident=True),
         ranked("main_norm_weight", [D], torch.bfloat16, init_value=1, resident=True),
-        ranked("anchor_token_ids", [batch], torch.int64, init_value=lambda: anchors),
+        ranked("num_sampled", [batch], torch.int32, init_value=lambda: num_sampled),
+        ranked("last_sampled", [batch], torch.int64, init_value=lambda: last_sampled),
+        ranked(
+            "next_prefill_tokens",
+            [batch],
+            torch.int64,
+            init_value=lambda: next_prefill_tokens,
+        ),
         ranked("embedding_weight", [VOCAB, D], torch.bfloat16, init_value=init_embedding_weight, resident=True),
         ranked(
             "context_position_ids",
@@ -997,12 +1044,17 @@ def golden_dspark_drafter(tensors):
     positions = tensors["anchor_positions"]
     tables = tensors["block_tables"]
     context_slots = tensors["context_slot_mapping"]
+    selected_anchor_ids = torch.where(
+        tensors["num_sampled"] > 0,
+        tensors["last_sampled"],
+        tensors["next_prefill_tokens"],
+    )
     for rank in range(N_RANKS):
         main_x = rms_norm(tensors["target_hidden"][rank, :, :D])
         query_ids = torch.zeros(DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, dtype=torch.int64)
         for request in range(positions.shape[1]):
             row = request * DSPARK_QUERY_WIDTH
-            query_ids[row] = tensors["anchor_token_ids"][rank, request]
+            query_ids[row] = selected_anchor_ids[rank, request]
             query_ids[row + 1 : row + DSPARK_QUERY_WIDTH] = DSPARK_NOISE_TOKEN_ID
         query_hidden = tensors["embedding_weight"][rank].index_select(0, query_ids)
         hidden = query_hidden.float().unsqueeze(1).expand(-1, HC_MULT, -1).contiguous()
