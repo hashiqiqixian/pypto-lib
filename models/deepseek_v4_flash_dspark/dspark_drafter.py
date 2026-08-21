@@ -21,6 +21,7 @@ from config import (
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
     MOE_TOKENS,
+    PREFILL_SEQ,
     TP,
 )
 from dspark_attention import dspark_attention
@@ -751,26 +752,36 @@ def _balanced_routes():
     return routes.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
 
-def build_tensor_specs(batch):
+def build_tensor_specs(batch, *, mode="decode"):
     import torch
     from golden import TensorSpec
 
     if batch not in DSPARK_SUPPORTED_BATCHES:
         raise ValueError(f"unsupported DSpark batch {batch}; expected one of {DSPARK_SUPPORTED_BATCHES}")
+    if mode not in ("decode", "prefill"):
+        raise ValueError(f"unsupported DSpark mode {mode!r}; expected 'decode' or 'prefill'")
 
-    target_seq = DECODE_SEQ
-    context_seq = DECODE_SEQ
-    positions = _anchor_position_set(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
-    valid_pattern = torch.tensor([1, 4, 7, 2, 5, 8, 3, 6], dtype=torch.int32)
-    valid_counts = valid_pattern.repeat((batch + valid_pattern.numel() - 1) // valid_pattern.numel())[:batch]
-    context_positions = torch.zeros(N_RANKS, batch * context_seq, dtype=torch.int32)
-    for request in range(batch):
-        valid_count = int(valid_counts[request])
-        context_start = int(positions[0, request]) - valid_count + 1
-        context_positions[
-            :,
-            request * context_seq : request * context_seq + valid_count,
-        ] = torch.arange(context_start, context_start + valid_count, dtype=torch.int32)
+    if mode == "decode":
+        target_seq = DECODE_SEQ
+        context_seq = DECODE_SEQ
+        positions = _anchor_position_set(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        valid_pattern = torch.tensor([1, 4, 7, 2, 5, 8, 3, 6], dtype=torch.int32)
+        valid_counts = valid_pattern.repeat((batch + valid_pattern.numel() - 1) // valid_pattern.numel())[:batch]
+        context_positions = torch.zeros(N_RANKS, batch * context_seq, dtype=torch.int32)
+        for request in range(batch):
+            valid_count = int(valid_counts[request])
+            context_start = int(positions[0, request]) - valid_count + 1
+            context_positions[
+                :,
+                request * context_seq : request * context_seq + valid_count,
+            ] = torch.arange(context_start, context_start + valid_count, dtype=torch.int32)
+    else:
+        target_seq = PREFILL_SEQ
+        context_seq = PREFILL_SEQ
+        valid_counts = None
+        position_row = torch.arange(PREFILL_SEQ, dtype=torch.int32)
+        context_positions = position_row.repeat(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        positions = torch.full((N_RANKS, batch), PREFILL_SEQ - 1, dtype=torch.int32)
     tables = _block_tables(batch)
     context_slots = _context_slots(tables, context_positions, context_seq, valid_counts)
     anchors = torch.arange(batch, dtype=torch.int64).unsqueeze(0).expand(N_RANKS, -1).contiguous()
