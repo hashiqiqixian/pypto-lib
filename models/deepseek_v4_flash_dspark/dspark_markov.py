@@ -287,77 +287,70 @@ def greedy_markov_step(
 
     confidence_blocks = (batch + CONFIDENCE_PAD - 1) // CONFIDENCE_PAD
     with pl.spmd(
-        confidence_blocks,
+        1,
         name_hint="dspark_confidence_head",
         deps=[markov_embedding_tid],
     ) as confidence_tid:
-        confidence_block = pl.tile.get_block_idx()
-        request_base = confidence_block * CONFIDENCE_PAD
-        valid_rows = pl.min(CONFIDENCE_PAD, batch - request_base)
-        confidence_logit = pl.full(
-            [1, CONFIDENCE_PAD],
-            dtype=pl.FP32,
-            value=0.0,
-        )
-        for hidden_block in pl.range(D // HIDDEN_TILE):
-            hidden_offset = hidden_block * HIDDEN_TILE
-            hidden_bf16 = pl.reshape(
-                pl.slice(
-                    head_hidden,
-                    [CONFIDENCE_PAD, 1, HIDDEN_TILE],
-                    [request_base, step, hidden_offset],
-                    valid_shape=[valid_rows, 1, HIDDEN_TILE],
-                ),
-                [CONFIDENCE_PAD, HIDDEN_TILE],
+        for confidence_block in pl.range(confidence_blocks):
+            request_base = confidence_block * CONFIDENCE_PAD
+            valid_rows = pl.min(CONFIDENCE_PAD, batch - request_base)
+            confidence_logit = pl.full(
+                [1, CONFIDENCE_PAD],
+                dtype=pl.FP32,
+                value=0.0,
             )
-            hidden_fp32 = pl.cast(hidden_bf16, target_type=pl.FP32)
-            hidden_weight = confidence_head_weight[
+            for hidden_block in pl.range(D // HIDDEN_TILE):
+                hidden_offset = hidden_block * HIDDEN_TILE
+                hidden_bf16 = pl.reshape(
+                    pl.slice(
+                        head_hidden,
+                        [CONFIDENCE_PAD, 1, HIDDEN_TILE],
+                        [request_base, step, hidden_offset],
+                        valid_shape=[valid_rows, 1, HIDDEN_TILE],
+                    ),
+                    [CONFIDENCE_PAD, HIDDEN_TILE],
+                )
+                hidden_fp32 = pl.cast(hidden_bf16, target_type=pl.FP32)
+                hidden_weight = confidence_head_weight[
+                    0:1,
+                    hidden_offset : hidden_offset + HIDDEN_TILE,
+                ]
+                confidence_logit = pl.add(
+                    confidence_logit,
+                    pl.reshape(
+                        pl.row_sum(
+                            pl.col_expand_mul(hidden_fp32, hidden_weight)
+                        ),
+                        [1, CONFIDENCE_PAD],
+                    ),
+                )
+            markov_bf16 = pl.slice(
+                markov_embedding,
+                [CONFIDENCE_PAD, DSPARK_MARKOV_RANK],
+                [request_base, 0],
+                valid_shape=[valid_rows, DSPARK_MARKOV_RANK],
+            )
+            markov_fp32 = pl.cast(markov_bf16, target_type=pl.FP32)
+            markov_weight = confidence_head_weight[
                 0:1,
-                hidden_offset : hidden_offset + HIDDEN_TILE,
+                D : D + DSPARK_MARKOV_RANK,
             ]
             confidence_logit = pl.add(
                 confidence_logit,
                 pl.reshape(
-                    pl.row_sum(
-                        pl.col_expand_mul(hidden_fp32, hidden_weight)
-                    ),
+                    pl.row_sum(pl.col_expand_mul(markov_fp32, markov_weight)),
                     [1, CONFIDENCE_PAD],
                 ),
             )
-        markov_bf16 = pl.slice(
-            markov_embedding,
-            [CONFIDENCE_PAD, DSPARK_MARKOV_RANK],
-            [request_base, 0],
-            valid_shape=[valid_rows, DSPARK_MARKOV_RANK],
-        )
-        markov_fp32 = pl.cast(markov_bf16, target_type=pl.FP32)
-        markov_weight = confidence_head_weight[
-            0:1,
-            D : D + DSPARK_MARKOV_RANK,
-        ]
-        confidence_logit = pl.add(
-            confidence_logit,
-            pl.reshape(
-                pl.row_sum(pl.col_expand_mul(markov_fp32, markov_weight)),
-                [1, CONFIDENCE_PAD],
-            ),
-        )
-        confidence_prob = pl.recip(
-            pl.add(pl.exp(pl.neg(confidence_logit)), 1.0)
-        )
-        confidence_column = pl.reshape(
-            confidence_prob,
-            [CONFIDENCE_PAD, 1],
-        )
-        confidence_column = pl.set_validshape(
-            confidence_column,
-            valid_rows,
-            1,
-        )
-        confidence_probs[
-            request_base : request_base + CONFIDENCE_PAD,
-            step : step + 1,
-        ] = confidence_column
+            confidence_prob = pl.recip(
+                pl.add(pl.exp(pl.neg(confidence_logit)), 1.0)
+            )
+            for request_offset in pl.range(valid_rows):
+                pl.write(
+                    confidence_probs,
+                    [request_base + request_offset, step],
+                    pl.read(confidence_prob, [0, request_offset]),
+                )
 
     with pl.spmd(
         MARKOV_M_TILE,
