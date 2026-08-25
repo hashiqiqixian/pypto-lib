@@ -71,9 +71,38 @@ def prefill_kv_token_allgather_step(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
 ):
-    """Temporarily expose each rank's local input without communication."""
+    """Gather every rank's token rows into rank-major order on every rank."""
     local_rows = pl.tensor.dim(hidden_local, 0)
-    group_out[0:local_rows, 0:D] = hidden_local[0:local_rows, 0:D]
+    local_t = pl.cast(local_rows, pl.INT32)
+    target_row = tp_rank * local_t
+    for peer_tp in pl.range(TP_SIZE):
+        pld.tensor.put(
+            dst=gather_window,
+            peer=group_base + peer_tp,
+            src=hidden_local,
+            dst_offsets=[target_row, 0],
+            src_offsets=[0, 0],
+            shape=[local_t, D],
+            chunk_rows=COMM_ROW_TILE,
+            chunk_cols=D,
+        )
+
+    expected_one = pl.cast(1, pl.INT32)
+    gather_signal = tp_group_barrier(gather_signal, group_base, tp_rank, expected_one)
+
+    # Whole tiles take the wide path; the ragged remainder falls back to rows.
+    group_rows = TP_SIZE * local_rows
+    full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
+    for tile_row in pl.range(0, full_rows, READBACK_ROW_TILE):
+        group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = gather_window[
+            tile_row : tile_row + READBACK_ROW_TILE, 0:D
+        ]
+    for tail_row in pl.range(full_rows, group_rows):
+        group_out[tail_row : tail_row + 1, 0:D] = gather_window[tail_row : tail_row + 1, 0:D]
+
+    expected_two = pl.cast(2, pl.INT32)
+    gather_signal = tp_group_barrier(gather_signal, group_base, tp_rank, expected_two)
+    gather_signal = reset_tp_group_signal(gather_signal, group_base, tp_rank)
     return group_out, gather_signal
 
 
@@ -164,11 +193,11 @@ def build_tensor_specs(local_t=FIXTURE_LOCAL_T):
 
 
 def golden_prefill_kv_allgather(tensors):
-    """Temporarily expect each rank to receive only its own input slice."""
+    """Every rank ends up holding the same rank-major concatenation."""
     hidden_local = tensors["hidden_local"]
-    _, local_t, _ = hidden_local.shape
-    tensors["group_out"].zero_()
-    tensors["group_out"][:, :local_t] = hidden_local
+    tp_size, local_t, _ = hidden_local.shape
+    gathered = hidden_local.reshape(tp_size * local_t, D)
+    tensors["group_out"][:] = gathered.unsqueeze(0)
 
 
 if __name__ == "__main__":
