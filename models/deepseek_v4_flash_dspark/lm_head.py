@@ -75,6 +75,9 @@ N_LOGITS_COMM_TILES = VOCAB_PER_TP // LOGITS_COMM_TILE
 LOGITS_COMM_BLOCKS = min(FUSED_LM_HEAD_CORES, N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0))
 LOGITS_OWNER_ROW_BLOCKS = MAX_LOGIT_ROWS // LOGITS_GATHER_ROW_TILE
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
+LOGITS_FLAT_PUT_TILE = 16384
+LOGITS_FLAT_PUT_TILES = VOCAB_PER_TP // LOGITS_FLAT_PUT_TILE
+LOGITS_FLAT_PUT_TAIL = VOCAB_PER_TP % LOGITS_FLAT_PUT_TILE
 GREEDY_GRID_ROWS = VOCAB // GREEDY_ROW_WIDTH
 GREEDY_BLOCK_SPAN = GREEDY_BLOCK_ROWS * GREEDY_ROW_WIDTH
 # 2^30: above every vocab id, clear of int32 overflow once a block base is added.
@@ -101,7 +104,7 @@ def lm_head(
     logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS * VOCAB], pl.FP32],
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
@@ -242,8 +245,9 @@ def lm_head(
                         mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL,
                     ] = tail_acc
 
-    # Publish each owner's rows from this rank's vocabulary shard. This is the
-    # pre-fusion path used before direct C-to-V remote stores were introduced.
+    # PTOAS 0.57 mis-parenthesizes multi-dimensional dynamic subview offsets.
+    # Flatten the communication views so each generated address has one offset.
+    logits_shards_flat = pl.reshape(logits_shards, [GROUP_LOGIT_ROWS * VOCAB_PER_TP])
     with pl.spmd(
         LOGITS_OWNER_ROW_BLOCKS,
         name_hint="lm_head_combine_push",
@@ -254,27 +258,31 @@ def lm_head(
         vocab_base = tp_rank * VOCAB_PER_TP
         for owner_tp in pl.range(TP_SIZE):
             source_row_base = owner_tp * MAX_LOGIT_ROWS
-            for output_block in pl.range(N_LOGITS_COMM_TILES):
-                output_offset = output_block * LOGITS_COMM_TILE
-                pld.tensor.put(
-                    dst=logits_window,
-                    peer=group_base + owner_tp,
-                    src=logits_shards,
-                    dst_offsets=[row_offset, vocab_base + output_offset],
-                    src_offsets=[source_row_base + row_offset, output_offset],
-                    shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TILE],
-                )
+            for row_lane in pl.unroll(8):
+                row = row_offset + row_lane
+                dst_row_base = row * VOCAB + vocab_base
+                src_row_base = (source_row_base + row) * VOCAB_PER_TP
+                for output_block in pl.range(LOGITS_FLAT_PUT_TILES):
+                    output_offset = output_block * LOGITS_FLAT_PUT_TILE
+                    pld.tensor.put(
+                        dst=logits_window,
+                        peer=group_base + owner_tp,
+                        src=logits_shards_flat,
+                        dst_offsets=[dst_row_base + output_offset],
+                        src_offsets=[src_row_base + output_offset],
+                        shape=[LOGITS_FLAT_PUT_TILE],
+                    )
 
-            if LOGITS_COMM_TAIL != 0:
-                tail_offset = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
-                pld.tensor.put(
-                    dst=logits_window,
-                    peer=group_base + owner_tp,
-                    src=logits_shards,
-                    dst_offsets=[row_offset, vocab_base + tail_offset],
-                    src_offsets=[source_row_base + row_offset, tail_offset],
-                    shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TAIL],
-                )
+                if LOGITS_FLAT_PUT_TAIL != 0:
+                    tail_offset = LOGITS_FLAT_PUT_TILES * LOGITS_FLAT_PUT_TILE
+                    pld.tensor.put(
+                        dst=logits_window,
+                        peer=group_base + owner_tp,
+                        src=logits_shards_flat,
+                        dst_offsets=[dst_row_base + tail_offset],
+                        src_offsets=[src_row_base + tail_offset],
+                        shape=[LOGITS_FLAT_PUT_TAIL],
+                    )
 
         for owner_tp in pl.range(TP_SIZE):
             if owner_tp != tp_rank:
@@ -301,6 +309,8 @@ def lm_head(
                     cmp=pld.WaitCmp.Ge,
                 )
 
+    logits_window_2d = pl.reshape(logits_window, [MAX_LOGIT_ROWS, VOCAB])
+
     # Assemble full-vocabulary logits, same vocab-tile split. deps on _cwait_tid for
     # the peers' stores; our own tiles ride the local RAW edge on logits_window.
     with pl.spmd(
@@ -313,7 +323,7 @@ def lm_head(
                 o0 = ob * LOGITS_COMM_TILE
                 lo = src_vocab_base + o0
                 for gr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                    logits[gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE] = logits_window[
+                    logits[gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE] = logits_window_2d[
                         gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE
                     ]
 
@@ -322,7 +332,7 @@ def lm_head(
                     tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
                     tl = src_vocab_base + tail_o0
                     for tr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                        logits[tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL] = logits_window[
+                        logits[tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL] = logits_window_2d[
                             tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL
                         ]
 
@@ -349,7 +359,7 @@ def l2_lm_head(
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS * VOCAB], pl.FP32],
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
@@ -442,7 +452,7 @@ def l3_lm_head(
     for r in pl.range(pld.world_size()):
         hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+        logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS * VOCAB], dtype=pl.FP32)
         logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         l2_lm_head(
             hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
