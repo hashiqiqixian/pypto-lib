@@ -264,8 +264,6 @@ def lm_head(
                     dst_offsets=[0, vocab_base + output_offset],
                     src_offsets=[source_row_base, output_offset],
                     shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TILE],
-                    chunk_rows=LOGITS_GATHER_ROW_TILE,
-                    chunk_cols=LOGITS_COMM_TILE,
                 )
 
             if LOGITS_COMM_TAIL != 0:
@@ -278,8 +276,6 @@ def lm_head(
                         dst_offsets=[0, vocab_base + tail_offset],
                         src_offsets=[source_row_base, tail_offset],
                         shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TAIL],
-                        chunk_rows=LOGITS_GATHER_ROW_TILE,
-                        chunk_cols=LOGITS_COMM_TAIL,
                     )
 
         for owner_tp in pl.range(TP_SIZE):
