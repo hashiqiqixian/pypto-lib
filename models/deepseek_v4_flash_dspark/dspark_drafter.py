@@ -22,7 +22,6 @@ from config import (
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
     MOE_TOKENS,
-    PREFILL_SEQ,
     PREFILL_TOKENS,
     TP,
 )
@@ -85,7 +84,10 @@ assert (
     * ((M.sliding_window + DSPARK_QUERY_WIDTH + BLOCK_SIZE - 1) // BLOCK_SIZE)
     <= KV_ORI_BLOCK_NUM
 )
-assert PREFILL_SEQ + DSPARK_QUERY_WIDTH <= KV_ORI_MAX_BLOCKS * BLOCK_SIZE
+assert (
+    DSPARK_GROUP_TOKEN_CAP // DSPARK_CP_SIZE + DSPARK_QUERY_WIDTH
+    <= KV_ORI_MAX_BLOCKS * BLOCK_SIZE
+)
 
 # model config
 T = DSPARK_MOE_TOKENS
@@ -902,7 +904,14 @@ def _block_tables(batch):
     return tables
 
 
-def _context_slots(tables, positions, tokens_per_request, valid_counts=None):
+def _context_slots(
+    tables,
+    positions,
+    request_ids,
+    *,
+    valid_mask=None,
+    first_cached_positions=None,
+):
     import torch
 
     slots = torch.full(
@@ -913,11 +922,15 @@ def _context_slots(tables, positions, tokens_per_request, valid_counts=None):
     for rank in range(N_RANKS):
         for layer in range(DSPARK_DRAFT_LAYERS):
             for token in range(positions.shape[1]):
-                request = token // tokens_per_request
-                request_offset = token % tokens_per_request
-                if valid_counts is not None and request_offset >= int(valid_counts[request]):
+                request = int(request_ids[token])
+                if valid_mask is not None and not bool(valid_mask[token]):
                     continue
                 position = int(positions[rank, token])
+                if (
+                    first_cached_positions is not None
+                    and position < int(first_cached_positions[request])
+                ):
+                    continue
                 physical_block = int(tables[rank, layer, request, position // BLOCK_SIZE])
                 slots[rank, layer, token] = physical_block * BLOCK_SIZE + position % BLOCK_SIZE
     return slots
@@ -942,26 +955,38 @@ def build_tensor_specs(batch, *, mode="decode"):
         raise ValueError(f"unsupported DSpark mode {mode!r}; expected 'decode' or 'prefill'")
 
     if mode == "decode":
-        target_seq = DECODE_SEQ
-        context_seq = DECODE_SEQ
+        local_context_tokens = batch * DECODE_SEQ
         positions = _anchor_position_set(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
         valid_pattern = torch.tensor([1, 4, 7, 2, 5, 8, 3, 6], dtype=torch.int32)
         valid_counts = valid_pattern.repeat((batch + valid_pattern.numel() - 1) // valid_pattern.numel())[:batch]
-        context_positions = torch.zeros(N_RANKS, batch * context_seq, dtype=torch.int32)
+        context_request_ids = torch.arange(batch, dtype=torch.int64).repeat_interleave(DECODE_SEQ)
+        context_offsets = torch.arange(DECODE_SEQ, dtype=torch.int32).repeat(batch)
+        valid_mask = context_offsets < valid_counts.repeat_interleave(DECODE_SEQ)
+        context_positions = torch.zeros(N_RANKS, local_context_tokens, dtype=torch.int32)
         for request in range(batch):
             valid_count = int(valid_counts[request])
             context_start = int(positions[0, request]) - valid_count + 1
             context_positions[
                 :,
-                request * context_seq : request * context_seq + valid_count,
+                request * DECODE_SEQ : request * DECODE_SEQ + valid_count,
             ] = torch.arange(context_start, context_start + valid_count, dtype=torch.int32)
+        first_cached_positions = None
     else:
-        target_seq = PREFILL_SEQ
-        context_seq = PREFILL_SEQ
-        valid_counts = None
-        position_row = torch.arange(PREFILL_SEQ, dtype=torch.int32)
-        context_positions = position_row.repeat(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
-        positions = torch.full((N_RANKS, batch), PREFILL_SEQ - 1, dtype=torch.int32)
+        local_context_tokens = PREFILL_TOKENS // DSPARK_CP_SIZE
+        request_counts = torch.full(
+            (batch,), local_context_tokens // batch, dtype=torch.int32
+        )
+        request_counts[: local_context_tokens % batch] += 1
+        context_request_ids = torch.arange(batch, dtype=torch.int64).repeat_interleave(
+            request_counts.to(torch.int64)
+        )
+        context_offsets = torch.cat(
+            [torch.arange(int(count), dtype=torch.int32) for count in request_counts]
+        )
+        context_positions = context_offsets.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        positions = (request_counts - 1).unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        valid_mask = None
+        first_cached_positions = torch.clamp(request_counts - WIN, min=0)
     if int(context_positions.min()) < 0 or int(context_positions.max()) >= ORI_MAX_BLOCKS * BLOCK_SIZE:
         raise ValueError("DSpark context positions exceed the logical KV block table")
     if int((positions + DSPARK_QUERY_WIDTH).max()) >= ORI_MAX_BLOCKS * BLOCK_SIZE:
@@ -969,14 +994,20 @@ def build_tensor_specs(batch, *, mode="decode"):
     tables = _block_tables(batch)
     if int(tables.min()) < 0 or int(tables.max()) >= ORI_BLOCK_NUM:
         raise ValueError("DSpark block table references a physical KV block outside the cache")
-    context_slots = _context_slots(tables, context_positions, context_seq, valid_counts)
+    context_slots = _context_slots(
+        tables,
+        context_positions,
+        context_request_ids,
+        valid_mask=valid_mask,
+        first_cached_positions=first_cached_positions,
+    )
     context_group_positions = torch.empty(
-        N_RANKS, DSPARK_CP_SIZE * batch * context_seq, dtype=torch.int32
+        N_RANKS, DSPARK_CP_SIZE * local_context_tokens, dtype=torch.int32
     )
     context_group_slots = torch.empty(
         N_RANKS,
         DSPARK_DRAFT_LAYERS,
-        DSPARK_CP_SIZE * batch * context_seq,
+        DSPARK_CP_SIZE * local_context_tokens,
         dtype=torch.int64,
     )
     query_positions_local = torch.zeros(N_RANKS, T_QUERY, dtype=torch.int32)
@@ -1033,16 +1064,16 @@ def build_tensor_specs(batch, *, mode="decode"):
     routes = routes.reshape(N_RANKS, DSPARK_DRAFT_LAYERS * VOCAB, TOPK).contiguous()
 
     def init_target_hidden():
-        values = torch.zeros(N_RANKS, batch * target_seq, MAIN_IN, dtype=torch.bfloat16)
+        values = torch.zeros(N_RANKS, local_context_tokens, MAIN_IN, dtype=torch.bfloat16)
         columns = torch.arange(D, dtype=torch.float32)
         base = ((columns % 31) - 15) * 0.002
         for rank in range(N_RANKS):
-            for request in range(batch):
-                for offset in range(target_seq):
-                    row = request * target_seq + offset
-                    values[rank, row, :D] = (
-                        base + 0.01 * (rank + request + 1) + 0.001 * offset
-                    ).to(torch.bfloat16)
+            for row in range(local_context_tokens):
+                request = int(context_request_ids[row])
+                offset = int(context_offsets[row])
+                values[rank, row, :D] = (
+                    base + 0.01 * (rank + request + 1) + 0.001 * offset
+                ).to(torch.bfloat16)
         return values
 
     def init_main_proj_weight():
@@ -1102,7 +1133,7 @@ def build_tensor_specs(batch, *, mode="decode"):
         return cache
 
     specs = [
-        ranked("target_hidden", [batch * target_seq, MAIN_IN], torch.bfloat16, init_value=init_target_hidden),
+        ranked("target_hidden", [local_context_tokens, MAIN_IN], torch.bfloat16, init_value=init_target_hidden),
         TensorSpec(
             "initial_hidden",
             [N_RANKS, DSPARK_MAX_BATCH * DSPARK_QUERY_PAD, HC_MULT, D],
@@ -1128,13 +1159,13 @@ def build_tensor_specs(batch, *, mode="decode"):
         ranked("embedding_weight", [VOCAB, D], torch.bfloat16, init_value=init_embedding_weight, resident=True),
         ranked(
             "context_group_position_ids",
-            [DSPARK_CP_SIZE * batch * context_seq],
+            [DSPARK_CP_SIZE * local_context_tokens],
             torch.int32,
             init_value=lambda: context_group_positions,
         ),
         ranked(
             "context_group_slot_mapping",
-            [DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * batch * context_seq],
+            [DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * local_context_tokens],
             torch.int64,
             init_value=lambda: context_group_slots,
         ),
