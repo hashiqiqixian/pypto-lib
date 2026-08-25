@@ -596,7 +596,7 @@ def l2_distributed_markov_sample(
         normalized,
     )
     base_logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-    base_logits, _owner_hiddens, base_logits_tid = lm_head(
+    base_logits, base_logits_tid = lm_head(
         normalized,
         lm_head_weight,
         logit_row_indices,
