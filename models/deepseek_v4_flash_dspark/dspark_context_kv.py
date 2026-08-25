@@ -28,7 +28,12 @@ from config import (
     PREFILL_SEQ,
     TP,
 )
-from qkv_proj_rope import kv_proj_rope, materialize_rope_rows, rope_prepare
+from qkv_proj_rope import (
+    kv_proj_rope,
+    materialize_rope_rows,
+    materialize_rope_rows_dynamic,
+    rope_prepare,
+)
 
 
 # Dynamic shape variables.
@@ -37,6 +42,7 @@ ORI_BLOCK_NUM_DYN = pl.dynamic("DSPARK_CONTEXT_KV_ORI_BLOCK_NUM_DYN")
 
 # The public DSpark program supports at most 16 requests with 7 draft rows.
 DSPARK_QUERY_TOKENS = 16 * 7
+DSPARK_CONTEXT_LAYERS = 3
 
 # model config
 D = M.hidden_size
@@ -57,14 +63,17 @@ def dspark_context_kv(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    slot_mapping: pl.Tensor[[DSPARK_CONTEXT_LAYERS, T_DYN], pl.INT64],
+    layer_index: pl.Scalar[pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
 ):
-    t_dim = pl.tensor.dim(main_x, 0)
+    t_dim = pl.tensor.dim(position_ids, 0)
 
     rope_cos_t = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.BF16)
-    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, t_dim, rope_cos_t, rope_sin_t)
+    materialize_rope_rows_dynamic(
+        freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t
+    )
 
     rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
@@ -80,7 +89,7 @@ def dspark_context_kv(
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_context_kv_scatter"):
         for write_t in pl.range(t_dim):
-            write_row_i64 = pl.read(slot_mapping, [write_t])
+            write_row_i64 = pl.read(slot_mapping, [layer_index, write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
@@ -146,15 +155,23 @@ def dspark_context_kv_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    slot_mapping: pl.Tensor[[DSPARK_CONTEXT_LAYERS, T_DYN], pl.INT64],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
 ):
     main_x.bind_dynamic(0, T_DYN)
     position_ids.bind_dynamic(0, T_DYN)
-    slot_mapping.bind_dynamic(0, T_DYN)
+    slot_mapping.bind_dynamic(1, T_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     return dspark_context_kv(
-        main_x, wkv, gamma_ckv, freqs_cos, freqs_sin, position_ids, slot_mapping, kv_cache
+        main_x,
+        wkv,
+        gamma_ckv,
+        freqs_cos,
+        freqs_sin,
+        position_ids,
+        slot_mapping,
+        pl.const(0, pl.INT32),
+        kv_cache,
     )
 
 
@@ -179,7 +196,7 @@ def golden_dspark_context_kv(tensors):
 
     kv = torch.cat([kv_full[:, :NOPE_DIM], rotated.float()], dim=-1).to(torch.bfloat16)
     kv_cache_flat = tensors["kv_cache"].view(-1, HEAD_DIM)
-    slots = tensors["slot_mapping"]
+    slots = tensors["slot_mapping"][0]
     for token_idx in range(kv.shape[0]):
         cache_row = int(slots[token_idx].item())
         if cache_row >= 0:
@@ -212,9 +229,10 @@ def build_tensor_specs(batch, seq):
         return position_ids_from_starts(init_start_pos(), seq=seq).reshape(-1).contiguous()
 
     def init_slot_mapping():
-        return paged_slot_mapping(
+        slots = paged_slot_mapping(
             position_ids_from_starts(init_start_pos(), seq=seq), init_block_table(), block_size=BLOCK_SIZE
         ).reshape(-1).contiguous()
+        return slots.unsqueeze(0).expand(DSPARK_CONTEXT_LAYERS, -1).contiguous()
 
     def init_main_x():
         return torch.randn(t, D, dtype=torch.bfloat16) * 0.05
@@ -234,7 +252,12 @@ def build_tensor_specs(batch, seq):
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_cos.clone()),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_sin.clone()),
         TensorSpec("position_ids", [t], torch.int32, init_value=init_position_ids),
-        TensorSpec("slot_mapping", [t], torch.int64, init_value=init_slot_mapping),
+        TensorSpec(
+            "slot_mapping",
+            [DSPARK_CONTEXT_LAYERS, t],
+            torch.int64,
+            init_value=init_slot_mapping,
+        ),
         TensorSpec(
             "kv_cache",
             [KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],

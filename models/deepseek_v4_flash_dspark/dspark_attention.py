@@ -28,11 +28,17 @@ from config import (
     KV_ORI_MAX_BLOCKS,
     TP,
 )
-from qkv_proj_rope import kv_proj_rope, materialize_rope_rows, q_proj_rope, rope_prepare
+from qkv_proj_rope import (
+    kv_proj_rope,
+    materialize_rope_rows_dynamic,
+    q_proj_rope,
+    rope_prepare,
+)
 
 
 # Dynamic shape variables.
 ORI_BLOCK_NUM_DYN = pl.dynamic("DSPARK_ATTENTION_ORI_BLOCK_NUM_DYN")
+KV_T_DYN = pl.dynamic("DSPARK_ATTENTION_KV_T_DYN")
 
 # model config
 B = DECODE_BATCH // TP
@@ -72,6 +78,7 @@ NEG_INF = -1.0e20
 @pl.jit.inline
 def dspark_attention(
     x: pl.Tensor[[T, D], pl.BF16],
+    kv_x: pl.Tensor[[KV_T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -81,8 +88,9 @@ def dspark_attention(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T], pl.INT32],
+    kv_position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    slot_mapping: pl.Tensor[[T], pl.INT64],
+    kv_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[B, INDEX_WIDTH], pl.INT32],
     swa_lens: pl.Tensor[[B], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -91,9 +99,17 @@ def dspark_attention(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, D], pl.BF16],
 ):
+    kv_tokens = pl.tensor.dim(kv_position_ids, 0)
     rope_cos_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
-    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, T, rope_cos_t, rope_sin_t)
+    for rope_t in pl.spmd(T, name_hint="dspark_q_rope_rows"):
+        rope_position = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
+        rope_cos_t[rope_t : rope_t + 1, :] = freqs_cos[
+            rope_position : rope_position + 1, :
+        ]
+        rope_sin_t[rope_t : rope_t + 1, :] = freqs_sin[
+            rope_position : rope_position + 1, :
+        ]
 
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
@@ -109,10 +125,39 @@ def dspark_attention(
         q, qr, qr_scale,
     )
 
-    # Neutral fence: qr_proj and kv_proj share one input, nothing to defer behind.
+    kv_rope_cos_t = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.BF16)
+    kv_rope_sin_t = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.BF16)
+    materialize_rope_rows_dynamic(
+        freqs_cos,
+        freqs_sin,
+        kv_position_ids,
+        kv_rope_cos_t,
+        kv_rope_sin_t,
+    )
+    kv_rope_cos_il = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.FP32)
+    kv_rope_sin_signed = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.FP32)
+    kv_rope_swap_idx = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.INT32)
+    rope_prepare(
+        kv_rope_cos_t,
+        kv_rope_sin_t,
+        kv_rope_cos_il,
+        kv_rope_sin_signed,
+        kv_rope_swap_idx,
+    )
+
+    # Q remains on the local SP shard; KV covers the full TP-group token stream.
     late_dep = pl.system.task_dummy(deps=[])
-    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x, wkv, gamma_ckv, rope_cos_il, rope_sin_signed, rope_swap_idx, kv, late_dep)
+    kv = pl.create_tensor([kv_tokens, HEAD_DIM], dtype=pl.BF16)
+    kv_proj_rope(
+        kv_x,
+        wkv,
+        gamma_ckv,
+        kv_rope_cos_il,
+        kv_rope_sin_signed,
+        kv_rope_swap_idx,
+        kv,
+        late_dep,
+    )
 
     # Commit the block's own KV and build the visible-length mask in one task; the
     # gather below reads those rows back through swa_indices.
@@ -120,8 +165,8 @@ def dspark_attention(
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     sparse_bias = pl.create_tensor([B, INDEX_WIDTH], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_kv_commit_valid_bias"):
-        for write_t in pl.range(T):
-            write_row_i64 = pl.read(slot_mapping, [write_t])
+        for write_t in pl.range(kv_tokens):
+            write_row_i64 = pl.read(kv_slot_mapping, [write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
@@ -331,8 +376,9 @@ def dspark_attention_test(
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     return dspark_attention(
         x,
+        x,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, position_ids,
+        freqs_cos, freqs_sin, position_ids, position_ids,
         kv_cache, slot_mapping, swa_indices, swa_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out,

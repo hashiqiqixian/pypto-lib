@@ -707,11 +707,14 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
         step_delta = torch.arange(DSPARK_QUERY_WIDTH, dtype=torch.float32).view(1, -1) / 32.0
         hidden[:, :, 0] = (0.25 + request_delta + step_delta).to(torch.bfloat16)
         if distributed:
-            # TP ranks share one request batch; DP groups own different context.
+            # Every TP rank owns a distinct SP request slice. A rank-specific
+            # one-hot feature makes the fused SP-gather/TP-vocab path observable.
             rank_hidden = []
             for rank in range(WORLD_SIZE):
                 group_hidden = hidden.clone()
                 group_hidden[:, :, 1] = 1.0 + (rank // TP_SIZE) / 8.0
+                group_hidden[:, :, 2 : 2 + TP_SIZE] = 0.0
+                group_hidden[:, :, 2 + rank % TP_SIZE] = 1.0
                 rank_hidden.append(group_hidden)
             return torch.stack(rank_hidden)
         return hidden
@@ -726,11 +729,10 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
             )
             for rank in range(WORLD_SIZE):
                 if rank % TP_SIZE == 0:
-                    dp_group = rank // TP_SIZE
-                    # Rows 4-7 have no Markov bias. Give each DP group a
-                    # different base-logit winner that stays above the +/-4 bias.
-                    group_token = 4 + dp_group % 4
-                    weight[rank, group_token, :LM_K_TILE] = 8.0 / LM_K_TILE
+                    # Rows 4+owner_tp have no Markov bias. Distinct winners for
+                    # the SP owners prove their hidden rows are not duplicated.
+                    for owner_tp in range(TP_SIZE):
+                        weight[rank, 4 + owner_tp, 2 + owner_tp] = 8.0
             return weight
         weight = torch.zeros(VOCAB, D, dtype=torch.bfloat16)
         weight[0, :LM_K_TILE] = 1.0 / LM_K_TILE
