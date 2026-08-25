@@ -251,41 +251,34 @@ def lm_head(
         vocab_base = tp_rank * VOCAB_PER_TP
         for owner_tp in pl.range(TP_SIZE):
             source_row_base = owner_tp * MAX_LOGIT_ROWS
-            owner_logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB_PER_TP], pl.FP32] = pl.slice(
-                logits_shards,
-                [MAX_LOGIT_ROWS, VOCAB_PER_TP],
-                [source_row_base, 0],
-            )
             for output_block in pl.range(
                 push_block,
                 N_LOGITS_COMM_TILES,
                 LOGITS_COMM_BLOCKS,
             ):
                 output_offset = output_block * LOGITS_COMM_TILE
-                pld.tensor.put(
-                    dst=logits_window,
-                    peer=group_base + owner_tp,
-                    src=owner_logits,
-                    dst_offsets=[0, vocab_base + output_offset],
-                    src_offsets=[0, output_offset],
-                    shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TILE],
-                    chunk_rows=LOGITS_GATHER_ROW_TILE,
-                    chunk_cols=LOGITS_COMM_TILE,
-                )
+                for row_offset in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
+                    pld.tensor.put(
+                        dst=logits_window,
+                        peer=group_base + owner_tp,
+                        src=logits_shards,
+                        dst_offsets=[row_offset, vocab_base + output_offset],
+                        src_offsets=[source_row_base + row_offset, output_offset],
+                        shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TILE],
+                    )
 
             if LOGITS_COMM_TAIL != 0:
                 if push_block == LOGITS_TAIL_BLOCK:
                     tail_offset = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
-                    pld.tensor.put(
-                        dst=logits_window,
-                        peer=group_base + owner_tp,
-                        src=owner_logits,
-                        dst_offsets=[0, vocab_base + tail_offset],
-                        src_offsets=[0, tail_offset],
-                        shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TAIL],
-                        chunk_rows=LOGITS_GATHER_ROW_TILE,
-                        chunk_cols=LOGITS_COMM_TAIL,
-                    )
+                    for tail_row in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
+                        pld.tensor.put(
+                            dst=logits_window,
+                            peer=group_base + owner_tp,
+                            src=logits_shards,
+                            dst_offsets=[tail_row, vocab_base + tail_offset],
+                            src_offsets=[source_row_base + tail_row, tail_offset],
+                            shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TAIL],
+                        )
 
         for owner_tp in pl.range(TP_SIZE):
             if owner_tp != tp_rank:
