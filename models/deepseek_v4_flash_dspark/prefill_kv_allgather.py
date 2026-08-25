@@ -55,9 +55,6 @@ PREFILL_LOCAL_CAP = PREFILL_GROUP_CAP // TP_SIZE
 # tiling
 COMM_ROW_TILE = 8
 READBACK_ROW_TILE = _parse_int_argv("--readback-tile", 16)
-LM_DISPATCH_ROWS = 512
-LM_DISPATCH_ROW_TILE = 16
-LM_GATHER_COL_TILE = 512
 if READBACK_ROW_TILE < 1:
     raise ValueError(f"--readback-tile must be >= 1 (got {READBACK_ROW_TILE})")
 
@@ -65,7 +62,7 @@ if READBACK_ROW_TILE < 1:
 FIXTURE_LOCAL_T = min(257, PREFILL_LOCAL_CAP)
 
 
-@pl.jit.inline(auto_scope=False)
+@pl.jit.incore
 def prefill_kv_token_allgather_step(
     hidden_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
     group_out: pl.InOut[pl.Tensor[[CP_KV_T_DYN, D], pl.BF16]],
@@ -74,59 +71,38 @@ def prefill_kv_token_allgather_step(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
 ):
-    """Temporarily reproduce the LM Head hidden dispatch without its matmul."""
-    selected_hidden = pl.create_tensor([LM_DISPATCH_ROWS, D], dtype=pl.BF16)
-    with pl.spmd(
-        LM_DISPATCH_ROWS // LM_DISPATCH_ROW_TILE,
-        name_hint="lm_dispatch_probe_push",
-    ) as push_tid:
-        block = pl.tile.get_block_idx()
-        row = block * LM_DISPATCH_ROW_TILE
-        selected_hidden[row : row + LM_DISPATCH_ROW_TILE, :] = hidden_local[
-            row : row + LM_DISPATCH_ROW_TILE, :
-        ]
-        for peer_tp in pl.range(TP_SIZE):
-            pld.tensor.put(
-                dst=gather_window,
-                peer=group_base + peer_tp,
-                src=selected_hidden,
-                dst_offsets=[tp_rank * LM_DISPATCH_ROWS + row, 0],
-                src_offsets=[row, 0],
-                shape=[LM_DISPATCH_ROW_TILE, D],
-            )
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal,
-                    peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+    """Gather every rank's token rows into rank-major order on every rank."""
+    local_rows = pl.tensor.dim(hidden_local, 0)
+    local_t = pl.cast(local_rows, pl.INT32)
+    target_row = tp_rank * local_t
+    for peer_tp in pl.range(TP_SIZE):
+        pld.tensor.put(
+            dst=gather_window,
+            peer=group_base + peer_tp,
+            src=hidden_local,
+            dst_offsets=[target_row, 0],
+            src_offsets=[0, 0],
+            shape=[local_t, D],
+            chunk_rows=COMM_ROW_TILE,
+            chunk_cols=D,
+        )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_dispatch_probe_wait") as wait_tid:
-        expected = pl.cast(LM_DISPATCH_ROWS // LM_DISPATCH_ROW_TILE, pl.INT32)
-        for owner_tp in pl.range(TP_SIZE):
-            if owner_tp != tp_rank:
-                pld.system.wait(
-                    signal=gather_signal,
-                    offsets=[owner_tp, 0],
-                    expected=expected,
-                    cmp=pld.WaitCmp.Ge,
-                )
+    expected_one = pl.cast(1, pl.INT32)
+    gather_signal = tp_group_barrier(gather_signal, group_base, tp_rank, expected_one)
 
-    group_rows = TP_SIZE * LM_DISPATCH_ROWS
-    with pl.spmd(
-        (group_rows // LM_DISPATCH_ROW_TILE) * (D // LM_GATHER_COL_TILE),
-        name_hint="lm_dispatch_probe_gather",
-        deps=[push_tid, wait_tid],
-    ) as _gather_tid:
-        block = pl.tile.get_block_idx()
-        col = (block % (D // LM_GATHER_COL_TILE)) * LM_GATHER_COL_TILE
-        row = (block // (D // LM_GATHER_COL_TILE)) * LM_DISPATCH_ROW_TILE
-        group_out[row : row + LM_DISPATCH_ROW_TILE, col : col + LM_GATHER_COL_TILE] = gather_window[
-            row : row + LM_DISPATCH_ROW_TILE, col : col + LM_GATHER_COL_TILE
+    # Whole tiles take the wide path; the ragged remainder falls back to rows.
+    group_rows = TP_SIZE * local_rows
+    full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
+    for tile_row in pl.range(0, full_rows, READBACK_ROW_TILE):
+        group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = gather_window[
+            tile_row : tile_row + READBACK_ROW_TILE, 0:D
         ]
+    for tail_row in pl.range(full_rows, group_rows):
+        group_out[tail_row : tail_row + 1, 0:D] = gather_window[tail_row : tail_row + 1, 0:D]
+
+    expected_two = pl.cast(2, pl.INT32)
+    gather_signal = tp_group_barrier(gather_signal, group_base, tp_rank, expected_two)
+    gather_signal = reset_tp_group_signal(gather_signal, group_base, tp_rank)
     return group_out, gather_signal
 
 
