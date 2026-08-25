@@ -504,30 +504,29 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
 
 
 def _compare_logits_rank_layout(actual, expected, **_):
-    """Temporarily classify a nonzero TP-owner mismatch by candidate layout."""
+    """Temporarily map each output row and vocabulary shard to its source row."""
     import torch
 
     active = int(torch.count_nonzero(expected[1].abs().amax(dim=-1)))
-    rank_one = actual[1, :active]
-    candidates = {
-        "rank0_owner": expected[0, :active],
-        "rank1_owner": expected[1, :active],
-        "rank1_swapped_vocab_shards": torch.cat(
-            [
-                expected[1, :active, VOCAB_PER_TP:],
-                expected[1, :active, :VOCAB_PER_TP],
-            ],
-            dim=-1,
-        ),
-    }
+    references = expected[:, :active].reshape(TP_SIZE * active, VOCAB)
     lines = []
-    for name, candidate in candidates.items():
-        close = torch.isclose(rank_one, candidate, rtol=1e-3, atol=1e-3)
-        diff = (rank_one - candidate).abs()
-        lines.append(
-            f"{name}: close={int(close.sum())}/{close.numel()} "
-            f"max_abs={float(diff.max())} mean_abs={float(diff.mean())}"
-        )
+    for output_rank in range(TP_SIZE):
+        for vocab_rank in range(TP_SIZE):
+            lo = vocab_rank * VOCAB_PER_TP
+            hi = lo + VOCAB_PER_TP
+            sampled_actual = actual[output_rank, :active, lo:hi:64]
+            sampled_references = references[:, lo:hi:64]
+            errors = (sampled_actual[:, None, :] - sampled_references[None, :, :]).abs().mean(dim=-1)
+            best_error, best_flat_row = errors.min(dim=1)
+            mappings = []
+            for output_row in range(active):
+                source_flat_row = int(best_flat_row[output_row])
+                source_rank = source_flat_row // active
+                source_row = source_flat_row % active
+                mappings.append(
+                    f"{output_row}->{source_rank}:{source_row}({float(best_error[output_row]):.6f})"
+                )
+            lines.append(f"out_rank={output_rank} vocab_rank={vocab_rank}: " + " ".join(mappings))
     return False, "\n".join(lines)
 
 
