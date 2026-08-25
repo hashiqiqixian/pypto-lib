@@ -509,6 +509,34 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     ]
 
 
+def _compare_logits_rank_layout(actual, expected, **_):
+    """Temporarily classify a nonzero TP-owner mismatch by candidate layout."""
+    import torch
+
+    active = int(torch.count_nonzero(expected[1].abs().amax(dim=-1)))
+    rank_one = actual[1, :active]
+    candidates = {
+        "rank0_owner": expected[0, :active],
+        "rank1_owner": expected[1, :active],
+        "rank1_swapped_vocab_shards": torch.cat(
+            [
+                expected[1, :active, VOCAB_PER_TP:],
+                expected[1, :active, :VOCAB_PER_TP],
+            ],
+            dim=-1,
+        ),
+    }
+    lines = []
+    for name, candidate in candidates.items():
+        close = torch.isclose(rank_one, candidate, rtol=1e-3, atol=1e-3)
+        diff = (rank_one - candidate).abs()
+        lines.append(
+            f"{name}: close={int(close.sum())}/{close.numel()} "
+            f"max_abs={float(diff.max())} mean_abs={float(diff.mean())}"
+        )
+    return False, "\n".join(lines)
+
+
 if __name__ == "__main__":
     import argparse
     from golden import run_jit
@@ -542,6 +570,7 @@ if __name__ == "__main__":
         fn=fn,
         specs=specs,
         golden_fn=golden_fn,
+        compare_fn={"logits": _compare_logits_rank_layout},
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
