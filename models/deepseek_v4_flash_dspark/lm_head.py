@@ -67,6 +67,7 @@ LOGITS_COMM_TILE = 2048
 GREEDY_ROW_WIDTH = 808
 GREEDY_BLOCK_ROWS = 8
 SAMPLED_IDS_PAD = 8
+OWNER_PROBE_COLS = 8
 FUSED_LM_HEAD_CORES = 24
 VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
@@ -107,6 +108,7 @@ def lm_head(
     hidden_ready_tid: pl.Scalar[pl.TASK_ID],
 ) -> tuple[
     pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    pl.Tensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     pl.Scalar[pl.TASK_ID],
 ]:
     # Scratch is allocated just outside the scope that first writes it: a
@@ -344,7 +346,7 @@ def lm_head(
         for src_tp in pl.range(TP_SIZE):
             pl.write(hidden_done, [src_tp, 0], zero)
             pl.write(logits_done, [src_tp, 0], zero)
-    return logits, _clear_tid
+    return logits, owner_hiddens, _clear_tid
 
 
 @pl.jit
@@ -353,6 +355,7 @@ def l2_lm_head(
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    owner_probe: pl.Out[pl.Tensor[[TP_SIZE, OWNER_PROBE_COLS], pl.BF16]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
@@ -360,18 +363,27 @@ def l2_lm_head(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
+) -> tuple[
+    pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    pl.Tensor[[TP_SIZE, OWNER_PROBE_COLS], pl.BF16],
+]:
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="lm_head_input_ready",
     ) as hidden_ready_tid:
         _input_anchor = pl.read(hidden_states, [0, 0])
-    lm_head(
+    logits, owner_hiddens, lm_head_tid = lm_head(
         hidden_states, lm_head_weight, logit_row_indices, logits,
         hidden_window, hidden_done, logits_window, logits_done,
         group_base, tp_rank, done_epoch, hidden_ready_tid,
     )
-    return logits
+    with pl.spmd(TP_SIZE, name_hint="lm_head_owner_probe", deps=[lm_head_tid]):
+        owner = pl.tile.get_block_idx()
+        source_row = owner * MAX_LOGIT_ROWS
+        owner_probe[owner : owner + 1, :] = owner_hiddens[
+            source_row : source_row + 1, 0:OWNER_PROBE_COLS
+        ]
+    return logits, owner_probe
 
 
 @pl.jit.inline
@@ -436,6 +448,7 @@ def l3_lm_head(
     hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    owner_probe: pl.Out[pl.Tensor[[WORLD_SIZE, TP_SIZE, OWNER_PROBE_COLS], pl.BF16]],
     logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
 ):
     # Windows are group-local: hidden_window holds one row slot per group member,
@@ -452,6 +465,7 @@ def l3_lm_head(
         logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         l2_lm_head(
             hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            owner_probe[r],
             hidden_window, hidden_done, logits_window, logits_done,
             r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
         )
@@ -475,6 +489,13 @@ def golden_lm_head(tensors):
                 selected[row].copy_(hidden[owner_rank, source_row])
         full_logits.append(torch.matmul(selected, full_weight.t()))
     tensors["logits"][:] = torch.stack(full_logits, dim=0)
+    for rank in range(WORLD_SIZE):
+        group_base = rank // TP_SIZE * TP_SIZE
+        for owner_tp in range(TP_SIZE):
+            owner_rank = group_base + owner_tp
+            tensors["owner_probe"][rank, owner_tp] = hidden[
+                owner_rank, 0, :OWNER_PROBE_COLS
+            ].to(torch.bfloat16)
 
 
 def build_tensor_specs(num_tokens=TEST_TOKENS):
@@ -505,6 +526,12 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             init_value=init_lm_head_weight, resident="stacked",
         ),
         TensorSpec("logits", [WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], torch.float32, is_output=True),
+        TensorSpec(
+            "owner_probe",
+            [WORLD_SIZE, TP_SIZE, OWNER_PROBE_COLS],
+            torch.bfloat16,
+            is_output=True,
+        ),
         TensorSpec("logit_row_indices", [WORLD_SIZE, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices),
     ]
 
