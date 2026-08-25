@@ -377,7 +377,7 @@ def l2_lm_head(
         hidden_window, hidden_done, logits_window, logits_done,
         group_base, tp_rank, done_epoch, hidden_ready_tid,
     )
-    with pl.spmd(TP_SIZE, name_hint="lm_head_owner_probe", deps=[lm_head_tid]) as _owner_probe_tid:
+    with pl.spmd(TP_SIZE, name_hint="lm_head_owner_probe", deps=[lm_head_tid]):
         owner = pl.tile.get_block_idx()
         source_row = owner * MAX_LOGIT_ROWS
         owner_probe[owner : owner + 1, :] = owner_hiddens[
