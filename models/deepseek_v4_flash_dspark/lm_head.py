@@ -73,6 +73,7 @@ VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 N_LOGITS_COMM_TILES = VOCAB_PER_TP // LOGITS_COMM_TILE
 LOGITS_COMM_BLOCKS = min(FUSED_LM_HEAD_CORES, N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0))
+LOGITS_OWNER_ROW_BLOCKS = MAX_LOGIT_ROWS // LOGITS_GATHER_ROW_TILE
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
 GREEDY_GRID_ROWS = VOCAB // GREEDY_ROW_WIDTH
 GREEDY_BLOCK_SPAN = GREEDY_BLOCK_ROWS * GREEDY_ROW_WIDTH
@@ -86,6 +87,7 @@ os.environ.setdefault("PTO2_RING_HEAP", "1073741824")
 
 assert MAX_LOGIT_ROWS % MM_ROW_TILE == 0, "each row block must be one owner's rows"
 assert MAX_LOGIT_ROWS % PUSH_ROW_TILE == 0, "row block must cover whole rows"
+assert MAX_LOGIT_ROWS % LOGITS_GATHER_ROW_TILE == 0, "logits row blocks must cover whole rows"
 assert GREEDY_BLOCK_ROWS * 4 % 32 == 0, "reduction result must clear the 32 B column floor"
 assert GREEDY_ROW_WIDTH * 4 % 32 == 0, "block row must clear the 32 B row floor"
 assert VOCAB < GREEDY_INDEX_SENTINEL, "sentinel must lose every row_min against a real id"
@@ -243,42 +245,36 @@ def lm_head(
     # Publish each owner's rows from this rank's vocabulary shard. This is the
     # pre-fusion path used before direct C-to-V remote stores were introduced.
     with pl.spmd(
-        LOGITS_COMM_BLOCKS,
+        LOGITS_OWNER_ROW_BLOCKS,
         name_hint="lm_head_combine_push",
         deps=[_matmul_tid],
     ) as _push_tid:
-        push_block = pl.tile.get_block_idx()
+        row_block = pl.tile.get_block_idx()
+        row_offset = row_block * LOGITS_GATHER_ROW_TILE
         vocab_base = tp_rank * VOCAB_PER_TP
         for owner_tp in pl.range(TP_SIZE):
             source_row_base = owner_tp * MAX_LOGIT_ROWS
-            for output_block in pl.range(
-                push_block,
-                N_LOGITS_COMM_TILES,
-                LOGITS_COMM_BLOCKS,
-            ):
+            for output_block in pl.range(N_LOGITS_COMM_TILES):
                 output_offset = output_block * LOGITS_COMM_TILE
-                for row_offset in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                    pld.tensor.put(
-                        dst=logits_window,
-                        peer=group_base + owner_tp,
-                        src=logits_shards,
-                        dst_offsets=[row_offset, vocab_base + output_offset],
-                        src_offsets=[source_row_base + row_offset, output_offset],
-                        shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TILE],
-                    )
+                pld.tensor.put(
+                    dst=logits_window,
+                    peer=group_base + owner_tp,
+                    src=logits_shards,
+                    dst_offsets=[row_offset, vocab_base + output_offset],
+                    src_offsets=[source_row_base + row_offset, output_offset],
+                    shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TILE],
+                )
 
             if LOGITS_COMM_TAIL != 0:
-                if push_block == LOGITS_TAIL_BLOCK:
-                    tail_offset = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
-                    for tail_row in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                        pld.tensor.put(
-                            dst=logits_window,
-                            peer=group_base + owner_tp,
-                            src=logits_shards,
-                            dst_offsets=[tail_row, vocab_base + tail_offset],
-                            src_offsets=[source_row_base + tail_row, tail_offset],
-                            shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TAIL],
-                        )
+                tail_offset = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
+                pld.tensor.put(
+                    dst=logits_window,
+                    peer=group_base + owner_tp,
+                    src=logits_shards,
+                    dst_offsets=[row_offset, vocab_base + tail_offset],
+                    src_offsets=[source_row_base + row_offset, tail_offset],
+                    shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TAIL],
+                )
 
         for owner_tp in pl.range(TP_SIZE):
             if owner_tp != tp_rank:
@@ -301,7 +297,7 @@ def lm_head(
                 pld.system.wait(
                     signal=logits_done,
                     offsets=[src_tp, 0],
-                    expected=pl.cast(done_epoch * LOGITS_COMM_BLOCKS, pl.INT32),
+                    expected=pl.cast(done_epoch * LOGITS_OWNER_ROW_BLOCKS, pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
 
