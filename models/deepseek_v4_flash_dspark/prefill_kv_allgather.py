@@ -73,7 +73,8 @@ def prefill_kv_token_allgather_step(
 ):
     """Temporarily expose each rank's local input without communication."""
     local_rows = pl.tensor.dim(hidden_local, 0)
-    group_out[0:local_rows, 0:D] = hidden_local[0:local_rows, 0:D]
+    for row in pl.range(local_rows):
+        group_out[row : row + 1, 0:D] = hidden_local[row : row + 1, 0:D]
     return group_out, gather_signal
 
 
