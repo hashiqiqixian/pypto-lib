@@ -245,7 +245,7 @@ def greedy_markov_step(
     markov_w2: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
     confidence_head_weight: pl.Tensor[[1, D + DSPARK_MARKOV_RANK], pl.FP32],
     draft_token_scratch: pl.Tensor[[MARKOV_M_TILE, MARKOV_ID_PAD], pl.INT32],
-    confidence_scratch: pl.Tensor[[MARKOV_M_TILE, DSPARK_QUERY_WIDTH], pl.FP32],
+    confidence_scratch: pl.Tensor[[DSPARK_QUERY_WIDTH, MARKOV_M_TILE], pl.FP32],
     base_logits_ready_tid: pl.Scalar[pl.TASK_ID],
     start_tid: pl.Scalar[pl.TASK_ID],
     step: pl.Scalar[pl.INT32],
@@ -345,12 +345,10 @@ def greedy_markov_step(
         confidence_prob = pl.recip(
             pl.add(pl.exp(pl.neg(confidence_logit)), 1.0)
         )
-        for request_offset in pl.range(valid_rows):
-            pl.write(
-                confidence_scratch,
-                [request_base + request_offset, step],
-                pl.read(confidence_prob, [0, request_offset]),
-            )
+        confidence_scratch[
+            step : step + 1,
+            request_base : request_base + CONFIDENCE_PAD,
+        ] = confidence_prob
 
     with pl.spmd(
         MARKOV_M_TILE,
@@ -452,7 +450,7 @@ def sample_from_base_logits(
         dtype=pl.INT32,
     )
     confidence_scratch = pl.create_tensor(
-        [MARKOV_M_TILE, DSPARK_QUERY_WIDTH],
+        [DSPARK_QUERY_WIDTH, MARKOV_M_TILE],
         dtype=pl.FP32,
     )
     with pl.spmd(
@@ -521,7 +519,7 @@ def sample_from_base_logits(
                 pl.write(
                     confidence_probs,
                     [request, output_step],
-                    pl.read(confidence_scratch, [request, output_step]),
+                    pl.read(confidence_scratch, [output_step, request]),
                 )
     return draft_token_ids, confidence_probs
 
