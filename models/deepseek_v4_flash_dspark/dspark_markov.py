@@ -245,7 +245,7 @@ def greedy_markov_step(
     markov_w2: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
     confidence_head_weight: pl.Tensor[[1, D + DSPARK_MARKOV_RANK], pl.FP32],
     draft_token_scratch: pl.Tensor[[MARKOV_M_TILE, MARKOV_ID_PAD], pl.INT32],
-    confidence_probs: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32],
+    confidence_scratch: pl.Tensor[[MARKOV_M_TILE, DSPARK_QUERY_WIDTH], pl.FP32],
     base_logits_ready_tid: pl.Scalar[pl.TASK_ID],
     start_tid: pl.Scalar[pl.TASK_ID],
     step: pl.Scalar[pl.INT32],
@@ -287,12 +287,12 @@ def greedy_markov_step(
 
     confidence_blocks = (batch + CONFIDENCE_PAD - 1) // CONFIDENCE_PAD
     with pl.spmd(
-        1,
+        confidence_blocks,
         name_hint="dspark_confidence_head",
         deps=[markov_embedding_tid],
     ) as confidence_tid:
         confidence_worker = pl.tile.get_block_idx()
-        for confidence_block in pl.range(confidence_worker, confidence_blocks):
+        for confidence_block in pl.range(confidence_worker, confidence_worker + 1):
             request_base = confidence_block * CONFIDENCE_PAD
             valid_rows = pl.min(CONFIDENCE_PAD, batch - request_base)
             confidence_logit = pl.full(
@@ -348,7 +348,7 @@ def greedy_markov_step(
             )
             for request_offset in pl.range(valid_rows):
                 pl.write(
-                    confidence_probs,
+                    confidence_scratch,
                     [request_base + request_offset, step],
                     pl.read(confidence_prob, [0, request_offset]),
                 )
@@ -452,6 +452,10 @@ def sample_from_base_logits(
         [MARKOV_M_TILE, MARKOV_ID_PAD],
         dtype=pl.INT32,
     )
+    confidence_scratch = pl.create_tensor(
+        [MARKOV_M_TILE, DSPARK_QUERY_WIDTH],
+        dtype=pl.FP32,
+    )
     with pl.spmd(
         batch,
         name_hint="dspark_markov_token_scratch_zero",
@@ -464,43 +468,43 @@ def sample_from_base_logits(
     step_0_tid = greedy_markov_step(
         head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
         markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_probs,
+        draft_token_scratch, confidence_scratch,
         base_logits_ready_tid, token_scratch_zero_tid, pl.cast(0, pl.INT32)
     )
     step_1_tid = greedy_markov_step(
         head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
         markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_probs,
+        draft_token_scratch, confidence_scratch,
         base_logits_ready_tid, step_0_tid, pl.cast(1, pl.INT32)
     )
     step_2_tid = greedy_markov_step(
         head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
         markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_probs,
+        draft_token_scratch, confidence_scratch,
         base_logits_ready_tid, step_1_tid, pl.cast(2, pl.INT32)
     )
     step_3_tid = greedy_markov_step(
         head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
         markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_probs,
+        draft_token_scratch, confidence_scratch,
         base_logits_ready_tid, step_2_tid, pl.cast(3, pl.INT32)
     )
     step_4_tid = greedy_markov_step(
         head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
         markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_probs,
+        draft_token_scratch, confidence_scratch,
         base_logits_ready_tid, step_3_tid, pl.cast(4, pl.INT32)
     )
     step_5_tid = greedy_markov_step(
         head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
         markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_probs,
+        draft_token_scratch, confidence_scratch,
         base_logits_ready_tid, step_4_tid, pl.cast(5, pl.INT32)
     )
     step_6_tid = greedy_markov_step(
         head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
         markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_probs,
+        draft_token_scratch, confidence_scratch,
         base_logits_ready_tid, step_5_tid, pl.cast(6, pl.INT32)
     )
     with pl.at(
@@ -514,6 +518,11 @@ def sample_from_base_logits(
                     draft_token_ids,
                     [request, output_step],
                     pl.read(draft_token_scratch, [request, output_step]),
+                )
+                pl.write(
+                    confidence_probs,
+                    [request, output_step],
+                    pl.read(confidence_scratch, [request, output_step]),
                 )
     return draft_token_ids, confidence_probs
 
