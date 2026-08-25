@@ -349,13 +349,15 @@ def greedy_markov_step(
             confidence_prob,
             [CONFIDENCE_PAD, 1],
         )
-        confidence_tile = pl.load(
+        confidence_column = pl.set_validshape(
             confidence_column,
-            [0, 0],
-            [CONFIDENCE_PAD, 1],
-            valid_shape=[valid_rows, 1],
+            valid_rows,
+            1,
         )
-        pl.store(confidence_tile, [request_base, step], confidence_probs)
+        confidence_probs[
+            request_base : request_base + CONFIDENCE_PAD,
+            step : step + 1,
+        ] = confidence_column
 
     with pl.spmd(
         MARKOV_M_TILE,
