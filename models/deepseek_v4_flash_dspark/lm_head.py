@@ -517,33 +517,6 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     ]
 
 
-def _compare_logits_rank_layout(actual, expected, **_):
-    """Temporarily map each output row and vocabulary shard to its source row."""
-    import torch
-
-    active = int(torch.count_nonzero(expected[1].abs().amax(dim=-1)))
-    references = expected[:, :active].reshape(TP_SIZE * active, VOCAB)
-    lines = []
-    for output_rank in range(TP_SIZE):
-        for vocab_rank in range(TP_SIZE):
-            lo = vocab_rank * VOCAB_PER_TP
-            hi = lo + VOCAB_PER_TP
-            sampled_actual = actual[output_rank, :active, lo:hi:64]
-            sampled_references = references[:, lo:hi:64]
-            errors = (sampled_actual[:, None, :] - sampled_references[None, :, :]).abs().mean(dim=-1)
-            best_error, best_flat_row = errors.min(dim=1)
-            mappings = []
-            for output_row in range(active):
-                source_flat_row = int(best_flat_row[output_row])
-                source_rank = source_flat_row // active
-                source_row = source_flat_row % active
-                mappings.append(
-                    f"{output_row}->{source_rank}:{source_row}({float(best_error[output_row]):.6f})"
-                )
-            lines.append(f"out_rank={output_rank} vocab_rank={vocab_rank}: " + " ".join(mappings))
-    return False, "\n".join(lines)
-
-
 if __name__ == "__main__":
     import argparse
     from golden import run_jit
@@ -577,7 +550,6 @@ if __name__ == "__main__":
         fn=fn,
         specs=specs,
         golden_fn=golden_fn,
-        compare_fn={"logits": _compare_logits_rank_layout},
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
