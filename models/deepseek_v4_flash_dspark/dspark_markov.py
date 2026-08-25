@@ -291,7 +291,8 @@ def greedy_markov_step(
         name_hint="dspark_confidence_head",
         deps=[markov_embedding_tid],
     ) as confidence_tid:
-        for confidence_block in pl.range(confidence_blocks):
+        confidence_worker = pl.tile.get_block_idx()
+        for confidence_block in pl.range(confidence_worker, confidence_blocks):
             request_base = confidence_block * CONFIDENCE_PAD
             valid_rows = pl.min(CONFIDENCE_PAD, batch - request_base)
             confidence_logit = pl.full(
