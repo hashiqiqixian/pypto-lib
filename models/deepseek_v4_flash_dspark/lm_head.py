@@ -251,7 +251,7 @@ def lm_head(
         vocab_base = tp_rank * VOCAB_PER_TP
         for owner_tp in pl.range(TP_SIZE):
             source_row_base = owner_tp * MAX_LOGIT_ROWS
-            owner_logits = pl.slice(
+            owner_logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB_PER_TP], pl.FP32] = pl.slice(
                 logits_shards,
                 [MAX_LOGIT_ROWS, VOCAB_PER_TP],
                 [source_row_base, 0],
