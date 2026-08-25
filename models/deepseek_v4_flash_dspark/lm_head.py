@@ -251,6 +251,11 @@ def lm_head(
         vocab_base = tp_rank * VOCAB_PER_TP
         for owner_tp in pl.range(TP_SIZE):
             source_row_base = owner_tp * MAX_LOGIT_ROWS
+            owner_logits = pl.slice(
+                logits_shards,
+                [MAX_LOGIT_ROWS, VOCAB_PER_TP],
+                [source_row_base, 0],
+            )
             for output_block in pl.range(
                 push_block,
                 N_LOGITS_COMM_TILES,
@@ -260,10 +265,12 @@ def lm_head(
                 pld.tensor.put(
                     dst=logits_window,
                     peer=group_base + owner_tp,
-                    src=logits_shards,
+                    src=owner_logits,
                     dst_offsets=[0, vocab_base + output_offset],
-                    src_offsets=[source_row_base, output_offset],
+                    src_offsets=[0, output_offset],
                     shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TILE],
+                    chunk_rows=LOGITS_GATHER_ROW_TILE,
+                    chunk_cols=LOGITS_COMM_TILE,
                 )
 
             if LOGITS_COMM_TAIL != 0:
@@ -272,10 +279,12 @@ def lm_head(
                     pld.tensor.put(
                         dst=logits_window,
                         peer=group_base + owner_tp,
-                        src=logits_shards,
+                        src=owner_logits,
                         dst_offsets=[0, vocab_base + tail_offset],
-                        src_offsets=[source_row_base, tail_offset],
+                        src_offsets=[0, tail_offset],
                         shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TAIL],
+                        chunk_rows=LOGITS_GATHER_ROW_TILE,
+                        chunk_cols=LOGITS_COMM_TAIL,
                     )
 
         for owner_tp in pl.range(TP_SIZE):
