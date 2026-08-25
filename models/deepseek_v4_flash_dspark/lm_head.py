@@ -309,8 +309,6 @@ def lm_head(
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    logits_window_2d = pl.reshape(logits_window, [MAX_LOGIT_ROWS, VOCAB])
-
     # Assemble full-vocabulary logits, same vocab-tile split. deps on _cwait_tid for
     # the peers' stores; our own tiles ride the local RAW edge on logits_window.
     with pl.spmd(
@@ -323,18 +321,24 @@ def lm_head(
                 o0 = ob * LOGITS_COMM_TILE
                 lo = src_vocab_base + o0
                 for gr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                    logits[gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE] = logits_window_2d[
-                        gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE
-                    ]
+                    for row_lane in pl.unroll(8):
+                        row = gr + row_lane
+                        flat_offset = row * VOCAB + lo
+                        flat_logits = pl.load(logits_window, [flat_offset], [LOGITS_COMM_TILE])
+                        logits_row = pl.reshape(flat_logits, [1, LOGITS_COMM_TILE])
+                        pl.store(logits_row, [row, lo], logits)
 
             if LOGITS_COMM_TAIL != 0:
                 if gblk == LOGITS_TAIL_BLOCK:
                     tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
                     tl = src_vocab_base + tail_o0
                     for tr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                        logits[tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL] = logits_window_2d[
-                            tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL
-                        ]
+                        for tail_lane in pl.unroll(8):
+                            tail_row = tr + tail_lane
+                            tail_flat_offset = tail_row * VOCAB + tl
+                            flat_tail = pl.load(logits_window, [tail_flat_offset], [LOGITS_COMM_TAIL])
+                            tail_logits_row = pl.reshape(flat_tail, [1, LOGITS_COMM_TAIL])
+                            pl.store(tail_logits_row, [tail_row, tl], logits)
 
     # Every local wait has observed all current-round peer notifies before the
     # logits gather can complete. Clear only this rank's counters so a retained
