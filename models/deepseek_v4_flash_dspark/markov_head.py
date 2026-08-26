@@ -37,7 +37,12 @@ def markov_head(
     t_dim = pl.tensor.dim(token_ids, 0)
     t_linear = ((t_dim + T_TILE - 1) // T_TILE) * T_TILE
 
-    for token_idx in pl.spmd(t_dim, name_hint="markov_embedding", allow_early_resolve=True):
+    with pl.spmd(
+        t_dim,
+        name_hint="markov_embedding",
+        allow_early_resolve=True,
+    ) as embedding_tid:
+        token_idx = pl.tile.get_block_idx()
         token_id = pl.read(token_ids, [token_idx])
         token_row = pl.cast(token_id, target_type=pl.INDEX)
         markov_embed[token_idx : token_idx + 1, 0:MARKOV_RANK] = markov_w1[
@@ -46,7 +51,12 @@ def markov_head(
 
     vocab_dim = pl.tensor.dim(markov_w2, 0)
     work_items = (t_linear // T_TILE) * (vocab_dim // VOCAB_TILE)
-    for block in pl.spmd(SPMD_BLOCKS, name_hint="markov_logits"):
+    with pl.spmd(
+        SPMD_BLOCKS,
+        name_hint="markov_logits",
+        deps=[embedding_tid],
+    ) as logits_tid:
+        block = pl.tile.get_block_idx()
         for work_idx in pl.range(block, work_items, SPMD_BLOCKS):
             t0 = (work_idx // (vocab_dim // VOCAB_TILE)) * T_TILE
             vocab0 = (work_idx % (vocab_dim // VOCAB_TILE)) * VOCAB_TILE
@@ -59,7 +69,7 @@ def markov_head(
             logits_valid = pl.set_validshape(logits_tile, valid_rows, VOCAB_TILE)
             logits_bias[t0 : t0 + T_TILE, vocab0 : vocab0 + VOCAB_TILE] = logits_valid
 
-    return logits_bias, markov_embed
+    return logits_bias, markov_embed, embedding_tid, logits_tid
 
 
 @pl.jit
@@ -76,7 +86,14 @@ def markov_head_test(
     logits_bias.bind_dynamic(0, T_DYN)
     logits_bias.bind_dynamic(1, VOCAB_DYN)
     markov_embed.bind_dynamic(0, T_DYN)
-    return markov_head(token_ids, markov_w1, markov_w2, logits_bias, markov_embed)
+    logits_bias, markov_embed, _, _ = markov_head(
+        token_ids,
+        markov_w1,
+        markov_w2,
+        logits_bias,
+        markov_embed,
+    )
+    return logits_bias, markov_embed
 
 
 def golden_markov_head(tensors):
