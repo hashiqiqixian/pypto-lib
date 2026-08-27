@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2
+# ci: devices=4
 """Validate DSpark prompt-context KV insertion followed by the seven-query drafter."""
 
 from pypto.ir.distributed_compiled_program import DistributedConfig
@@ -28,7 +28,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Validate DeepSeek V4 DSpark prompt prefill and drafting.")
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
-    parser.add_argument("--ep", type=int, choices=(2, 4, 8, 16), default=2)
+    parser.add_argument("--tp", type=int, choices=(4,), default=4)
+    parser.add_argument("--ep", type=int, choices=(4, 8, 16), default=N_RANKS)
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)))
     parser.add_argument("--compile-only", action="store_true")
@@ -36,6 +37,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device_ids = [int(device) for device in args.device.split(",")]
+    assert args.tp == 4
     assert args.ep == N_RANKS
     assert len(device_ids) >= N_RANKS
     result = run_jit(
