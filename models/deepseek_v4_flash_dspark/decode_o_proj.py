@@ -17,7 +17,9 @@ import config
 # TP-derived shapes freeze at import time, so select the TP world before the
 # config read below.
 _TP_CHOICES = (1, 2, 4)
-_TP_DEFAULT = 2
+# Keep the established two-card standalone harness while allowing an importing
+# model entrypoint to select its own TP world before this module freezes shapes.
+_TP_DEFAULT = 2 if __name__ == "__main__" else config.TP
 
 
 def _parse_tp_argv():

@@ -18,7 +18,9 @@ import sys
 import config
 
 _EP_CHOICES = (2, 4, 8, 16)
-_EP_DEFAULT = 2
+# Keep the established two-card standalone harness while allowing an importing
+# model entrypoint to select its own EP world before this module freezes shapes.
+_EP_DEFAULT = 2 if __name__ == "__main__" else config.EP
 
 
 def _parse_ep_argv():
