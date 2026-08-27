@@ -35,7 +35,6 @@ from config import (
     BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
-    DECODE_TOKENS,
     FLASH as M,
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
@@ -378,7 +377,7 @@ def draft_layer(
     attention_local_flat = pl.create_tensor(
         [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16
     )
-    attention_local_flat, attention_signal = o_group_a2a(
+    attention_local_flat, _attention_signal = o_group_a2a(
         attention_grouped,
         attention_local_flat,
         attention_window,
@@ -392,7 +391,7 @@ def draft_layer(
         [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
     )
     o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-    o_local, o_signal = decode_sharded_o_projection_reduce_scatter(
+    o_local, _o_signal = decode_sharded_o_projection_reduce_scatter(
         attention_local_groups,
         layer_wo_a,
         layer_wo_b,
@@ -435,7 +434,7 @@ def draft_layer(
         arrived, data_arrived, routed_y_buf, combine_arrived,
         layer_id, active_tokens, my_rank, moe_epoch,
     )
-    return output_hc, attention_signal, o_signal
+    return output_hc
 
 @pl.jit
 def dspark_drafter(
@@ -528,7 +527,7 @@ def dspark_drafter(
     head_hidden.bind_dynamic(0, B_DYN)
     batch = pl.tensor.dim(num_sampled, 0)
     target_tokens = pl.tensor.dim(target_hidden, 0)
-    active_tokens = batch * DSPARK_QUERY_WIDTH
+    active_tokens = pl.cast(batch * DSPARK_QUERY_WIDTH, pl.INT32)
 
     kv_cache_0 = kv_caches[0]
     kv_cache_1 = kv_caches[1]
@@ -594,7 +593,7 @@ def dspark_drafter(
     swa_lens_1 = swa_lens[1]
     swa_lens_2 = swa_lens[2]
     hidden_1 = intermediate_hidden[0]
-    hidden_1, attention_signal, o_signal = draft_layer(
+    hidden_1 = draft_layer(
         initial_hidden, pl.const(0, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
@@ -609,11 +608,11 @@ def dspark_drafter(
         shared_w2, shared_w2_scale,
         hidden_1, attention_window, attention_signal, o_window, o_signal, group_base, tp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-        pl.const(40, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(1, pl.INT32),
+        pl.const(40, pl.INT32), active_tokens, my_rank, pl.const(1, pl.INT32),
     )
 
     hidden_2 = intermediate_hidden[1]
-    hidden_2, attention_signal, o_signal = draft_layer(
+    hidden_2 = draft_layer(
         hidden_1, pl.const(1, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
@@ -628,11 +627,11 @@ def dspark_drafter(
         shared_w2, shared_w2_scale,
         hidden_2, attention_window, attention_signal, o_window, o_signal, group_base, tp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-        pl.const(41, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(2, pl.INT32),
+        pl.const(41, pl.INT32), active_tokens, my_rank, pl.const(2, pl.INT32),
     )
 
     hidden_3 = intermediate_hidden[2]
-    hidden_3, attention_signal, o_signal = draft_layer(
+    hidden_3 = draft_layer(
         hidden_2, pl.const(2, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
@@ -647,7 +646,7 @@ def dspark_drafter(
         shared_w2, shared_w2_scale,
         hidden_3, attention_window, attention_signal, o_window, o_signal, group_base, tp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-        pl.const(42, pl.INT32), pl.cast(active_tokens, pl.INT32), my_rank, pl.const(3, pl.INT32),
+        pl.const(42, pl.INT32), active_tokens, my_rank, pl.const(3, pl.INT32),
     )
     clear_moe_signals(hidden_3, arrived, data_arrived, combine_arrived)
 
