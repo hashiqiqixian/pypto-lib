@@ -49,7 +49,10 @@ LM_M_TILE = 16
 LM_N_TILE = 128
 LM_K_TILE = 256
 MARKOV_M_TILE = DSPARK_MAX_BATCH
-MARKOV_ID_PAD = 8
+# Scalar stores reach DDR one 64-byte cache line at a time.  Keep each
+# request's INT32 token scratch on its own line so concurrent request blocks
+# cannot overwrite a neighbouring row.
+MARKOV_ID_PAD = 16
 CONFIDENCE_PAD = 8
 GREEDY_VOCAB_CHUNK = 256
 GREEDY_NUM_CHUNKS = VOCAB // GREEDY_VOCAB_CHUNK
