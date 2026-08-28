@@ -16,6 +16,7 @@ from config import FLASH as M
 from lm_head import (
     DONE_VALUE,
     GROUP_LOGIT_ROWS,
+    LM_HEAD_RING_HEAP,
     MAX_LOGIT_ROWS,
     TP_SIZE,
     VOCAB_PER_TP,
@@ -49,7 +50,10 @@ LM_M_TILE = 16
 LM_N_TILE = 128
 LM_K_TILE = 256
 MARKOV_M_TILE = DSPARK_MAX_BATCH
-MARKOV_ID_PAD = 8
+# Scalar stores reach DDR one 64-byte cache line at a time.  Keep each
+# request's INT32 token scratch on its own line so concurrent request blocks
+# cannot overwrite a neighbouring row.
+MARKOV_ID_PAD = 16
 CONFIDENCE_PAD = 8
 GREEDY_VOCAB_CHUNK = 256
 GREEDY_NUM_CHUNKS = VOCAB // GREEDY_VOCAB_CHUNK
@@ -975,7 +979,7 @@ if __name__ == "__main__":
     assert args.tp == TP_SIZE
     assert args.dp * args.tp == WORLD_SIZE
     compile_cfg = dict(dump_passes=args.dump_passes)
-    runtime_cfg = dict(platform=args.platform)
+    runtime_cfg = dict(platform=args.platform, ring_heap=LM_HEAD_RING_HEAP)
     fn = markov_sample
     golden_fn = golden_nonzero_markov
     if args.distributed:
