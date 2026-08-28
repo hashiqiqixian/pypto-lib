@@ -503,7 +503,8 @@ def o_proj_reduce_scatter(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_a_quant", deps=[proj_a_tid]) as quant_tid:
             for qt in pl.pipeline(0, group_t, QUANT_T_TILE, stage=2):
                 quant_rows = pl.min(QUANT_T_TILE, group_t - qt)
-                o_a_tile = pl.slice(o_a_fp32, [QUANT_T_TILE, O_LORA], [qt, o_a_col], valid_shape=[quant_rows, O_LORA])
+                # Keep the narrowing-cast input static; row-wise ops do not mix the capacity tail into valid rows.
+                o_a_tile = pl.slice(o_a_fp32, [QUANT_T_TILE, O_LORA], [qt, o_a_col])
                 o_a_abs = pl.abs(o_a_tile)
                 row_amax = pl.reshape(pl.row_max(o_a_abs), [1, QUANT_T_TILE])
                 amax_floor = pl.full([1, QUANT_T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
