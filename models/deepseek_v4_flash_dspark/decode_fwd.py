@@ -60,6 +60,7 @@ import pypto.language.distributed as pld
 from decode_csa import decode_csa, decode_csa_tp1
 from decode_hca import decode_hca, decode_hca_tp1
 from decode_swa import decode_swa, decode_swa_tp1
+from dspark_proj import MAIN_HIDDEN_DIM, capture_dspark_target_hidden
 from hc_head import hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
@@ -340,6 +341,7 @@ def decode_fwd(
     x_attn_active: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     x_moe_next: pl.InOut[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    target_hidden: pl.Out[pl.Tensor[[T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
@@ -862,6 +864,9 @@ def decode_fwd(
                             token : token + 1, 0 : HC_MULT, 0 : D,
                         ]
 
+    capture_dspark_target_hidden(x_pong, target_hidden, pl.const(0, pl.INT32))
+    capture_dspark_target_hidden(x_ping, target_hidden, pl.const(1, pl.INT32))
+
     with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)
         model_layer_last = pl.const(42, pl.INT32)
@@ -1001,6 +1006,7 @@ def decode_fwd(
                     pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
                         token : token + 1, 0 : HC_MULT, 0 : D,
                     ]
+            capture_dspark_target_hidden(pre_hc_hidden_out, target_hidden, pl.const(2, pl.INT32))
     clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
 
     with pl.scope():
@@ -1128,6 +1134,7 @@ def l3_decode_fwd(
     x_attn_active: pl.InOut[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
     x_moe_next: pl.InOut[pl.Tensor[[N_RANKS, MOE_TOKENS, HC_MULT, D], pl.FP32]],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
+    target_hidden: pl.Out[pl.Tensor[[N_RANKS, T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[N_RANKS, T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
@@ -1177,6 +1184,7 @@ def l3_decode_fwd(
     x_pong.bind_dynamic(1, T_DYN)
     x_attn_active.bind_dynamic(1, T_DYN)
     pre_hc_hidden_out.bind_dynamic(1, T_DYN)
+    target_hidden.bind_dynamic(1, T_DYN)
     x_out.bind_dynamic(1, T_DYN)
 
     attention_window_buf = pld.alloc_window_buffer([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
@@ -1265,7 +1273,7 @@ def l3_decode_fwd(
             hidden_workspace[rank],
             x_ping[rank], x_pong[rank],
             x_attn_active[rank], x_moe_next[rank],
-            pre_hc_hidden_out[rank], x_out[rank], logits[rank],
+            pre_hc_hidden_out[rank], target_hidden[rank], x_out[rank], logits[rank],
             sampled_ids[rank],
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route,
@@ -1548,6 +1556,9 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
         ),
         "pre_hc_hidden_out": TensorSpec(
             "pre_hc_hidden_out", [N_RANKS, local_t, HC_MULT, D], torch.float32, is_output=True,
+        ),
+        "target_hidden": TensorSpec(
+            "target_hidden", [N_RANKS, local_t, MAIN_HIDDEN_DIM], torch.bfloat16, is_output=True,
         ),
         "x_out": TensorSpec("x_out", [N_RANKS, local_t, D], torch.bfloat16, is_output=True),
         "logits": TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True),

@@ -24,6 +24,7 @@ T_DYN = pl.dynamic("DSPARK_PROJ_T_DYN")
 
 # model config
 D = M.hidden_size
+HC_MULT = M.hc_mult
 TARGET_LAYERS = 3                        # dspark_target_layer_ids
 MAIN_HIDDEN_DIM = TARGET_LAYERS * D
 
@@ -31,6 +32,42 @@ MAIN_HIDDEN_DIM = TARGET_LAYERS * D
 T_TILE = 16                              # cube M-tile; matmul rows must be a multiple of 16
 N_TILE = 128                             # 32 output blocks over D
 K_TILE = 512                             # 24 reduction steps over MAIN_HIDDEN_DIM
+CAPTURE_D_TILE = 512                     # vector tile used to average the HC streams
+
+
+@pl.jit.inline
+def capture_dspark_target_hidden(
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    target_hidden: pl.Tensor[[T_DYN, MAIN_HIDDEN_DIM], pl.BF16],
+    target_layer_slot: pl.Scalar[pl.INT32],
+):
+    """Store one post-layer HC state in the DSpark target-hidden contract.
+
+    DeepSeek-V4 reconstructs four HC streams after every transformer layer.
+    DSpark follows the upstream target-model contract: average those streams
+    and concatenate the selected layer-40/41/42 rows along the hidden axis.
+    """
+    t_dim = pl.tensor.dim(x_hc, 0)
+    x_flat = pl.reshape(x_hc, [t_dim, HC_MULT * D])
+    target_d0 = target_layer_slot * D
+    for tile in pl.spmd(
+        t_dim * (D // CAPTURE_D_TILE),
+        name_hint="dspark_target_hidden_capture",
+        allow_early_resolve=True,
+    ):
+        token = tile // (D // CAPTURE_D_TILE)
+        d0 = (tile % (D // CAPTURE_D_TILE)) * CAPTURE_D_TILE
+        stream_0 = x_flat[token : token + 1, d0 : d0 + CAPTURE_D_TILE]
+        stream_1 = x_flat[token : token + 1, D + d0 : D + d0 + CAPTURE_D_TILE]
+        stream_2 = x_flat[token : token + 1, 2 * D + d0 : 2 * D + d0 + CAPTURE_D_TILE]
+        stream_3 = x_flat[token : token + 1, 3 * D + d0 : 3 * D + d0 + CAPTURE_D_TILE]
+        stream_sum = pl.add(pl.add(stream_0, stream_1), pl.add(stream_2, stream_3))
+        stream_mean = pl.cast(pl.mul(stream_sum, 1.0 / HC_MULT), target_type=pl.BF16, mode="rint")
+        target_hidden[
+            token : token + 1,
+            target_d0 + d0 : target_d0 + d0 + CAPTURE_D_TILE,
+        ] = stream_mean
+    return target_hidden
 
 
 @pl.jit.inline

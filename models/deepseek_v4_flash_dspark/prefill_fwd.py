@@ -18,6 +18,8 @@ import pypto.language.distributed as pld
 from golden import run_jit
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
+from dspark_proj import MAIN_HIDDEN_DIM, capture_dspark_target_hidden
+
 from moe import (
     AUX_PAD,
     D,
@@ -240,6 +242,7 @@ def mask_inactive_sample_rows(
 @pl.jit(auto_scope=False)
 def prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    target_hidden: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -708,6 +711,8 @@ def prefill_fwd(
                     gather_window, gather_signal,
                     group_base, tp_rank, csa_layer, my_rank,
                 )
+                if pair_order == HCA_NUM_LAYERS - 1:
+                    capture_dspark_target_hidden(x_hc, target_hidden, pl.const(0, pl.INT32))
 
         with pl.scope():
             hca_layer = attention_order * 2 + pl.const(3, pl.INT32)
@@ -819,6 +824,8 @@ def prefill_fwd(
                     gather_window, gather_signal,
                     group_base, tp_rank, hca_layer, my_rank,
                 )
+                if pair_order == HCA_NUM_LAYERS - 1:
+                    capture_dspark_target_hidden(x_hc, target_hidden, pl.const(1, pl.INT32))
 
     # Layer 42: CSA order 20.
     with pl.scope():
@@ -969,6 +976,7 @@ def prefill_fwd(
                 gather_window, gather_signal,
                 group_base, tp_rank, layer_last, my_rank,
             )
+            capture_dspark_target_hidden(x_hc, target_hidden, pl.const(2, pl.INT32))
 
     with pl.scope():
         clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
@@ -1000,6 +1008,7 @@ def prefill_fwd(
 @pl.jit.host
 def l3_prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    target_hidden: pl.Out[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -1096,6 +1105,7 @@ def l3_prefill_fwd(
 ):
     """Run layer-major DSA-CP with replicated boundaries, token-local compute, and a TP LM head."""
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    target_hidden.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     hidden_workspace.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     x_out.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     attn_stage.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
@@ -1160,6 +1170,7 @@ def l3_prefill_fwd(
         lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         prefill_fwd(
             x_hc[r],
+            target_hidden[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
             attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r],
             wkv[r], gamma_cq[r], gamma_ckv[r],
@@ -1567,6 +1578,7 @@ def build_tensor_specs(
 
     ordered_names = [
         "x_hc",
+        "target_hidden",
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
         "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
         "kv_cache", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
@@ -1620,6 +1632,15 @@ def build_tensor_specs(
                 return (global_x[group_ids] * 0.05).to(dtype).contiguous()
 
             specs.append(TensorSpec(name, x_hc_shape, base.dtype, init_value=init_x_hc, is_output=True))
+        elif name == "target_hidden":
+            specs.append(
+                TensorSpec(
+                    name,
+                    [N_RANKS, num_tokens, MAIN_HIDDEN_DIM],
+                    torch.bfloat16,
+                    is_output=True,
+                )
+            )
         elif name == "position_ids_local":
             local_tokens = num_tiles * T
             dtype = base_specs[name].dtype
