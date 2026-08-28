@@ -127,6 +127,10 @@ if O_RS_PUBLISH_WORKERS % TP_SIZE != 0:
     raise ValueError(f"TP size {TP_SIZE} must divide O-B publish workers {O_RS_PUBLISH_WORKERS}")
 if GROUP_T_PAD % O_B_T_TILE != 0:
     raise ValueError(f"O-B token tile {O_B_T_TILE} must divide token capacity {GROUP_T_PAD}")
+if (TP_SIZE * config.DECODE_SEQ) % QUANT_T_TILE != 0:
+    raise ValueError(
+        f"TP request stride {TP_SIZE * config.DECODE_SEQ} must be divisible by quant tile {QUANT_T_TILE}"
+    )
 if T_PAD % PROJ_B_MM_T_TILE != 0:
     raise ValueError(
         f"proj_b_mm token tile {PROJ_B_MM_T_TILE} must divide token capacity {T_PAD}"
@@ -504,8 +508,13 @@ def o_proj_reduce_scatter(
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_a_quant", deps=[proj_a_tid]) as quant_tid:
             for qt in pl.pipeline(0, group_t, QUANT_T_TILE, stage=2):
-                quant_rows = pl.min(QUANT_T_TILE, group_t - qt)
-                o_a_tile = pl.slice(o_a_fp32, [QUANT_T_TILE, O_LORA], [qt, o_a_col], valid_shape=[quant_rows, O_LORA])
+                quant_rows = QUANT_T_TILE
+                o_a_tile = pl.slice(
+                    o_a_fp32,
+                    [QUANT_T_TILE, O_LORA],
+                    [qt, o_a_col],
+                    valid_shape=[QUANT_T_TILE, O_LORA],
+                )
                 o_a_abs = pl.abs(o_a_tile)
                 row_amax = pl.reshape(pl.row_max(o_a_abs), [1, QUANT_T_TILE])
                 amax_floor = pl.full([1, QUANT_T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
