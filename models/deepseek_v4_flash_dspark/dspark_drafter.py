@@ -53,8 +53,8 @@ from decode_o_proj import (
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
     TP_SIZE,
-    decode_sharded_o_projection_reduce_scatter,
     o_group_a2a,
+    o_proj_reduce_scatter,
 )
 from hc_head import hc_head
 from hc_post import hc_post_prefill
@@ -391,7 +391,7 @@ def draft_layer(
         [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
     )
     o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-    o_local, _o_signal = decode_sharded_o_projection_reduce_scatter(
+    o_local, _o_signal = o_proj_reduce_scatter(
         attention_local_groups,
         layer_wo_a,
         layer_wo_b,
