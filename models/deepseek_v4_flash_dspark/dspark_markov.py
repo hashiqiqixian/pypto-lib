@@ -16,6 +16,7 @@ from config import FLASH as M
 from lm_head import (
     DONE_VALUE,
     GROUP_LOGIT_ROWS,
+    LM_HEAD_RING_HEAP,
     MAX_LOGIT_ROWS,
     TP_SIZE,
     VOCAB_PER_TP,
@@ -978,7 +979,7 @@ if __name__ == "__main__":
     assert args.tp == TP_SIZE
     assert args.dp * args.tp == WORLD_SIZE
     compile_cfg = dict(dump_passes=args.dump_passes)
-    runtime_cfg = dict(platform=args.platform)
+    runtime_cfg = dict(platform=args.platform, ring_heap=LM_HEAD_RING_HEAP)
     fn = markov_sample
     golden_fn = golden_nonzero_markov
     if args.distributed:
