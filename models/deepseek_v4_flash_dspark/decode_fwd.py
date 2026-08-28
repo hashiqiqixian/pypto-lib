@@ -752,8 +752,6 @@ def decode_fwd(
                         x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
                             token : token + 1, 0 : HC_MULT, 0 : D,
                         ]
-                if ordinal == HCA_LAYER_COUNT - 1:
-                    capture_dspark_target_hidden(x_pong, target_hidden, pl.const(0, pl.INT32))
 
         with pl.scope():
             hc_attn_fn_layer_hca = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_weight_layer * HC_FN_STORAGE_ROWS, 0])
@@ -865,8 +863,9 @@ def decode_fwd(
                         x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
                             token : token + 1, 0 : HC_MULT, 0 : D,
                         ]
-                if ordinal == HCA_LAYER_COUNT - 1:
-                    capture_dspark_target_hidden(x_ping, target_hidden, pl.const(1, pl.INT32))
+
+    capture_dspark_target_hidden(x_pong, target_hidden, pl.const(0, pl.INT32))
+    capture_dspark_target_hidden(x_ping, target_hidden, pl.const(1, pl.INT32))
 
     with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)

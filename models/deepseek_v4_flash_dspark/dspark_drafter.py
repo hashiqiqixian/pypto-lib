@@ -46,15 +46,17 @@ from dspark_attention import dspark_attention
 from dspark_context_kv import dspark_context_kv
 from dspark_proj import dspark_proj
 from decode_o_proj import (
+    ATTENTION_PUBLISH_WORKERS,
     ATTENTION_WINDOW_ROWS,
+    COMM_ROW_TILE,
     GROUP_T_PAD,
     LOCAL_O_GROUPS,
     LOCAL_O_WIDTH,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
     TP_SIZE,
-    decode_sharded_o_projection_reduce_scatter,
     o_group_a2a,
+    o_proj_reduce_scatter,
 )
 from hc_head import hc_head
 from hc_post import hc_post_prefill
@@ -377,21 +379,53 @@ def draft_layer(
     attention_local_flat = pl.create_tensor(
         [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16
     )
+    with pl.spmd(
+        ATTENTION_PUBLISH_WORKERS,
+        name_hint="dspark_o_group_publish",
+    ) as attention_publish_tid:
+        worker = pl.tile.get_block_idx()
+        for global_group in pl.range(worker, O_GROUPS, ATTENTION_PUBLISH_WORKERS):
+            destination_rank = global_group // LOCAL_O_GROUPS
+            local_group = global_group - destination_rank * LOCAL_O_GROUPS
+            source_row = global_group * LOCAL_T_PAD
+            target_row = local_group * GROUP_T_PAD + tp_rank * active_tokens
+            pld.tensor.put(
+                dst=attention_window,
+                peer=group_base + destination_rank,
+                src=attention_grouped,
+                dst_offsets=[target_row, 0],
+                src_offsets=[source_row, 0],
+                shape=[active_tokens, O_GROUP_IN],
+                chunk_rows=COMM_ROW_TILE,
+                chunk_cols=O_GROUP_IN,
+            )
+
+        for destination_rank in pl.range(TP_SIZE):
+            if destination_rank != tp_rank:
+                pld.system.notify(
+                    target=attention_signal,
+                    peer=group_base + destination_rank,
+                    offsets=[tp_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+
     attention_local_flat, _attention_signal = o_group_a2a(
-        attention_grouped,
         attention_local_flat,
         attention_window,
         attention_signal,
         group_base,
         tp_rank,
         active_tokens,
+        attention_publish_tid,
+        ATTENTION_PUBLISH_WORKERS,
     )
     attention_local_groups = pl.reshape(
         attention_local_flat,
         [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN],
     )
     o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-    o_local, _o_signal = decode_sharded_o_projection_reduce_scatter(
+    o_local, _o_signal = o_proj_reduce_scatter(
         attention_local_groups,
         layer_wo_a,
         layer_wo_b,
