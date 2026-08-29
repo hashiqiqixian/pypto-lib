@@ -998,6 +998,7 @@ def decode_fwd(
 
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
+        dspark_target_hidden = pl.assemble(dspark_target_hidden, hidden_workspace, [0, 2 * D])
         final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
         lm_head(
             x_out,
