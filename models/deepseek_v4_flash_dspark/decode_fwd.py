@@ -60,6 +60,7 @@ import pypto.language.distributed as pld
 from decode_csa import decode_csa, decode_csa_tp1
 from decode_hca import decode_hca, decode_hca_tp1
 from decode_swa import decode_swa_attention
+from dspark_proj import MAIN_HIDDEN_DIM, TARGET_LAYER_IDS
 from hc_head import hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
@@ -166,6 +167,8 @@ def _validate_import_contract():
         raise ValueError(f"MoE world size {N_RANKS} does not match EP={EP_SIZE}")
     if MAIN_LAYER_COUNT != 43:
         raise ValueError(f"D-Spark decode forward expects 43 layers, got {MAIN_LAYER_COUNT}")
+    if TARGET_LAYER_IDS != tuple(range(MAIN_LAYER_COUNT - len(TARGET_LAYER_IDS), MAIN_LAYER_COUNT)):
+        raise ValueError(f"D-Spark target layers must be the final three layers: {TARGET_LAYER_IDS}")
     if MODEL_CONFIG.vocab_size % TP_SIZE:
         raise ValueError(f"vocab size {MODEL_CONFIG.vocab_size} must be divisible by TP={TP_SIZE}")
     if LM_HEAD_TP_SIZE != TP_SIZE:
@@ -344,6 +347,7 @@ def decode_fwd(
     x_attn_active: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     x_moe_next: pl.InOut[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
@@ -373,6 +377,7 @@ def decode_fwd(
     embed_weight.bind_dynamic(0, EMBED_VOCAB_DYN)
     input_ids.bind_dynamic(0, T_DYN)
     hidden_workspace.bind_dynamic(0, T_DYN)
+    dspark_target_hidden.bind_dynamic(0, T_DYN)
     x_ping.bind_dynamic(0, T_DYN)
     raw_kv_pool.bind_dynamic(0, FWD_PACKED_RAW_BLOCKS_DYN)
     freqs_cos.bind_dynamic(0, T_DYN)
@@ -851,6 +856,14 @@ def decode_fwd(
                         ]
 
     with pl.scope():
+        target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
+        hc_head(x_pong, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
+
+    with pl.scope():
+        target_hidden_l41 = pl.slice(dspark_target_hidden, [local_t, D], [0, D])
+        hc_head(x_ping, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l41)
+
+    with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)
         model_layer_last = pl.const(42, pl.INT32)
         weight_layer_last = model_layer_last % FWD_WEIGHT_BANK_SIZE
@@ -993,6 +1006,7 @@ def decode_fwd(
 
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
+        dspark_target_hidden = pl.assemble(dspark_target_hidden, hidden_workspace, [0, 2 * D])
         final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
         lm_head(
             x_out,
@@ -1118,6 +1132,7 @@ def l3_decode_fwd(
     x_attn_active: pl.InOut[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
     x_moe_next: pl.InOut[pl.Tensor[[N_RANKS, MOE_TOKENS, HC_MULT, D], pl.FP32]],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[N_RANKS, T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[N_RANKS, T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
@@ -1126,6 +1141,7 @@ def l3_decode_fwd(
     embed_weight.bind_dynamic(1, EMBED_VOCAB_DYN)
     input_ids.bind_dynamic(1, T_DYN)
     hidden_workspace.bind_dynamic(1, T_DYN)
+    dspark_target_hidden.bind_dynamic(1, T_DYN)
     x_ping.bind_dynamic(1, T_DYN)
     raw_kv_pool.bind_dynamic(1, FWD_PACKED_RAW_BLOCKS_DYN)
     freqs_cos.bind_dynamic(1, T_DYN)
@@ -1262,7 +1278,8 @@ def l3_decode_fwd(
             hidden_workspace[rank],
             x_ping[rank], x_pong[rank],
             x_attn_active[rank], x_moe_next[rank],
-            pre_hc_hidden_out[rank], x_out[rank], logits[rank],
+            pre_hc_hidden_out[rank], dspark_target_hidden[rank],
+            x_out[rank], logits[rank],
             sampled_ids[rank],
             gather_window, gather_signal,
             attention_window, attention_signal, o_window, o_signal,
@@ -1273,7 +1290,7 @@ def l3_decode_fwd(
             group_base, tp_rank, rank,
             device=rank,
         )
-    return x_out, logits, sampled_ids
+    return x_out, logits, sampled_ids, dspark_target_hidden
 
 
 _COMMON_ATTN_WEIGHT_NAMES = (
@@ -1556,6 +1573,9 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
         "pre_hc_hidden_out": TensorSpec(
             "pre_hc_hidden_out", [N_RANKS, local_t, HC_MULT, D], torch.float32, is_output=True,
         ),
+        "dspark_target_hidden": TensorSpec(
+            "dspark_target_hidden", [N_RANKS, local_t, MAIN_HIDDEN_DIM], torch.bfloat16, is_output=True,
+        ),
         "x_out": TensorSpec("x_out", [N_RANKS, local_t, D], torch.bfloat16, is_output=True),
         "logits": TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True),
         "sampled_ids": TensorSpec(
@@ -1611,6 +1631,64 @@ def _parse_start_pos(raw):
     if not values:
         raise ValueError("--start-pos must contain at least one integer")
     return values[0] if len(values) == 1 else values
+
+
+def golden_decode_fwd(_tensors):
+    """Leave full-forward outputs to output-specific behavioral comparators."""
+
+
+def finite_tensor_compare(actual, _expected, **_kwargs):
+    """Require a completed finite device result for full-forward state outputs."""
+    import torch
+
+    if actual.numel() == 0:
+        return False, "    decode forward output is empty"
+    if actual.is_floating_point() and not bool(torch.isfinite(actual).all()):
+        return False, "    decode forward output contains NaN or Inf"
+    return True, ""
+
+
+def dspark_target_hidden_compare(actual, _expected, **kwargs):
+    """Recompute layers 40/41 and compare layer 42 with its reused head output."""
+    import torch
+    from hc_head import golden_hc_head
+
+    inputs = kwargs.get("inputs", {})
+    outputs = kwargs.get("actual_outputs", {})
+    sources = (outputs.get("x_pong"), outputs.get("x_ping"))
+    hidden_workspace = outputs.get("hidden_workspace")
+    if any(source is None for source in sources) or hidden_workspace is None:
+        return False, "    missing layer-40/41 HC source or layer-42 head output"
+
+    for rank in range(actual.shape[0]):
+        expected_parts = []
+        for source in sources:
+            expected_part = torch.empty(source.shape[1], D, dtype=torch.bfloat16)
+            golden_hc_head({
+                "x_hc": source[rank].cpu(),
+                "hc_head_fn": inputs["hc_head_fn"][rank],
+                "hc_head_scale": inputs["hc_head_scale"][rank],
+                "hc_head_base": inputs["hc_head_base"][rank],
+                "y": expected_part,
+            })
+            expected_parts.append(expected_part)
+        expected_parts.append(hidden_workspace[rank].cpu())
+        expected_rank = torch.cat(expected_parts, dim=1).float()
+        actual_rank = actual[rank].float()
+        tolerance = 1e-4 + (1.0 / 128) * expected_rank.abs()
+        bad = (actual_rank - expected_rank).abs() > tolerance
+        ratio = float(bad.float().mean())
+        if ratio > 0.005:
+            worst = float((actual_rank - expected_rank).abs().max())
+            return False, f"    rank {rank} target hidden mismatch: ratio={ratio:.2%}, max |err|={worst:.3e}"
+    return True, ""
+
+
+def compare_functions(specs):
+    """Validate every output for completion and the DSpark tap mathematically."""
+    compare = {spec.name: finite_tensor_compare for spec in specs if spec.is_output}
+    compare["dspark_target_hidden"] = dspark_target_hidden_compare
+    return compare
 
 
 def main():
@@ -1672,6 +1750,7 @@ def main():
     result = run_jit(
         fn=l3_decode_fwd,
         specs=specs,
+        golden_fn=golden_decode_fwd,
         save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
@@ -1689,6 +1768,7 @@ def main():
         ),
         rtol=1e-2,
         atol=1e-2,
+        compare_fn=compare_functions(specs),
     )
     if not result.passed:
         if result.error:
