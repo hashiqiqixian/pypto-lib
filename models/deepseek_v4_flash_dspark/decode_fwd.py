@@ -856,14 +856,6 @@ def decode_fwd(
                         ]
 
     with pl.scope():
-        target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
-        hc_head(x_pong, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
-
-    with pl.scope():
-        target_hidden_l41 = pl.slice(dspark_target_hidden, [local_t, D], [0, D])
-        hc_head(x_ping, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l41)
-
-    with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)
         model_layer_last = pl.const(42, pl.INT32)
         weight_layer_last = model_layer_last % FWD_WEIGHT_BANK_SIZE
@@ -1006,7 +998,6 @@ def decode_fwd(
 
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
-        dspark_target_hidden = pl.assemble(dspark_target_hidden, hidden_workspace, [0, 2 * D])
         final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
         lm_head(
             x_out,
