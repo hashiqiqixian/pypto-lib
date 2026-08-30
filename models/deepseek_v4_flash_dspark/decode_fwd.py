@@ -745,7 +745,8 @@ def decode_fwd(
                         ]
                 if ordinal == HCA_LAYER_COUNT - 1:
                     target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
-                    hc_head(x_pong, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
+                    x_moe_l40 = pl.slice(x_moe_next, [local_t, HC_MULT, D], [0, 0, 0])
+                    hc_head(x_moe_l40, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
 
         with pl.scope():
             hc_attn_fn_layer_hca = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_weight_layer * HC_FN_STORAGE_ROWS, 0])
