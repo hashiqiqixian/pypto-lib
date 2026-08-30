@@ -600,6 +600,7 @@ def decode_fwd(
                 if token < local_t:
                     x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
 
+    target_hc_l40 = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
     for ordinal in pl.range(HCA_LAYER_COUNT):
         csa_model_layer = pl.cast(ordinal * 2 + 2, pl.INT32)
         hca_model_layer = pl.cast(ordinal * 2 + 3, pl.INT32)
@@ -743,6 +744,10 @@ def decode_fwd(
                         x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
                             token : token + 1, 0 : HC_MULT, 0 : D,
                         ]
+                        if ordinal == HCA_LAYER_COUNT - 1:
+                            target_hc_l40[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
+                                token : token + 1, 0 : HC_MULT, 0 : D,
+                            ]
 
         with pl.scope():
             hc_attn_fn_layer_hca = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_weight_layer * HC_FN_STORAGE_ROWS, 0])
@@ -857,7 +862,8 @@ def decode_fwd(
 
     with pl.scope():
         target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
-        hc_head(x_pong, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
+        target_hc_l40_active = pl.slice(target_hc_l40, [local_t, HC_MULT, D], [0, 0, 0])
+        hc_head(target_hc_l40_active, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
 
     with pl.scope():
         target_hidden_l41 = pl.slice(dspark_target_hidden, [local_t, D], [0, D])
