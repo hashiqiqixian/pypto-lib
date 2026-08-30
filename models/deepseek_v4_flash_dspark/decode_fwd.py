@@ -600,7 +600,7 @@ def decode_fwd(
                 if token < local_t:
                     x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
 
-    for ordinal in pl.range(HCA_LAYER_COUNT):
+    for ordinal in pl.range(HCA_LAYER_COUNT - 1):
         csa_model_layer = pl.cast(ordinal * 2 + 2, pl.INT32)
         hca_model_layer = pl.cast(ordinal * 2 + 3, pl.INT32)
         csa_weight_layer = csa_model_layer % FWD_WEIGHT_BANK_SIZE
@@ -855,13 +855,269 @@ def decode_fwd(
                             token : token + 1, 0 : HC_MULT, 0 : D,
                         ]
 
-    with pl.scope():
-        target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
-        hc_head(x_pong, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
+    for ordinal in pl.unroll(HCA_LAYER_COUNT - 1, HCA_LAYER_COUNT):
+        csa_model_layer = pl.cast(ordinal * 2 + 2, pl.INT32)
+        hca_model_layer = pl.cast(ordinal * 2 + 3, pl.INT32)
+        csa_weight_layer = csa_model_layer % FWD_WEIGHT_BANK_SIZE
+        hca_weight_layer = hca_model_layer % FWD_WEIGHT_BANK_SIZE
+        csa_extra_layer = ordinal % FWD_CSA_WEIGHT_BANK_SIZE
+        hca_extra_layer = ordinal % FWD_HCA_WEIGHT_BANK_SIZE
 
-    with pl.scope():
-        target_hidden_l41 = pl.slice(dspark_target_hidden, [local_t, D], [0, D])
-        hc_head(x_ping, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l41)
+        with pl.scope():
+            hc_attn_fn_layer_csa = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_weight_layer * HC_FN_STORAGE_ROWS, 0])
+            hc_ffn_fn_layer_csa = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [csa_weight_layer * HC_FN_STORAGE_ROWS, 0])
+            wq_a_layer_csa: pl.Tensor[[D, Q_LORA], pl.BF16] = pl.slice(wq_a, [D, Q_LORA], [csa_weight_layer * D, 0])
+            wq_b_layer_csa: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8] = pl.slice(wq_b, [Q_LORA, H * HEAD_DIM], [csa_weight_layer * Q_LORA, 0])
+            wq_b_scale_layer_csa: pl.Tensor[[H * HEAD_DIM], pl.FP32] = pl.slice(wq_b_scale, [H * HEAD_DIM], [csa_weight_layer * H * HEAD_DIM])
+            wkv_layer_csa: pl.Tensor[[D, HEAD_DIM], pl.BF16] = pl.slice(wkv, [D, HEAD_DIM], [csa_weight_layer * D, 0])
+            gamma_cq_layer_csa: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(gamma_cq, [Q_LORA], [csa_weight_layer * Q_LORA])
+            gamma_ckv_layer_csa: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(gamma_ckv, [HEAD_DIM], [csa_weight_layer * HEAD_DIM])
+            wo_a_layer_csa: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [csa_weight_layer * LOCAL_O_GROUPS, 0, 0])
+            routed_w1_layer_csa: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [csa_weight_layer * N_LOCAL, 0, 0])
+            routed_w3_layer_csa: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [csa_weight_layer * N_LOCAL, 0, 0])
+            routed_w2_layer_csa: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [csa_weight_layer * N_LOCAL, 0, 0])
+            raw_kv_layer_csa = pl.slice(raw_kv_pool, [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [csa_model_layer * raw_blocks_per_layer, 0, 0, 0])
+            csa_state_layer_csa = pl.slice(csa_compress_state, [csa_state_blocks_per_layer, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], [ordinal * csa_state_blocks_per_layer, 0, 0])
+            csa_cmp_kv_layer_csa = pl.slice(csa_cmp_kv, [csa_cmp_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [ordinal * csa_cmp_blocks_per_layer, 0, 0, 0])
+            csa_inner_state_layer_csa = pl.slice(csa_inner_compress_state, [csa_inner_state_blocks_per_layer, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM], [ordinal * csa_inner_state_blocks_per_layer, 0, 0])
+            csa_idx_cache_layer_csa = pl.slice(csa_idx_kv_cache, [csa_idx_blocks_per_layer, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], [ordinal * csa_idx_blocks_per_layer, 0, 0, 0])
+            csa_idx_scale_layer_csa = pl.slice(csa_idx_kv_scale, [csa_idx_blocks_per_layer, BLOCK_SIZE, 1, 1], [ordinal * csa_idx_blocks_per_layer, 0, 0, 0])
+            hc_attn_scale_layer_csa = pl.slice(hc_attn_scale, [3], [csa_weight_layer * 3])
+            hc_attn_base_layer_csa = pl.slice(hc_attn_base, [MIX_HC], [csa_weight_layer * MIX_HC])
+            attn_norm_w_layer_csa = pl.slice(attn_norm_w, [D], [csa_weight_layer * D])
+            csa_cmp_wkv_layer_csa = pl.slice(csa_cmp_wkv, [CSA_MAIN_OUT_DIM, D], [csa_extra_layer * CSA_MAIN_OUT_DIM, 0])
+            csa_cmp_wgate_layer_csa = pl.slice(csa_cmp_wgate, [CSA_MAIN_OUT_DIM, D], [csa_extra_layer * CSA_MAIN_OUT_DIM, 0])
+            csa_cmp_ape_layer_csa = pl.slice(csa_cmp_ape, [CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], [csa_extra_layer * CSA_COMPRESS_RATIO, 0])
+            csa_cmp_norm_w_layer_csa = pl.slice(csa_cmp_norm_w, [HEAD_DIM], [csa_extra_layer * HEAD_DIM])
+            csa_idx_wq_b_layer_csa = pl.slice(csa_idx_wq_b, [Q_LORA, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], [csa_extra_layer * Q_LORA, 0])
+            csa_idx_wq_b_scale_layer_csa = pl.slice(csa_idx_wq_b_scale, [CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], [csa_extra_layer * CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM])
+            csa_weights_proj_layer_csa = pl.slice(csa_weights_proj, [D, CSA_IDX_N_HEADS], [csa_extra_layer * D, 0])
+            csa_hadamard_idx_layer_csa = pl.slice(csa_hadamard_idx, [CSA_IDX_HEAD_DIM, CSA_IDX_HEAD_DIM], [csa_extra_layer * CSA_IDX_HEAD_DIM, 0])
+            csa_inner_wkv_layer_csa = pl.slice(csa_inner_wkv, [CSA_INNER_OUT_DIM, D], [csa_extra_layer * CSA_INNER_OUT_DIM, 0])
+            csa_inner_wgate_layer_csa = pl.slice(csa_inner_wgate, [CSA_INNER_OUT_DIM, D], [csa_extra_layer * CSA_INNER_OUT_DIM, 0])
+            csa_inner_ape_layer_csa = pl.slice(csa_inner_ape, [CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], [csa_extra_layer * CSA_COMPRESS_RATIO, 0])
+            csa_inner_norm_w_layer_csa = pl.slice(csa_inner_norm_w, [CSA_IDX_HEAD_DIM], [csa_extra_layer * CSA_IDX_HEAD_DIM])
+            attn_sink_layer_csa = pl.slice(attn_sink, [H], [csa_weight_layer * H])
+            wo_b_layer_csa = pl.slice(wo_b, [D, LOCAL_O_WIDTH], [csa_weight_layer * D, 0])
+            wo_b_scale_layer_csa = pl.slice(wo_b_scale, [D], [csa_weight_layer * D])
+            hc_ffn_scale_layer_csa = pl.slice(hc_ffn_scale, [3], [csa_weight_layer * 3])
+            hc_ffn_base_layer_csa = pl.slice(hc_ffn_base, [MIX_HC], [csa_weight_layer * MIX_HC])
+            norm_w_layer_csa = pl.slice(norm_w, [D], [csa_weight_layer * D])
+            gate_w_layer_csa = pl.slice(gate_w, [N_EXPERTS_GLOBAL, D], [csa_weight_layer * N_EXPERTS_GLOBAL, 0])
+            gate_bias_layer_csa = pl.slice(gate_bias, [N_EXPERTS_GLOBAL], [csa_weight_layer * N_EXPERTS_GLOBAL])
+            tid2eid_layer_csa = pl.slice(tid2eid, [VOCAB, TOPK], [csa_weight_layer * VOCAB, 0])
+            routed_w1_scale_layer_csa = pl.slice(routed_w1_scale, [N_LOCAL, MOE_INTER], [csa_weight_layer * N_LOCAL, 0])
+            routed_w3_scale_layer_csa = pl.slice(routed_w3_scale, [N_LOCAL, MOE_INTER], [csa_weight_layer * N_LOCAL, 0])
+            routed_w2_scale_layer_csa = pl.slice(routed_w2_scale, [N_LOCAL, D], [csa_weight_layer * N_LOCAL, 0])
+            shared_w1_layer_csa = pl.slice(shared_w1, [MOE_INTER, D], [csa_weight_layer * MOE_INTER, 0])
+            shared_w1_scale_layer_csa = pl.slice(shared_w1_scale, [MOE_INTER], [csa_weight_layer * MOE_INTER])
+            shared_w3_layer_csa = pl.slice(shared_w3, [MOE_INTER, D], [csa_weight_layer * MOE_INTER, 0])
+            shared_w3_scale_layer_csa = pl.slice(shared_w3_scale, [MOE_INTER], [csa_weight_layer * MOE_INTER])
+            shared_w2_layer_csa = pl.slice(shared_w2, [D, MOE_INTER], [csa_weight_layer * D, 0])
+            shared_w2_scale_layer_csa = pl.slice(shared_w2_scale, [D], [csa_weight_layer * D])
+            with pl.scope():
+                if TP_SIZE == 1:
+                    decode_csa_tp1(
+                        x_ping,
+                        hc_attn_fn_layer_csa, hc_attn_scale_layer_csa, hc_attn_base_layer_csa,
+                        attn_norm_w_layer_csa, wq_a_layer_csa, wq_b_layer_csa, wq_b_scale_layer_csa,
+                        wkv_layer_csa, gamma_cq_layer_csa, gamma_ckv_layer_csa,
+                        freqs_cos, freqs_sin, csa_cmp_freqs_cos, csa_cmp_freqs_sin,
+                        csa_cmp_wkv_layer_csa, csa_cmp_wgate_layer_csa,
+                        csa_cmp_ape_layer_csa, csa_cmp_norm_w_layer_csa,
+                        csa_state_layer_csa, csa_compress_state_block_table,
+                        csa_idx_wq_b_layer_csa, csa_idx_wq_b_scale_layer_csa,
+                        csa_weights_proj_layer_csa, csa_hadamard_idx_layer_csa,
+                        csa_inner_wkv_layer_csa, csa_inner_wgate_layer_csa,
+                        csa_inner_ape_layer_csa, csa_inner_norm_w_layer_csa,
+                        csa_inner_state_layer_csa, csa_inner_compress_state_block_table,
+                        raw_kv_layer_csa, csa_cmp_kv_layer_csa, csa_cmp_block_table,
+                        csa_idx_cache_layer_csa, csa_idx_scale_layer_csa, csa_idx_block_table,
+                        csa_ori_slot_mapping, csa_window_swa_indices, csa_window_swa_lens,
+                        csa_cmp_slot_mapping, csa_idx_slot_mapping,
+                        csa_state_slot_mapping, csa_inner_state_slot_mapping,
+                        position_ids, csa_kv_seq_lens,
+                        attn_sink_layer_csa, wo_a_layer_csa, wo_b_layer_csa, wo_b_scale_layer_csa,
+                        x_attn_active,
+                    )
+                else:
+                    decode_csa(
+                        x_ping,
+                        hc_attn_fn_layer_csa, hc_attn_scale_layer_csa, hc_attn_base_layer_csa,
+                        attn_norm_w_layer_csa, wq_a_layer_csa, wq_b_layer_csa, wq_b_scale_layer_csa,
+                        wkv_layer_csa, gamma_cq_layer_csa, gamma_ckv_layer_csa,
+                        freqs_cos, freqs_sin, csa_cmp_freqs_cos, csa_cmp_freqs_sin,
+                        csa_cmp_wkv_layer_csa, csa_cmp_wgate_layer_csa,
+                        csa_cmp_ape_layer_csa, csa_cmp_norm_w_layer_csa,
+                        csa_state_layer_csa, csa_compress_state_block_table,
+                        csa_idx_wq_b_layer_csa, csa_idx_wq_b_scale_layer_csa,
+                        csa_weights_proj_layer_csa, csa_hadamard_idx_layer_csa,
+                        csa_inner_wkv_layer_csa, csa_inner_wgate_layer_csa,
+                        csa_inner_ape_layer_csa, csa_inner_norm_w_layer_csa,
+                        csa_inner_state_layer_csa, csa_inner_compress_state_block_table,
+                        raw_kv_layer_csa, csa_cmp_kv_layer_csa, csa_cmp_block_table,
+                        csa_idx_cache_layer_csa, csa_idx_scale_layer_csa, csa_idx_block_table,
+                        csa_ori_slot_mapping, csa_window_swa_indices, csa_window_swa_lens,
+                        csa_cmp_slot_mapping, csa_idx_slot_mapping,
+                        csa_state_slot_mapping, csa_inner_state_slot_mapping,
+                        position_ids, csa_kv_seq_lens,
+                        attn_sink_layer_csa, wo_a_layer_csa, wo_b_layer_csa, wo_b_scale_layer_csa,
+                        x_attn_active,
+                        attention_window, attention_signal, o_window, o_signal,
+                        group_base, tp_rank, local_t,
+                    )
+
+            with pl.scope():
+                x_attn_moe_csa = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+                for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_csa_attn_pack"):
+                    if token < local_t:
+                        x_attn_moe_csa[token : token + 1, 0 : HC_MULT, 0 : D] = x_attn_active[
+                            token : token + 1, 0 : HC_MULT, 0 : D,
+                        ]
+                    else:
+                        zero_moe_row_csa = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                        x_attn_moe_csa[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_csa
+                moe(
+                    x_attn_moe_csa,
+                    hc_ffn_fn_layer_csa, hc_ffn_scale_layer_csa, hc_ffn_base_layer_csa,
+                    norm_w_layer_csa, gate_w_layer_csa, gate_bias_layer_csa, tid2eid_layer_csa,
+                    moe_input_ids,
+                    routed_w1_layer_csa, routed_w1_scale_layer_csa,
+                    routed_w3_layer_csa, routed_w3_scale_layer_csa,
+                    routed_w2_layer_csa, routed_w2_scale_layer_csa,
+                    shared_w1_layer_csa, shared_w1_scale_layer_csa,
+                    shared_w3_layer_csa, shared_w3_scale_layer_csa,
+                    shared_w2_layer_csa, shared_w2_scale_layer_csa,
+                    x_moe_next,
+                    recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+                    routed_y_buf, combine_arrived,
+                    csa_model_layer, local_t, my_rank, csa_model_layer + 1,
+                )
+                for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_csa_active_trim"):
+                    if token < local_t:
+                        x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
+                            token : token + 1, 0 : HC_MULT, 0 : D,
+                        ]
+
+        with pl.scope():
+            target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
+            hc_head(x_pong, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
+
+        with pl.scope():
+            hc_attn_fn_layer_hca = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_weight_layer * HC_FN_STORAGE_ROWS, 0])
+            hc_ffn_fn_layer_hca = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [hca_weight_layer * HC_FN_STORAGE_ROWS, 0])
+            wq_a_layer_hca: pl.Tensor[[D, Q_LORA], pl.BF16] = pl.slice(wq_a, [D, Q_LORA], [hca_weight_layer * D, 0])
+            wq_b_layer_hca: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8] = pl.slice(wq_b, [Q_LORA, H * HEAD_DIM], [hca_weight_layer * Q_LORA, 0])
+            wq_b_scale_layer_hca: pl.Tensor[[H * HEAD_DIM], pl.FP32] = pl.slice(wq_b_scale, [H * HEAD_DIM], [hca_weight_layer * H * HEAD_DIM])
+            wkv_layer_hca: pl.Tensor[[D, HEAD_DIM], pl.BF16] = pl.slice(wkv, [D, HEAD_DIM], [hca_weight_layer * D, 0])
+            gamma_cq_layer_hca: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(gamma_cq, [Q_LORA], [hca_weight_layer * Q_LORA])
+            gamma_ckv_layer_hca: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(gamma_ckv, [HEAD_DIM], [hca_weight_layer * HEAD_DIM])
+            wo_a_layer_hca: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [hca_weight_layer * LOCAL_O_GROUPS, 0, 0])
+            routed_w1_layer_hca: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [hca_weight_layer * N_LOCAL, 0, 0])
+            routed_w3_layer_hca: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [hca_weight_layer * N_LOCAL, 0, 0])
+            routed_w2_layer_hca: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [hca_weight_layer * N_LOCAL, 0, 0])
+            raw_kv_layer_hca = pl.slice(raw_kv_pool, [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [hca_model_layer * raw_blocks_per_layer, 0, 0, 0])
+            hca_state_layer_hca = pl.slice(hca_compress_state, [hca_state_blocks_per_layer, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [ordinal * hca_state_blocks_per_layer, 0, 0])
+            hca_cmp_kv_layer_hca = pl.slice(hca_cmp_kv, [hca_cmp_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [ordinal * hca_cmp_blocks_per_layer, 0, 0, 0])
+            hc_attn_scale_layer_hca = pl.slice(hc_attn_scale, [3], [hca_weight_layer * 3])
+            hc_attn_base_layer_hca = pl.slice(hc_attn_base, [MIX_HC], [hca_weight_layer * MIX_HC])
+            attn_norm_w_layer_hca = pl.slice(attn_norm_w, [D], [hca_weight_layer * D])
+            hca_cmp_wkv_layer_hca = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [hca_extra_layer * HCA_MAIN_OUT_DIM, 0])
+            hca_cmp_wgate_layer_hca = pl.slice(hca_cmp_wgate, [HCA_MAIN_OUT_DIM, D], [hca_extra_layer * HCA_MAIN_OUT_DIM, 0])
+            hca_cmp_ape_layer_hca = pl.slice(hca_cmp_ape, [HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], [hca_extra_layer * HCA_COMPRESS_RATIO, 0])
+            hca_cmp_norm_w_layer_hca = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [hca_extra_layer * HEAD_DIM])
+            attn_sink_layer_hca = pl.slice(attn_sink, [H], [hca_weight_layer * H])
+            wo_b_layer_hca = pl.slice(wo_b, [D, LOCAL_O_WIDTH], [hca_weight_layer * D, 0])
+            wo_b_scale_layer_hca = pl.slice(wo_b_scale, [D], [hca_weight_layer * D])
+            hc_ffn_scale_layer_hca = pl.slice(hc_ffn_scale, [3], [hca_weight_layer * 3])
+            hc_ffn_base_layer_hca = pl.slice(hc_ffn_base, [MIX_HC], [hca_weight_layer * MIX_HC])
+            norm_w_layer_hca = pl.slice(norm_w, [D], [hca_weight_layer * D])
+            gate_w_layer_hca = pl.slice(gate_w, [N_EXPERTS_GLOBAL, D], [hca_weight_layer * N_EXPERTS_GLOBAL, 0])
+            gate_bias_layer_hca = pl.slice(gate_bias, [N_EXPERTS_GLOBAL], [hca_weight_layer * N_EXPERTS_GLOBAL])
+            tid2eid_layer_hca = pl.slice(tid2eid, [VOCAB, TOPK], [hca_weight_layer * VOCAB, 0])
+            routed_w1_scale_layer_hca = pl.slice(routed_w1_scale, [N_LOCAL, MOE_INTER], [hca_weight_layer * N_LOCAL, 0])
+            routed_w3_scale_layer_hca = pl.slice(routed_w3_scale, [N_LOCAL, MOE_INTER], [hca_weight_layer * N_LOCAL, 0])
+            routed_w2_scale_layer_hca = pl.slice(routed_w2_scale, [N_LOCAL, D], [hca_weight_layer * N_LOCAL, 0])
+            shared_w1_layer_hca = pl.slice(shared_w1, [MOE_INTER, D], [hca_weight_layer * MOE_INTER, 0])
+            shared_w1_scale_layer_hca = pl.slice(shared_w1_scale, [MOE_INTER], [hca_weight_layer * MOE_INTER])
+            shared_w3_layer_hca = pl.slice(shared_w3, [MOE_INTER, D], [hca_weight_layer * MOE_INTER, 0])
+            shared_w3_scale_layer_hca = pl.slice(shared_w3_scale, [MOE_INTER], [hca_weight_layer * MOE_INTER])
+            shared_w2_layer_hca = pl.slice(shared_w2, [D, MOE_INTER], [hca_weight_layer * D, 0])
+            shared_w2_scale_layer_hca = pl.slice(shared_w2_scale, [D], [hca_weight_layer * D])
+            with pl.scope():
+                if TP_SIZE == 1:
+                    decode_hca_tp1(
+                        x_pong,
+                        hc_attn_fn_layer_hca, hc_attn_scale_layer_hca, hc_attn_base_layer_hca,
+                        attn_norm_w_layer_hca, wq_a_layer_hca, wq_b_layer_hca, wq_b_scale_layer_hca,
+                        wkv_layer_hca, gamma_cq_layer_hca, gamma_ckv_layer_hca,
+                        freqs_cos, freqs_sin, hca_cmp_freqs_cos, hca_cmp_freqs_sin,
+                        hca_cmp_wkv_layer_hca, hca_cmp_wgate_layer_hca,
+                        hca_cmp_ape_layer_hca, hca_cmp_norm_w_layer_hca,
+                        hca_state_layer_hca, hca_compress_state_block_table,
+                        raw_kv_layer_hca, hca_cmp_kv_layer_hca, hca_cmp_block_table,
+                        hca_ori_slot_mapping, hca_window_swa_indices, hca_window_swa_lens,
+                        hca_cmp_slot_mapping, hca_state_slot_mapping,
+                        position_ids, hca_kv_seq_lens,
+                        attn_sink_layer_hca, wo_a_layer_hca, wo_b_layer_hca, wo_b_scale_layer_hca,
+                        x_attn_active,
+                    )
+                else:
+                    decode_hca(
+                        x_pong,
+                        hc_attn_fn_layer_hca, hc_attn_scale_layer_hca, hc_attn_base_layer_hca,
+                        attn_norm_w_layer_hca, wq_a_layer_hca, wq_b_layer_hca, wq_b_scale_layer_hca,
+                        wkv_layer_hca, gamma_cq_layer_hca, gamma_ckv_layer_hca,
+                        freqs_cos, freqs_sin, hca_cmp_freqs_cos, hca_cmp_freqs_sin,
+                        hca_cmp_wkv_layer_hca, hca_cmp_wgate_layer_hca,
+                        hca_cmp_ape_layer_hca, hca_cmp_norm_w_layer_hca,
+                        hca_state_layer_hca, hca_compress_state_block_table,
+                        raw_kv_layer_hca, hca_cmp_kv_layer_hca, hca_cmp_block_table,
+                        hca_ori_slot_mapping, hca_window_swa_indices, hca_window_swa_lens,
+                        hca_cmp_slot_mapping, hca_state_slot_mapping,
+                        position_ids, hca_kv_seq_lens,
+                        attn_sink_layer_hca, wo_a_layer_hca, wo_b_layer_hca, wo_b_scale_layer_hca,
+                        x_attn_active,
+                        attention_window, attention_signal, o_window, o_signal,
+                        group_base, tp_rank, local_t,
+                    )
+
+            with pl.scope():
+                x_attn_moe_hca = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+                for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_hca_attn_pack"):
+                    if token < local_t:
+                        x_attn_moe_hca[token : token + 1, 0 : HC_MULT, 0 : D] = x_attn_active[
+                            token : token + 1, 0 : HC_MULT, 0 : D,
+                        ]
+                    else:
+                        zero_moe_row_hca = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                        x_attn_moe_hca[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_hca
+                moe(
+                    x_attn_moe_hca,
+                    hc_ffn_fn_layer_hca, hc_ffn_scale_layer_hca, hc_ffn_base_layer_hca,
+                    norm_w_layer_hca, gate_w_layer_hca, gate_bias_layer_hca, tid2eid_layer_hca,
+                    moe_input_ids,
+                    routed_w1_layer_hca, routed_w1_scale_layer_hca,
+                    routed_w3_layer_hca, routed_w3_scale_layer_hca,
+                    routed_w2_layer_hca, routed_w2_scale_layer_hca,
+                    shared_w1_layer_hca, shared_w1_scale_layer_hca,
+                    shared_w3_layer_hca, shared_w3_scale_layer_hca,
+                    shared_w2_layer_hca, shared_w2_scale_layer_hca,
+                    x_moe_next,
+                    recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+                    routed_y_buf, combine_arrived,
+                    hca_model_layer, local_t, my_rank, hca_model_layer + 1,
+                )
+                for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_hca_active_trim"):
+                    if token < local_t:
+                        x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
+                            token : token + 1, 0 : HC_MULT, 0 : D,
+                        ]
+
+        with pl.scope():
+            target_hidden_l41 = pl.slice(dspark_target_hidden, [local_t, D], [0, D])
+            hc_head(x_ping, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l41)
+
 
     with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)
