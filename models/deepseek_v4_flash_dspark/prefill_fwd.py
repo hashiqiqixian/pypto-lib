@@ -734,10 +734,11 @@ def prefill_fwd(
                         [local_start, 0, 0],
                     )
                     target_hidden_l40 = pl.slice(dspark_target_hidden, [local_tokens, D], [0, 0])
-                    hc_head(
+                    head_start_dep = pl.system.task_dummy(deps=[])
+                    target_hidden_l40, target_hidden_l40_tid = hc_head(
                         target_x_hc_l40,
                         hc_head_fn, hc_head_scale, hc_head_base,
-                        target_hidden_l40,
+                        target_hidden_l40, head_start_dep,
                     )
 
         with pl.scope():
@@ -860,10 +861,11 @@ def prefill_fwd(
                         [local_start, 0, 0],
                     )
                     target_hidden_l41 = pl.slice(dspark_target_hidden, [local_tokens, D], [0, D])
-                    hc_head(
+                    head_start_dep = pl.system.task_dummy(deps=[])
+                    target_hidden_l41, target_hidden_l41_tid = hc_head(
                         target_x_hc_l41,
                         hc_head_fn, hc_head_scale, hc_head_base,
-                        target_hidden_l41,
+                        target_hidden_l41, head_start_dep,
                     )
 
     # Layer 42: CSA order 20.
@@ -1029,7 +1031,12 @@ def prefill_fwd(
     # gather x_hc holds every group token on each rank, and logit_row_indices
     # index that group token space.
     with pl.scope():
-        hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
+        head_start_dep = pl.system.task_dummy(deps=[])
+        hidden_workspace, target_hidden_l42_tid = hc_head(
+            x_hc,
+            hc_head_fn, hc_head_scale, hc_head_base,
+            hidden_workspace, head_start_dep,
+        )
         local_tokens = pl.tensor.dim(input_ids, 0)
         local_start = tp_rank * local_tokens
         local_hidden_workspace = pl.slice(hidden_workspace, [local_tokens, D], [local_start, 0])

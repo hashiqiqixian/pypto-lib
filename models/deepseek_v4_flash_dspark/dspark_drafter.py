@@ -692,7 +692,12 @@ def dspark_drafter(
     clear_moe_signals(hidden_3, arrived, data_arrived, combine_arrived)
 
     padded_head_hidden = pl.create_tensor([T, D], dtype=pl.BF16)
-    hc_head(hidden_3, hc_head_fn, hc_head_scale, hc_head_base, padded_head_hidden)
+    head_start_dep = pl.system.task_dummy(deps=[])
+    padded_head_hidden, head_hidden_tid = hc_head(
+        hidden_3,
+        hc_head_fn, hc_head_scale, hc_head_base,
+        padded_head_hidden, head_start_dep,
+    )
     head_hidden_flat = pl.reshape(head_hidden, [batch * DSPARK_QUERY_WIDTH, D])
     for token in pl.spmd(T, name_hint="dspark_head_unpad"):
         if token < active_tokens:

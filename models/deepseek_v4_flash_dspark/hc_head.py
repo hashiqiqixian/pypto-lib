@@ -51,14 +51,15 @@ LINEAR_OK = 16
 RMS_OK = 16
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def hc_head(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     y: pl.Tensor[[T_DYN, D], pl.BF16],
-):
+    start_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     t_dim = pl.tensor.dim(x_hc, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
     linear_full_rows = (t_dim // LINEAR_T_TILE) * LINEAR_T_TILE
@@ -67,7 +68,8 @@ def hc_head(
     y_flat = pl.reshape(y, [t_dim, D])
     # rms: split-K sum-of-squares, fanned over (token-tile x K-slice)
     sq_part = pl.create_tensor([RMS_OK, t_linear], dtype=pl.FP32)
-    for task in pl.spmd(token_tiles * RMS_OK, name_hint="hc_head_rms"):
+    with pl.spmd(token_tiles * RMS_OK, name_hint="hc_head_rms", deps=[start_dep]) as rms_tid:
+        task = pl.tile.get_block_idx()
         t0 = (task // RMS_OK) * T_TILE
         ok = task % RMS_OK
         k_base = ok * (HC_DIM // RMS_OK)
@@ -96,6 +98,7 @@ def hc_head(
     with pl.spmd(
         t_linear // LINEAR_T_TILE,
         name_hint="hc_head_linear_seed",
+        deps=[start_dep],
     ) as linear_seed_tid:
         seed_block = pl.tile.get_block_idx()
         seed_t0 = seed_block * LINEAR_T_TILE
@@ -168,7 +171,8 @@ def hc_head(
 
     # reduce: gate + hc mix, fanned over (token-tile x D-slice). The rsqrt/sigmoid gate is
     # recomputed per task instead of being published by its own scope.
-    for blk in pl.spmd(token_tiles * (D // D_SPMD), name_hint="hc_head_reduce"):
+    with pl.spmd(token_tiles * (D // D_SPMD), name_hint="hc_head_reduce", deps=[rms_tid]) as reduce_tid:
+        blk = pl.tile.get_block_idx()
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
         valid_rows = pl.min(T_TILE, t_dim - t0)
@@ -251,7 +255,7 @@ def hc_head(
                 y_flat[t0 : t0 + T_TILE, d0 : d0 + D_TILE] = y_valid_tail
 
     y = pl.reshape(y_flat, [t_dim, D])
-    return y
+    return y, reduce_tid
 
 
 @pl.jit
@@ -265,7 +269,8 @@ def hc_head_test(
     x_hc.bind_dynamic(0, T_DYN)
     y.bind_dynamic(0, T_DYN)
 
-    y = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, y)
+    start_dep = pl.system.task_dummy(deps=[])
+    y, head_tid = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, y, start_dep)
     return y
 
 

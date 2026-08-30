@@ -861,15 +861,6 @@ def decode_fwd(
                         ]
 
     with pl.scope():
-        target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
-        target_hc_l40_active = pl.slice(target_hc_l40, [local_t, HC_MULT, D], [0, 0, 0])
-        hc_head(target_hc_l40_active, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
-
-    with pl.scope():
-        target_hidden_l41 = pl.slice(dspark_target_hidden, [local_t, D], [0, D])
-        hc_head(x_ping, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l41)
-
-    with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)
         model_layer_last = pl.const(42, pl.INT32)
         weight_layer_last = model_layer_last % FWD_WEIGHT_BANK_SIZE
@@ -1011,7 +1002,25 @@ def decode_fwd(
     clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
 
     with pl.scope():
-        hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
+        target_head_dep = pl.system.task_dummy(deps=[])
+        target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
+        target_hc_l40_active = pl.slice(target_hc_l40, [local_t, HC_MULT, D], [0, 0, 0])
+        target_hidden_l40, target_head_dep = hc_head(
+            target_hc_l40_active,
+            hc_head_fn, hc_head_scale, hc_head_base,
+            target_hidden_l40, target_head_dep,
+        )
+        target_hidden_l41 = pl.slice(dspark_target_hidden, [local_t, D], [0, D])
+        target_hidden_l41, target_head_dep = hc_head(
+            x_ping,
+            hc_head_fn, hc_head_scale, hc_head_base,
+            target_hidden_l41, target_head_dep,
+        )
+        hidden_workspace, target_hidden_l42_tid = hc_head(
+            pre_hc_hidden_out,
+            hc_head_fn, hc_head_scale, hc_head_base,
+            hidden_workspace, target_head_dep,
+        )
         dspark_target_hidden = pl.assemble(dspark_target_hidden, hidden_workspace, [0, 2 * D])
         final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
         lm_head(
