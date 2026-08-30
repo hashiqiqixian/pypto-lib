@@ -600,7 +600,7 @@ def decode_fwd(
                 if token < local_t:
                     x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
 
-    for ordinal in pl.range(HCA_LAYER_COUNT):
+    for ordinal in pl.unroll(HCA_LAYER_COUNT):
         csa_model_layer = pl.cast(ordinal * 2 + 2, pl.INT32)
         hca_model_layer = pl.cast(ordinal * 2 + 3, pl.INT32)
         csa_weight_layer = csa_model_layer % FWD_WEIGHT_BANK_SIZE
