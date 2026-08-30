@@ -156,6 +156,8 @@ if LM_HEAD_VOCAB != MODEL_CONFIG.vocab_size:
     raise ValueError(f"LM-head vocab={LM_HEAD_VOCAB} does not match model vocab={MODEL_CONFIG.vocab_size}")
 if MODEL_CONFIG.vocab_size % TP_SIZE:
     raise ValueError(f"vocab size {MODEL_CONFIG.vocab_size} must be divisible by TP={TP_SIZE}")
+if TP_SIZE != 4:
+    raise ValueError("temporary target-HC precision diagnostic requires TP4")
 
 # FWD-layer stacked tensors, indexed by layer 0-42.
 FWD_LAYER_STACKED_NAMES = [
@@ -1074,6 +1076,44 @@ def prefill_fwd(
             dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = target_hidden_stack[
                 target_l42_row : target_l42_row + 1, 0:D,
             ]
+
+        # Temporary TP4 diagnostic: preserve the three raw local HC taps in an
+        # existing output after its final consumer so the host can compute an
+        # independent head golden for every target layer.
+        debug_source_l40 = pl.slice(
+            target_hc_stack,
+            [local_tokens, HC_MULT, D],
+            [target_l40_start, 0, 0],
+        )
+        debug_target_l40 = pl.slice(attn_stage, [local_tokens, HC_MULT, D], [0, 0, 0])
+        with pl.spmd(local_tokens, name_hint="prefill_fwd_export_target_hc_l40"):
+            debug_target_l40 = _copy_target_hc_row(debug_source_l40, debug_target_l40)
+
+        debug_source_l41 = pl.slice(
+            target_hc_stack,
+            [local_tokens, HC_MULT, D],
+            [target_l41_start, 0, 0],
+        )
+        debug_target_l41 = pl.slice(
+            attn_stage,
+            [local_tokens, HC_MULT, D],
+            [local_tokens, 0, 0],
+        )
+        with pl.spmd(local_tokens, name_hint="prefill_fwd_export_target_hc_l41"):
+            debug_target_l41 = _copy_target_hc_row(debug_source_l41, debug_target_l41)
+
+        debug_source_l42 = pl.slice(
+            target_hc_stack,
+            [local_tokens, HC_MULT, D],
+            [local_start, 0, 0],
+        )
+        debug_target_l42 = pl.slice(
+            attn_stage,
+            [local_tokens, HC_MULT, D],
+            [2 * local_tokens, 0, 0],
+        )
+        with pl.spmd(local_tokens, name_hint="prefill_fwd_export_target_hc_l42"):
+            debug_target_l42 = _copy_target_hc_row(debug_source_l42, debug_target_l42)
         final_norm_tid = rms_norm(layer42_hidden, final_norm_w, x_out)
         lm_head(
             x_out, lm_head_weight, logit_row_indices, logits,
@@ -1943,41 +1983,53 @@ def x_out_compare(actual, _expected, **kwargs):
 
 
 def dspark_target_hidden_compare(actual, _expected, **kwargs):
-    """Validate all taps are written and the layer-42 local projection is exact."""
+    """Temporarily validate all three target taps from exported raw HC states."""
     import torch
     from hc_head import golden_hc_head
 
     inputs = kwargs.get("inputs", {})
-    device_x_hc = kwargs.get("actual_outputs", {}).get("x_hc")
-    if device_x_hc is None:
-        return False, "    missing final device x_hc output"
+    raw_target_hc = kwargs.get("actual_outputs", {}).get("attn_stage")
+    if raw_target_hc is None:
+        return False, "    missing temporary raw target HC output"
     if not bool(torch.isfinite(actual).all()):
         return False, "    DSpark target hidden contains NaN or Inf"
 
     for rank in range(actual.shape[0]):
-        for slot in range(len(TARGET_LAYER_IDS) - 1):
-            part = actual[rank, :, slot * D : (slot + 1) * D]
-            if not bool(torch.count_nonzero(part)):
-                return False, f"    rank {rank} target layer {TARGET_LAYER_IDS[slot]} was not written"
-
         local_tokens = actual.shape[1]
-        local_start = (rank % TP_SIZE) * local_tokens
-        expected_l42 = torch.empty(local_tokens, D, dtype=torch.bfloat16)
-        golden_hc_head({
-            "x_hc": device_x_hc[rank, local_start : local_start + local_tokens].cpu(),
-            "hc_head_fn": inputs["hc_head_fn"][rank],
-            "hc_head_scale": inputs["hc_head_scale"][rank],
-            "hc_head_base": inputs["hc_head_base"][rank],
-            "y": expected_l42,
-        })
-        actual_l42 = actual[rank, :, 2 * D : 3 * D].float()
-        expected_l42 = expected_l42.float()
-        tolerance = 1e-4 + (1.0 / 128) * expected_l42.abs()
-        bad = (actual_l42 - expected_l42).abs() > tolerance
-        ratio = float(bad.float().mean())
-        if ratio > 0.005:
-            worst = float((actual_l42 - expected_l42).abs().max())
-            return False, f"    rank {rank} layer-42 target hidden mismatch: ratio={ratio:.2%}, max |err|={worst:.3e}"
+        required_rows = len(TARGET_LAYER_IDS) * local_tokens
+        if raw_target_hc.shape[1] < required_rows:
+            return False, f"    raw target HC has {raw_target_hc.shape[1]} rows, need {required_rows}"
+        for slot, layer_id in enumerate(TARGET_LAYER_IDS):
+            source = raw_target_hc[rank, slot * local_tokens : (slot + 1) * local_tokens].cpu()
+            if not bool(torch.isfinite(source).all()):
+                return False, f"    rank {rank} layer {layer_id} raw HC contains NaN or Inf"
+            expected_part = torch.empty(local_tokens, D, dtype=torch.bfloat16)
+            golden_hc_head({
+                "x_hc": source,
+                "hc_head_fn": inputs["hc_head_fn"][rank],
+                "hc_head_scale": inputs["hc_head_scale"][rank],
+                "hc_head_base": inputs["hc_head_base"][rank],
+                "y": expected_part,
+            })
+            expected_part = expected_part.float()
+            actual_part = actual[rank, :, slot * D : (slot + 1) * D].float()
+            error = (actual_part - expected_part).abs()
+            tolerance = 1e-4 + (1.0 / 128) * expected_part.abs()
+            bad = error > tolerance
+            ratio = float(bad.float().mean())
+            worst_flat = int(torch.argmax(error))
+            worst_token = worst_flat // D
+            worst_dim = worst_flat % D
+            worst = float(error.flatten()[worst_flat])
+            print(
+                f"[TARGET HC DEBUG] rank {rank} layer {layer_id}: max |err|={worst:.3e} "
+                f"at ({worst_token}, {worst_dim}), out-of-tolerance={ratio:.2%}"
+            )
+            if ratio > 0.005:
+                return False, (
+                    f"    rank {rank} layer {layer_id} target hidden mismatch: "
+                    f"ratio={ratio:.2%}, max |err|={worst:.3e}"
+                )
     return True, ""
 
 
