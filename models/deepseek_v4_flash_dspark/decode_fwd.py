@@ -170,7 +170,9 @@ def _validate_import_contract():
         raise ValueError(f"MoE world size {N_RANKS} does not match EP={EP_SIZE}")
     if MAIN_LAYER_COUNT != 43:
         raise ValueError(f"D-Spark decode forward expects 43 layers, got {MAIN_LAYER_COUNT}")
-    if TARGET_LAYER_IDS != tuple(range(MAIN_LAYER_COUNT - len(TARGET_LAYER_IDS), MAIN_LAYER_COUNT)):
+    if len(TARGET_LAYER_IDS) != 3 or TARGET_LAYER_IDS != tuple(
+        range(MAIN_LAYER_COUNT - len(TARGET_LAYER_IDS), MAIN_LAYER_COUNT)
+    ):
         raise ValueError(f"D-Spark target layers must be the final three layers: {TARGET_LAYER_IDS}")
     if MODEL_CONFIG.vocab_size % TP_SIZE:
         raise ValueError(f"vocab size {MODEL_CONFIG.vocab_size} must be divisible by TP={TP_SIZE}")
@@ -885,14 +887,6 @@ def decode_fwd(
                         ]
 
     with pl.scope():
-        target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
-        hc_head(x_pong, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
-
-    with pl.scope():
-        target_hidden_l41 = pl.slice(dspark_target_hidden, [local_t, D], [0, D])
-        hc_head(x_ping, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l41)
-
-    with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)
         model_layer_last = pl.const(42, pl.INT32)
         weight_layer_last = model_layer_last % FWD_WEIGHT_BANK_SIZE
@@ -1035,8 +1029,38 @@ def decode_fwd(
     clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
 
     with pl.scope():
-        hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
-        dspark_target_hidden = pl.assemble(dspark_target_hidden, hidden_workspace, [0, 2 * D])
+        target_hc_stack = pl.create_tensor([MOE_TOKENS * 3, HC_MULT, D], dtype=pl.FP32)
+        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_pack_target_hc"):
+            if token < local_t:
+                target_row = token * 3
+                target_hc_stack[target_row : target_row + 1, 0 : HC_MULT, 0 : D] = x_pong[
+                    token : token + 1, 0 : HC_MULT, 0 : D,
+                ]
+                target_hc_stack[target_row + 1 : target_row + 2, 0 : HC_MULT, 0 : D] = x_ping[
+                    token : token + 1, 0 : HC_MULT, 0 : D,
+                ]
+                target_hc_stack[target_row + 2 : target_row + 3, 0 : HC_MULT, 0 : D] = pre_hc_hidden_out[
+                    token : token + 1, 0 : HC_MULT, 0 : D,
+                ]
+        target_rows = local_t * 3
+        target_hc_active = pl.slice(target_hc_stack, [target_rows, HC_MULT, D], [0, 0, 0])
+        target_hidden_stack = pl.create_tensor([MOE_TOKENS * 3, D], dtype=pl.BF16)
+        target_hidden_active = pl.slice(target_hidden_stack, [target_rows, D], [0, 0])
+        hc_head(target_hc_active, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_active)
+        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_target_hidden"):
+            if token < local_t:
+                target_row = token * 3
+                target_hidden_l40 = target_hidden_stack[target_row : target_row + 1, 0:D]
+                target_hidden_l41 = target_hidden_stack[target_row + 1 : target_row + 2, 0:D]
+                target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
+                dspark_target_hidden[token : token + 1, 0:D] = target_hidden_l40
+                dspark_target_hidden[token : token + 1, D : 2 * D] = target_hidden_l41
+                dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = target_hidden_l42
+        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_final_hidden"):
+            if token < local_t:
+                target_row = token * 3
+                target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
+                hidden_workspace[token : token + 1, 0:D] = target_hidden_l42
         final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
         lm_head(
             x_out,
@@ -1679,20 +1703,24 @@ def finite_tensor_compare(actual, _expected, **_kwargs):
 
 
 def dspark_target_hidden_compare(actual, _expected, **kwargs):
-    """Recompute layers 40/41 and compare layer 42 with its reused head output."""
+    """Recompute all three target-layer projections from their HC outputs."""
     import torch
     from hc_head import golden_hc_head
 
     inputs = kwargs.get("inputs", {})
     outputs = kwargs.get("actual_outputs", {})
-    sources = (outputs.get("x_pong"), outputs.get("x_ping"))
-    hidden_workspace = outputs.get("hidden_workspace")
-    if any(source is None for source in sources) or hidden_workspace is None:
-        return False, "    missing layer-40/41 HC source or layer-42 head output"
+    if not bool(torch.isfinite(actual).all()):
+        return False, "    DSpark target hidden contains NaN or Inf"
+    sources = (
+        outputs.get("x_pong"),
+        outputs.get("x_ping"),
+        outputs.get("pre_hc_hidden_out"),
+    )
+    if any(source is None for source in sources):
+        return False, "    missing layer-40/41/42 HC source output"
 
     for rank in range(actual.shape[0]):
-        expected_parts = []
-        for source in sources:
+        for slot, (layer_id, source) in enumerate(zip(TARGET_LAYER_IDS, sources, strict=True)):
             expected_part = torch.empty(source.shape[1], D, dtype=torch.bfloat16)
             golden_hc_head({
                 "x_hc": source[rank].cpu(),
@@ -1701,16 +1729,17 @@ def dspark_target_hidden_compare(actual, _expected, **kwargs):
                 "hc_head_base": inputs["hc_head_base"][rank],
                 "y": expected_part,
             })
-            expected_parts.append(expected_part)
-        expected_parts.append(hidden_workspace[rank].cpu())
-        expected_rank = torch.cat(expected_parts, dim=1).float()
-        actual_rank = actual[rank].float()
-        tolerance = 1e-4 + (1.0 / 128) * expected_rank.abs()
-        bad = (actual_rank - expected_rank).abs() > tolerance
-        ratio = float(bad.float().mean())
-        if ratio > 0.005:
-            worst = float((actual_rank - expected_rank).abs().max())
-            return False, f"    rank {rank} target hidden mismatch: ratio={ratio:.2%}, max |err|={worst:.3e}"
+            expected_part = expected_part.float()
+            actual_part = actual[rank, :, slot * D : (slot + 1) * D].float()
+            error = (actual_part - expected_part).abs()
+            tolerance = 1e-4 + (1.0 / 128) * expected_part.abs()
+            ratio = float((error > tolerance).float().mean())
+            if ratio > 0.005:
+                worst = float(error.max())
+                return False, (
+                    f"    rank {rank} layer {layer_id} target hidden mismatch: "
+                    f"ratio={ratio:.2%}, max |err|={worst:.3e}"
+                )
     return True, ""
 
 
