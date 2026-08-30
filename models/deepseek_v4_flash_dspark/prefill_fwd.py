@@ -234,6 +234,18 @@ RESIDENT_CACHE_NAMES = frozenset(CACHE_NAMES)
 RESIDENT_CACHE_OUTPUT_NAMES = RESIDENT_CACHE_NAMES
 
 
+@pl.jit.incore
+def _copy_target_hc_row(
+    source: pl.Tensor,
+    target: pl.Out[pl.Tensor],
+):
+    """Copy one post-layer HC row into the fused target-head input."""
+    token = pl.tile.get_block_idx()
+    row = pl.load(source, [token, 0, 0], [1, HC_MULT, D])
+    target = pl.store(row, [token, 0, 0], target)
+    return target
+
+
 @pl.jit.inline
 def mask_inactive_sample_rows(
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -573,6 +585,14 @@ def prefill_fwd(
                 group_base, tp_rank, layer_l1, my_rank,
             )
 
+    group_tokens = pl.tensor.dim(x_hc, 0)
+    local_tokens = pl.tensor.dim(input_ids, 0)
+    local_start = pl.cast(tp_rank, pl.INDEX) * pl.cast(local_tokens, pl.INDEX)
+    target_l40_start = pl.cast(group_tokens, pl.INDEX)
+    target_l41_start = target_l40_start + pl.cast(local_tokens, pl.INDEX)
+    target_head_rows = group_tokens + 2 * local_tokens
+    target_hc_stack = pl.create_tensor([target_head_rows, HC_MULT, D], dtype=pl.FP32)
+
     # Layers 2-41: CSA/HCA pairs.
     for pair_order in pl.range(HCA_NUM_LAYERS):
         attention_order = pl.cast(pair_order, pl.INT32)
@@ -726,19 +746,18 @@ def prefill_fwd(
                     group_base, tp_rank, csa_layer, my_rank,
                 )
                 if pair_order == HCA_NUM_LAYERS - 1:
-                    local_tokens = pl.tensor.dim(input_ids, 0)
-                    local_start = tp_rank * local_tokens
                     target_x_hc_l40 = pl.slice(
                         x_hc,
                         [local_tokens, HC_MULT, D],
                         [local_start, 0, 0],
                     )
-                    target_hidden_l40 = pl.slice(dspark_target_hidden, [local_tokens, D], [0, 0])
-                    hc_head(
-                        target_x_hc_l40,
-                        hc_head_fn, hc_head_scale, hc_head_base,
-                        target_hidden_l40,
+                    target_hc_l40 = pl.slice(
+                        target_hc_stack,
+                        [local_tokens, HC_MULT, D],
+                        [target_l40_start, 0, 0],
                     )
+                    with pl.spmd(local_tokens, name_hint="prefill_fwd_capture_target_hc_l40"):
+                        target_hc_l40 = _copy_target_hc_row(target_x_hc_l40, target_hc_l40)
 
         with pl.scope():
             hca_layer = attention_order * 2 + pl.const(3, pl.INT32)
@@ -852,19 +871,18 @@ def prefill_fwd(
                     group_base, tp_rank, hca_layer, my_rank,
                 )
                 if pair_order == HCA_NUM_LAYERS - 1:
-                    local_tokens = pl.tensor.dim(input_ids, 0)
-                    local_start = tp_rank * local_tokens
                     target_x_hc_l41 = pl.slice(
                         x_hc,
                         [local_tokens, HC_MULT, D],
                         [local_start, 0, 0],
                     )
-                    target_hidden_l41 = pl.slice(dspark_target_hidden, [local_tokens, D], [0, D])
-                    hc_head(
-                        target_x_hc_l41,
-                        hc_head_fn, hc_head_scale, hc_head_base,
-                        target_hidden_l41,
+                    target_hc_l41 = pl.slice(
+                        target_hc_stack,
+                        [local_tokens, HC_MULT, D],
+                        [target_l41_start, 0, 0],
                     )
+                    with pl.spmd(local_tokens, name_hint="prefill_fwd_capture_target_hc_l41"):
+                        target_hc_l41 = _copy_target_hc_row(target_x_hc_l41, target_hc_l41)
 
     # Layer 42: CSA order 20.
     with pl.scope():
@@ -1025,16 +1043,38 @@ def prefill_fwd(
             group_base, tp_rank, pl.const(43, pl.INT32),
         )
 
-    # Final head over the gathered TP-group tokens: after the layer-42 token
-    # gather x_hc holds every group token on each rank, and logit_row_indices
-    # index that group token space.
+    # Batch the local layer-40/41 taps and the full layer-42 state into one
+    # target-head launch. The InCore copies mutate the stack in place, so the
+    # orchestration loop does not rebind it as a loop-carried tensor.
     with pl.scope():
-        hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
-        local_tokens = pl.tensor.dim(input_ids, 0)
-        local_start = tp_rank * local_tokens
-        local_hidden_workspace = pl.slice(hidden_workspace, [local_tokens, D], [local_start, 0])
-        dspark_target_hidden = pl.assemble(dspark_target_hidden, local_hidden_workspace, [0, 2 * D])
-        final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
+        target_hc_l42 = pl.slice(
+            target_hc_stack,
+            [group_tokens, HC_MULT, D],
+            [0, 0, 0],
+        )
+        with pl.spmd(group_tokens, name_hint="prefill_fwd_capture_target_hc_l42"):
+            target_hc_l42 = _copy_target_hc_row(x_hc, target_hc_l42)
+        target_hidden_stack = pl.create_tensor([target_head_rows, D], dtype=pl.BF16)
+        target_hidden_stack = hc_head(
+            target_hc_stack,
+            hc_head_fn, hc_head_scale, hc_head_base,
+            target_hidden_stack,
+        )
+        layer42_hidden = pl.slice(target_hidden_stack, [group_tokens, D], [0, 0])
+        for token in pl.spmd(local_tokens, name_hint="prefill_fwd_store_target_hidden"):
+            target_l40_row = target_l40_start + token
+            target_l41_row = target_l41_start + token
+            target_l42_row = local_start + token
+            dspark_target_hidden[token : token + 1, 0:D] = target_hidden_stack[
+                target_l40_row : target_l40_row + 1, 0:D,
+            ]
+            dspark_target_hidden[token : token + 1, D : 2 * D] = target_hidden_stack[
+                target_l41_row : target_l41_row + 1, 0:D,
+            ]
+            dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = target_hidden_stack[
+                target_l42_row : target_l42_row + 1, 0:D,
+            ]
+        final_norm_tid = rms_norm(layer42_hidden, final_norm_w, x_out)
         lm_head(
             x_out, lm_head_weight, logit_row_indices, logits,
             lm_head_hidden_window, lm_head_hidden_done,

@@ -600,7 +600,6 @@ def decode_fwd(
                 if token < local_t:
                     x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
 
-    target_hc_l40 = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
     for ordinal in pl.range(HCA_LAYER_COUNT):
         csa_model_layer = pl.cast(ordinal * 2 + 2, pl.INT32)
         hca_model_layer = pl.cast(ordinal * 2 + 3, pl.INT32)
@@ -744,10 +743,6 @@ def decode_fwd(
                         x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
                             token : token + 1, 0 : HC_MULT, 0 : D,
                         ]
-                        if ordinal == HCA_LAYER_COUNT - 1:
-                            target_hc_l40[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
-                                token : token + 1, 0 : HC_MULT, 0 : D,
-                            ]
 
         with pl.scope():
             hc_attn_fn_layer_hca = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_weight_layer * HC_FN_STORAGE_ROWS, 0])
@@ -859,15 +854,6 @@ def decode_fwd(
                         x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = x_moe_next[
                             token : token + 1, 0 : HC_MULT, 0 : D,
                         ]
-
-    with pl.scope():
-        target_hidden_l40 = pl.slice(dspark_target_hidden, [local_t, D], [0, 0])
-        target_hc_l40_active = pl.slice(target_hc_l40, [local_t, HC_MULT, D], [0, 0, 0])
-        hc_head(target_hc_l40_active, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l40)
-
-    with pl.scope():
-        target_hidden_l41 = pl.slice(dspark_target_hidden, [local_t, D], [0, D])
-        hc_head(x_ping, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_l41)
 
     with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)
@@ -1011,8 +997,38 @@ def decode_fwd(
     clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
 
     with pl.scope():
-        hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
-        dspark_target_hidden = pl.assemble(dspark_target_hidden, hidden_workspace, [0, 2 * D])
+        target_hc_stack = pl.create_tensor([MOE_TOKENS * 3, HC_MULT, D], dtype=pl.FP32)
+        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_pack_target_hc"):
+            if token < local_t:
+                target_row = token * 3
+                target_hc_stack[target_row : target_row + 1, 0 : HC_MULT, 0 : D] = x_pong[
+                    token : token + 1, 0 : HC_MULT, 0 : D,
+                ]
+                target_hc_stack[target_row + 1 : target_row + 2, 0 : HC_MULT, 0 : D] = x_ping[
+                    token : token + 1, 0 : HC_MULT, 0 : D,
+                ]
+                target_hc_stack[target_row + 2 : target_row + 3, 0 : HC_MULT, 0 : D] = pre_hc_hidden_out[
+                    token : token + 1, 0 : HC_MULT, 0 : D,
+                ]
+        target_rows = local_t * 3
+        target_hc_active = pl.slice(target_hc_stack, [target_rows, HC_MULT, D], [0, 0, 0])
+        target_hidden_stack = pl.create_tensor([MOE_TOKENS * 3, D], dtype=pl.BF16)
+        target_hidden_active = pl.slice(target_hidden_stack, [target_rows, D], [0, 0])
+        hc_head(target_hc_active, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_active)
+        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_target_hidden"):
+            if token < local_t:
+                target_row = token * 3
+                target_hidden_l40 = target_hidden_stack[target_row : target_row + 1, 0:D]
+                target_hidden_l41 = target_hidden_stack[target_row + 1 : target_row + 2, 0:D]
+                target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
+                dspark_target_hidden[token : token + 1, 0:D] = target_hidden_l40
+                dspark_target_hidden[token : token + 1, D : 2 * D] = target_hidden_l41
+                dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = target_hidden_l42
+        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_final_hidden"):
+            if token < local_t:
+                target_row = token * 3
+                target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
+                hidden_workspace[token : token + 1, 0:D] = target_hidden_l42
         final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
         lm_head(
             x_out,
