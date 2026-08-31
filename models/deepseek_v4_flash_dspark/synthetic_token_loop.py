@@ -1190,6 +1190,7 @@ def _run_session(args, runtime_dirs, model_dir: Path) -> None:
             platform=args.platform,
             device_id=0,
             backend_type=BackendType.Ascend950,
+            ring_heap=stages["markov"].module.LM_HEAD_RING_HEAP,
             **swimlane,
         ),
     }
