@@ -1255,6 +1255,7 @@ def _run_session(args, runtime_dirs, model_dir: Path) -> None:
         "markov": RunConfig(
             platform=args.platform,
             device_id=0,
+            ring_heap=stages["markov"].module.LM_HEAD_RING_HEAP,
             **swimlane,
         ),
     }
