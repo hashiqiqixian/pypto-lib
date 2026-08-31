@@ -358,7 +358,6 @@ def prefill_fwd(
     final_norm_w: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    hidden_workspace: pl.Tensor[[FWD_GROUP_TOKENS_DYN, D], pl.BF16],
     dspark_target_hidden: pl.Out[pl.Tensor[[FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
@@ -1187,7 +1186,6 @@ def l3_prefill_fwd(
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
-    hidden_workspace: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, D], pl.BF16],
     dspark_target_hidden: pl.Out[pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
@@ -1203,7 +1201,6 @@ def l3_prefill_fwd(
     The device schedule, including MoE collectives, runs over physical P/L.
     """
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
-    hidden_workspace.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     dspark_target_hidden.bind_dynamic(1, FWD_TOKENS_DYN)
     x_out.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     attn_stage.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
@@ -1317,7 +1314,7 @@ def l3_prefill_fwd(
             post_ffn[r], comb_ffn[r], ffn_out[r],
             hc_head_fn[r], hc_head_scale[r], hc_head_base[r],
             final_norm_w[r], lm_head_weight[r], logit_row_indices[r],
-            hidden_workspace[r], dspark_target_hidden[r],
+            dspark_target_hidden[r],
             x_out[r], logits[r], sampled_ids[r],
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
@@ -1864,9 +1861,6 @@ def build_tensor_specs(
         indices[::TP_SIZE, 0] = active_tokens - 1
         return indices
 
-    def init_hidden_workspace():
-        return torch.zeros(N_RANKS, stage_tokens, D, dtype=torch.bfloat16)
-
     head_specs = [
         TensorSpec("hc_head_fn", [N_RANKS, HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
         TensorSpec("hc_head_scale", [N_RANKS, 1], torch.float32, init_value=init_hc_head_scale),
@@ -1874,7 +1868,6 @@ def build_tensor_specs(
         TensorSpec("final_norm_w", [N_RANKS, D], torch.bfloat16, init_value=init_final_norm_w),
         TensorSpec("lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight),
         TensorSpec("logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices),
-        TensorSpec("hidden_workspace", [N_RANKS, stage_tokens, D], torch.bfloat16, init_value=init_hidden_workspace),
         TensorSpec(
             "dspark_target_hidden",
             [N_RANKS, local_tokens, MAIN_HIDDEN_DIM],
