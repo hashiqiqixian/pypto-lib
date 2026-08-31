@@ -49,7 +49,7 @@ from config import (
 )
 from dspark_attention import dspark_attention
 from dspark_context_kv import dspark_context_kv
-from dspark_proj import dspark_proj
+from dspark_proj import MAIN_HIDDEN_DIM, dspark_proj
 from decode_o_proj import (
     ATTENTION_PUBLISH_WORKERS,
     ATTENTION_WINDOW_ROWS,
@@ -133,7 +133,7 @@ O_GROUPS = M.o_groups
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
-MAIN_IN = DSPARK_DRAFT_LAYERS * D
+MAIN_IN = MAIN_HIDDEN_DIM
 
 WIN = M.sliding_window
 PAD_D_TILE = 512
