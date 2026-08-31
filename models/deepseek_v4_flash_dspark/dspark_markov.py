@@ -16,6 +16,7 @@ from config import FLASH as M
 from lm_head import (
     DONE_VALUE,
     GROUP_LOGIT_ROWS,
+    LM_HEAD_RING_HEAP,
     MAX_LOGIT_ROWS,
     TP_SIZE,
     VOCAB_PER_TP,
@@ -980,6 +981,7 @@ if __name__ == "__main__":
         assert len(device_ids) >= WORLD_SIZE
         fn = l3_distributed_markov_sample
         golden_fn = golden_distributed_markov
+        config["ring_heap"] = LM_HEAD_RING_HEAP
         config["distributed_config"] = DistributedConfig(
             device_ids=device_ids[:WORLD_SIZE],
             num_sub_workers=0,
