@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=4
-"""Compose the validated three-layer DeepSeek-V4-Flash DSpark drafter."""
+"""Compose the three-layer DeepSeek-V4-Flash DSpark drafter with DSA-CP attention."""
 
 import sys
 
@@ -81,9 +81,15 @@ from moe import (
     clear_moe_signals,
     moe,
 )
+from prefill_cp_token_allgather import (
+    PREFILL_GROUP_CAP,
+    TP_SIZE as PREFILL_CP_SIZE,
+    prefill_cp_token_allgather_step,
+)
 del sys.argv[_caller_argv_length:]
 
 T_MAIN_DYN = pl.dynamic("DSPARK_BACKBONE_T_MAIN_DYN")
+CP_CONTEXT_T_DYN = pl.dynamic("DSPARK_BACKBONE_CP_CONTEXT_T_DYN")
 B_DYN = pl.dynamic("DSPARK_BACKBONE_B_DYN")
 PREPARE_T_MAIN_DYN = pl.dynamic("DSPARK_PREPARE_T_MAIN_DYN")
 PREPARE_B_DYN = pl.dynamic("DSPARK_PREPARE_B_DYN")
@@ -96,9 +102,12 @@ DSPARK_QUERY_PAD = 8
 DSPARK_NOISE_TOKEN_ID = 128799
 DSPARK_SUPPORTED_BATCHES = (4, 8, 12, 16)
 DSPARK_MAX_BATCH = max(DSPARK_SUPPORTED_BATCHES)
+# Each rank owns complete seven-row request blocks; a CP group therefore carries
+# exactly DSPARK_CP_SIZE times one supported local batch.
 DSPARK_QUERY_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH
 DSPARK_MOE_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_PAD
 DSPARK_SWA_INDEX_WIDTH = (M.sliding_window + DSPARK_QUERY_WIDTH + 63) // 64 * 64
+DSPARK_CP_SIZE = PREFILL_CP_SIZE
 
 assert DECODE_SEQ == 1 + DSPARK_QUERY_WIDTH
 assert DSPARK_QUERY_WIDTH < DSPARK_QUERY_PAD
@@ -108,9 +117,13 @@ assert DSPARK_NOISE_TOKEN_ID < M.vocab_size
 assert DSPARK_SWA_INDEX_WIDTH >= M.sliding_window + DSPARK_QUERY_WIDTH
 assert DSPARK_QUERY_TOKENS <= LOCAL_T_PAD
 assert TP_SIZE == TP
-assert N_RANKS % TP_SIZE == 0
+assert DSPARK_CP_SIZE == TP_SIZE
+assert N_RANKS % DSPARK_CP_SIZE == 0
+assert PREFILL_TOKENS % DSPARK_CP_SIZE == 0
+assert DSPARK_CP_SIZE * DSPARK_QUERY_TOKENS <= PREFILL_GROUP_CAP
 assert (
-    DSPARK_MAX_BATCH
+    DSPARK_CP_SIZE
+    * DSPARK_MAX_BATCH
     * ((M.sliding_window + DSPARK_QUERY_WIDTH + BLOCK_SIZE - 1) // BLOCK_SIZE)
     <= KV_ORI_BLOCK_NUM
 )
@@ -186,7 +199,6 @@ def prepare_dspark_inputs(
 def build_dspark_metadata(
     anchor_positions: pl.Tensor[[METADATA_B_DYN], pl.INT32],
     block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, METADATA_B_DYN, ORI_MAX_BLOCKS], pl.INT32],
-    query_slot_mapping: pl.Tensor[[DSPARK_DRAFT_LAYERS, DSPARK_QUERY_TOKENS], pl.INT64],
     swa_indices: pl.Tensor[[DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     swa_lens: pl.Tensor[[DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH], pl.INT32],
     query_positions: pl.Tensor[[DSPARK_QUERY_TOKENS], pl.INT32],
@@ -196,22 +208,12 @@ def build_dspark_metadata(
     for metadata_core in pl.spmd(1, name_hint="dspark_query_metadata"):
         for token in pl.range(metadata_core, DSPARK_QUERY_TOKENS):
             pl.write(query_positions, [token], pl.cast(0, pl.INT32))
-            for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                pl.write(query_slot_mapping, [layer, token], pl.cast(-1, pl.INT64))
             if token < active_tokens:
                 request = token // DSPARK_QUERY_WIDTH
                 query_offset = token % DSPARK_QUERY_WIDTH
                 anchor_position = pl.read(anchor_positions, [request])
                 query_position = anchor_position + 1 + query_offset
                 pl.write(query_positions, [token], pl.cast(query_position, pl.INT32))
-                for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                    logical_block = query_position // BLOCK_SIZE
-                    block_offset = query_position % BLOCK_SIZE
-                    physical_block = pl.read(
-                        block_tables, [layer, request, pl.cast(logical_block, pl.INDEX)]
-                    )
-                    query_slot = physical_block * BLOCK_SIZE + block_offset
-                    pl.write(query_slot_mapping, [layer, token], pl.cast(query_slot, pl.INT64))
 
     for request in pl.spmd(DSPARK_MAX_BATCH, name_hint="dspark_visible_metadata"):
         start_position = pl.cast(0, pl.INT32)
@@ -241,7 +243,6 @@ def build_dspark_metadata(
                     )
                 pl.write(swa_indices, [layer, request, visible_offset], visible_slot)
     return (
-        query_slot_mapping,
         swa_indices,
         swa_lens,
         query_positions,
@@ -265,8 +266,9 @@ def draft_layer(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     query_positions: pl.Tensor[[T_QUERY], pl.INT32],
+    query_group_positions: pl.Tensor[[DSPARK_CP_SIZE * T_QUERY], pl.INT32],
     kv_cache: pl.Tensor[[KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    query_slot_mapping: pl.Tensor[[T_QUERY], pl.INT64],
+    query_group_slot_mapping: pl.Tensor[[DSPARK_CP_SIZE * T_QUERY], pl.INT64],
     swa_indices: pl.Tensor[[DSPARK_MAX_BATCH, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     swa_lens: pl.Tensor[[DSPARK_MAX_BATCH], pl.INT32],
     attn_sink: pl.Tensor[[DSPARK_DRAFT_LAYERS * H], pl.FP32],
@@ -294,12 +296,14 @@ def draft_layer(
     shared_w2: pl.Tensor[[DSPARK_DRAFT_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS * D], pl.FP32],
     output_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hidden_gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
+    hidden_gather_signal: pld.DistributedTensor[[DSPARK_CP_SIZE, 1], pl.INT32],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
+    dsa_cp_rank: pl.Scalar[pl.INT32],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -367,15 +371,28 @@ def draft_layer(
         [0, 0],
     )
     rms_norm(query_mixed_active, layer_attn_norm_w, query_normed)
+    query_group = pl.create_tensor(
+        [DSPARK_CP_SIZE * T_QUERY, D], dtype=pl.BF16
+    )
+    with pl.scope():
+        _gathered_query, hidden_gather_signal = prefill_cp_token_allgather_step(
+            query_normed,
+            query_group,
+            hidden_gather_window,
+            hidden_gather_signal,
+            group_base,
+            dsa_cp_rank,
+        )
     o_packed_heads = pl.create_tensor(
         [O_GROUPS * LOCAL_T_PAD * (H // O_GROUPS), HEAD_DIM],
         dtype=pl.BF16,
     )
     dspark_attention(
         query_normed,
+        query_group,
         layer_wq_a, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_gamma_cq, layer_gamma_ckv,
-        freqs_cos, freqs_sin, query_positions,
-        kv_cache, query_slot_mapping, swa_indices, swa_lens,
+        freqs_cos, freqs_sin, query_positions, query_group_positions,
+        kv_cache, query_group_slot_mapping, swa_indices, swa_lens,
         layer_attn_sink, o_packed_heads,
     )
     attention_grouped = pl.reshape(
@@ -385,6 +402,8 @@ def draft_layer(
     attention_local_flat = pl.create_tensor(
         [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16
     )
+    # DSA-CP reuses the same physical four-rank group as TP-sharded O projection.
+    tp_rank = dsa_cp_rank
     with pl.spmd(
         ATTENTION_PUBLISH_WORKERS,
         name_hint="dspark_o_group_publish",
@@ -474,7 +493,7 @@ def draft_layer(
         arrived, data_arrived, routed_y_buf, combine_arrived,
         layer_id, active_tokens, my_rank, moe_epoch,
     )
-    return output_hc
+    return output_hc, hidden_gather_signal
 
 @pl.jit
 def dspark_drafter(
@@ -485,14 +504,18 @@ def dspark_drafter(
     last_sampled: pl.Tensor[[B_DYN], pl.INT64],
     next_prefill_tokens: pl.Tensor[[B_DYN], pl.INT64],
     embedding_weight: pl.Tensor[[VOCAB, D], pl.BF16],
-    context_position_ids: pl.Tensor[[T_MAIN_DYN], pl.INT32],
-    context_slot_mapping: pl.Tensor[
-        [DSPARK_DRAFT_LAYERS, T_MAIN_DYN], pl.INT64
+    context_group_position_ids: pl.Tensor[[CP_CONTEXT_T_DYN], pl.INT32],
+    context_group_slot_mapping: pl.Tensor[
+        [DSPARK_DRAFT_LAYERS, CP_CONTEXT_T_DYN], pl.INT64
     ],
     anchor_positions: pl.Tensor[[B_DYN], pl.INT32],
     block_tables: pl.Tensor[
         [DSPARK_DRAFT_LAYERS, B_DYN, ORI_MAX_BLOCKS],
         pl.INT32,
+    ],
+    query_group_position_ids: pl.Tensor[[DSPARK_CP_SIZE * T_QUERY], pl.INT32],
+    query_group_slot_mapping: pl.Tensor[
+        [DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * T_QUERY], pl.INT64
     ],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
@@ -540,6 +563,8 @@ def dspark_drafter(
         pl.Tensor[[DSPARK_DRAFT_LAYERS, T, HC_MULT, D], pl.FP32]
     ],
     head_hidden: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16]],
+    hidden_gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
+    hidden_gather_signal: pld.DistributedTensor[[DSPARK_CP_SIZE, 1], pl.INT32],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
@@ -553,12 +578,22 @@ def dspark_drafter(
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
+    dsa_cp_rank: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
+    """Run one local-query shard of the DSA-CP drafter.
+
+    Every rank in the four-rank group must provide the same number of local
+    ``target_hidden`` rows. Group position and slot metadata must contain exactly
+    four times that row count in rank-major order; padded rows use slot ``-1``.
+    Physical slots use one group-global block namespace replicated on all ranks.
+    The group row count must not exceed ``PREFILL_GROUP_CAP`` (8192). The runtime
+    does not validate relationships between dynamic tensor axes, so the
+    dispatching host must reject inputs that violate this contract.
+    """
     target_hidden.bind_dynamic(0, T_MAIN_DYN)
-    context_position_ids.bind_dynamic(0, T_MAIN_DYN)
-    context_slot_mapping.bind_dynamic(1, T_MAIN_DYN)
+    context_group_position_ids.bind_dynamic(0, CP_CONTEXT_T_DYN)
+    context_group_slot_mapping.bind_dynamic(1, CP_CONTEXT_T_DYN)
     num_sampled.bind_dynamic(0, B_DYN)
     last_sampled.bind_dynamic(0, B_DYN)
     next_prefill_tokens.bind_dynamic(0, B_DYN)
@@ -593,20 +628,29 @@ def dspark_drafter(
         query_token_ids,
         hidden_0_flat,
     )
-    dspark_context_kv(
-        main_x, wkv_0, gamma_ckv_0, freqs_cos, freqs_sin,
-        context_position_ids, context_slot_mapping, pl.const(0, pl.INT32), kv_cache_0,
+    group_context_tokens = pl.tensor.dim(context_group_position_ids, 0)
+    group_main_x = pl.create_tensor([group_context_tokens, D], dtype=pl.BF16)
+    _gathered_context, hidden_gather_signal = prefill_cp_token_allgather_step(
+        main_x,
+        group_main_x,
+        hidden_gather_window,
+        hidden_gather_signal,
+        group_base,
+        dsa_cp_rank,
     )
     dspark_context_kv(
-        main_x, wkv_1, gamma_ckv_1, freqs_cos, freqs_sin,
-        context_position_ids, context_slot_mapping, pl.const(1, pl.INT32), kv_cache_1,
+        group_main_x, wkv_0, gamma_ckv_0, freqs_cos, freqs_sin,
+        context_group_position_ids, context_group_slot_mapping, pl.const(0, pl.INT32), kv_cache_0,
     )
     dspark_context_kv(
-        main_x, wkv_2, gamma_ckv_2, freqs_cos, freqs_sin,
-        context_position_ids, context_slot_mapping, pl.const(2, pl.INT32), kv_cache_2,
+        group_main_x, wkv_1, gamma_ckv_1, freqs_cos, freqs_sin,
+        context_group_position_ids, context_group_slot_mapping, pl.const(1, pl.INT32), kv_cache_1,
+    )
+    dspark_context_kv(
+        group_main_x, wkv_2, gamma_ckv_2, freqs_cos, freqs_sin,
+        context_group_position_ids, context_group_slot_mapping, pl.const(2, pl.INT32), kv_cache_2,
     )
 
-    query_slot_mapping = pl.create_tensor([DSPARK_DRAFT_LAYERS, T_QUERY], dtype=pl.INT64)
     swa_indices = pl.create_tensor(
         [DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH, DSPARK_SWA_INDEX_WIDTH],
         dtype=pl.INT32,
@@ -614,14 +658,12 @@ def dspark_drafter(
     swa_lens = pl.create_tensor([DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH], dtype=pl.INT32)
     query_positions = pl.create_tensor([T_QUERY], dtype=pl.INT32)
     (
-        query_slot_mapping,
         swa_indices,
         swa_lens,
         query_positions,
     ) = build_dspark_metadata(
         anchor_positions,
         block_tables,
-        query_slot_mapping,
         swa_indices,
         swa_lens,
         query_positions,
@@ -633,12 +675,12 @@ def dspark_drafter(
     swa_lens_1 = swa_lens[1]
     swa_lens_2 = swa_lens[2]
     hidden_1 = intermediate_hidden[0]
-    hidden_1 = draft_layer(
+    hidden_1, hidden_gather_signal = draft_layer(
         initial_hidden, pl.const(0, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, query_positions,
-        kv_cache_0, query_slot_mapping[0], swa_indices_0, swa_lens_0,
+        freqs_cos, freqs_sin, query_positions, query_group_position_ids,
+        kv_cache_0, query_group_slot_mapping[0], swa_indices_0, swa_lens_0,
         attn_sink, wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_w,
         gate_w, gate_bias, tid2eid, query_token_ids,
@@ -646,18 +688,19 @@ def dspark_drafter(
         routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        hidden_1, attention_window, attention_signal, o_window, o_signal, group_base, tp_rank,
+        hidden_1, hidden_gather_window, hidden_gather_signal,
+        attention_window, attention_signal, o_window, o_signal, group_base, dsa_cp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
         pl.const(40, pl.INT32), active_tokens, my_rank, pl.const(1, pl.INT32),
     )
 
     hidden_2 = intermediate_hidden[1]
-    hidden_2 = draft_layer(
+    hidden_2, hidden_gather_signal = draft_layer(
         hidden_1, pl.const(1, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, query_positions,
-        kv_cache_1, query_slot_mapping[1], swa_indices_1, swa_lens_1,
+        freqs_cos, freqs_sin, query_positions, query_group_position_ids,
+        kv_cache_1, query_group_slot_mapping[1], swa_indices_1, swa_lens_1,
         attn_sink, wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_w,
         gate_w, gate_bias, tid2eid, query_token_ids,
@@ -665,18 +708,19 @@ def dspark_drafter(
         routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        hidden_2, attention_window, attention_signal, o_window, o_signal, group_base, tp_rank,
+        hidden_2, hidden_gather_window, hidden_gather_signal,
+        attention_window, attention_signal, o_window, o_signal, group_base, dsa_cp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
         pl.const(41, pl.INT32), active_tokens, my_rank, pl.const(2, pl.INT32),
     )
 
     hidden_3 = intermediate_hidden[2]
-    hidden_3 = draft_layer(
+    hidden_3, hidden_gather_signal = draft_layer(
         hidden_2, pl.const(2, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, query_positions,
-        kv_cache_2, query_slot_mapping[2], swa_indices_2, swa_lens_2,
+        freqs_cos, freqs_sin, query_positions, query_group_position_ids,
+        kv_cache_2, query_group_slot_mapping[2], swa_indices_2, swa_lens_2,
         attn_sink, wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_w,
         gate_w, gate_bias, tid2eid, query_token_ids,
@@ -684,7 +728,8 @@ def dspark_drafter(
         routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        hidden_3, attention_window, attention_signal, o_window, o_signal, group_base, tp_rank,
+        hidden_3, hidden_gather_window, hidden_gather_signal,
+        attention_window, attention_signal, o_window, o_signal, group_base, dsa_cp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
         pl.const(42, pl.INT32), active_tokens, my_rank, pl.const(3, pl.INT32),
     )
@@ -719,12 +764,18 @@ def l3_dspark_drafter(
     last_sampled: pl.Tensor[[N_RANKS, B_DYN], pl.INT64],
     next_prefill_tokens: pl.Tensor[[N_RANKS, B_DYN], pl.INT64],
     embedding_weight: pl.Tensor[[N_RANKS, VOCAB, D], pl.BF16],
-    context_position_ids: pl.Tensor[[N_RANKS, T_MAIN_DYN], pl.INT32],
-    context_slot_mapping: pl.Tensor[
-        [N_RANKS, DSPARK_DRAFT_LAYERS, T_MAIN_DYN], pl.INT64
+    context_group_position_ids: pl.Tensor[[N_RANKS, CP_CONTEXT_T_DYN], pl.INT32],
+    context_group_slot_mapping: pl.Tensor[
+        [N_RANKS, DSPARK_DRAFT_LAYERS, CP_CONTEXT_T_DYN], pl.INT64
     ],
     anchor_positions: pl.Tensor[[N_RANKS, B_DYN], pl.INT32],
     block_tables: pl.Tensor[[N_RANKS, DSPARK_DRAFT_LAYERS, B_DYN, ORI_MAX_BLOCKS], pl.INT32],
+    query_group_position_ids: pl.Tensor[
+        [N_RANKS, DSPARK_CP_SIZE * T_QUERY], pl.INT32
+    ],
+    query_group_slot_mapping: pl.Tensor[
+        [N_RANKS, DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * T_QUERY], pl.INT64
+    ],
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, DSPARK_DRAFT_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -769,8 +820,8 @@ def l3_dspark_drafter(
     head_hidden: pl.Out[pl.Tensor[[N_RANKS, B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16]],
 ):
     target_hidden.bind_dynamic(1, T_MAIN_DYN)
-    context_position_ids.bind_dynamic(1, T_MAIN_DYN)
-    context_slot_mapping.bind_dynamic(2, T_MAIN_DYN)
+    context_group_position_ids.bind_dynamic(1, CP_CONTEXT_T_DYN)
+    context_group_slot_mapping.bind_dynamic(2, CP_CONTEXT_T_DYN)
     num_sampled.bind_dynamic(1, B_DYN)
     last_sampled.bind_dynamic(1, B_DYN)
     next_prefill_tokens.bind_dynamic(1, B_DYN)
@@ -778,6 +829,12 @@ def l3_dspark_drafter(
     block_tables.bind_dynamic(2, B_DYN)
     head_hidden.bind_dynamic(1, B_DYN)
 
+    hidden_gather_window_buf = pld.alloc_window_buffer(
+        [PREFILL_GROUP_CAP, D], dtype=pl.BF16
+    )
+    hidden_gather_signal_buf = pld.alloc_window_buffer(
+        [DSPARK_CP_SIZE, 1], dtype=pl.INT32
+    )
     attention_window_buf = pld.alloc_window_buffer(
         [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16
     )
@@ -796,6 +853,12 @@ def l3_dspark_drafter(
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
+        hidden_gather_window = pld.window(
+            hidden_gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16
+        )
+        hidden_gather_signal = pld.window(
+            hidden_gather_signal_buf, [DSPARK_CP_SIZE, 1], dtype=pl.INT32
+        )
         attention_window = pld.window(
             attention_window_buf, [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16
         )
@@ -816,8 +879,9 @@ def l3_dspark_drafter(
             target_hidden[rank], main_proj_weight[rank], main_norm_weight[rank],
             num_sampled[rank], last_sampled[rank], next_prefill_tokens[rank],
             embedding_weight[rank],
-            context_position_ids[rank], context_slot_mapping[rank],
+            context_group_position_ids[rank], context_group_slot_mapping[rank],
             anchor_positions[rank], block_tables[rank],
+            query_group_position_ids[rank], query_group_slot_mapping[rank],
             freqs_cos[rank], freqs_sin[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_w[rank],
             wq_a[rank], wq_b[rank], wq_b_scale[rank], wkv[rank], gamma_cq[rank], gamma_ckv[rank],
@@ -830,9 +894,10 @@ def l3_dspark_drafter(
             shared_w2[rank], shared_w2_scale[rank],
             hc_head_fn[rank], hc_head_scale[rank], hc_head_base[rank], initial_hidden[rank],
             intermediate_hidden[rank], head_hidden[rank],
+            hidden_gather_window, hidden_gather_signal,
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-            rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
+            rank // DSPARK_CP_SIZE * DSPARK_CP_SIZE, rank % DSPARK_CP_SIZE,
             rank,
             device=rank,
         )
@@ -863,16 +928,18 @@ def _block_tables(batch):
 
     logical = torch.arange(ORI_MAX_BLOCKS, dtype=torch.int32)
     tables = torch.empty(N_RANKS, DSPARK_DRAFT_LAYERS, batch, ORI_MAX_BLOCKS, dtype=torch.int32)
-    blocks_per_request = ORI_BLOCK_NUM // batch
+    blocks_per_request = ORI_BLOCK_NUM // (DSPARK_CP_SIZE * batch)
     required_blocks = (WIN + DSPARK_QUERY_WIDTH + BLOCK_SIZE - 1) // BLOCK_SIZE
     if blocks_per_request < required_blocks:
         raise ValueError(
-            "DSpark fixture KV cache cannot assign a sliding-window ring to every local request"
+            "DSpark fixture KV cache cannot assign a sliding-window ring to every CP request"
         )
     for rank in range(N_RANKS):
+        cp_rank = rank % DSPARK_CP_SIZE
         for layer in range(DSPARK_DRAFT_LAYERS):
             for request in range(batch):
-                request_base = request * blocks_per_request
+                group_request = cp_rank * batch + request
+                request_base = group_request * blocks_per_request
                 ring_offset = layer * 7
                 request_block = (logical + ring_offset) % blocks_per_request
                 tables[rank, layer, request] = request_base + request_block
@@ -947,21 +1014,22 @@ def build_tensor_specs(batch, *, mode="decode"):
             ] = torch.arange(context_start, context_start + valid_count, dtype=torch.int32)
         first_cached_positions = None
     else:
-        local_context_tokens = PREFILL_TOKENS
-        request_counts = torch.full(
-            (batch,), local_context_tokens // batch, dtype=torch.int32
+        local_context_tokens = PREFILL_TOKENS // DSPARK_CP_SIZE
+        local_rows = torch.arange(local_context_tokens, dtype=torch.int32)
+        cp_ranks = torch.arange(N_RANKS, dtype=torch.int32) % DSPARK_CP_SIZE
+        context_positions = (
+            cp_ranks[:, None] * local_context_tokens + local_rows[None, :]
         )
-        request_counts[: local_context_tokens % batch] += 1
-        context_request_ids = torch.arange(batch, dtype=torch.int64).repeat_interleave(
-            request_counts.to(torch.int64)
+        context_request_ids = torch.zeros(local_context_tokens, dtype=torch.int64)
+        context_offsets = local_rows
+        positions = torch.full(
+            (N_RANKS, batch), WIN - 1, dtype=torch.int32
         )
-        context_offsets = torch.cat(
-            [torch.arange(int(count), dtype=torch.int32) for count in request_counts]
-        )
-        context_positions = context_offsets.unsqueeze(0).expand(N_RANKS, -1).contiguous()
-        positions = (request_counts - 1).unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        positions[::DSPARK_CP_SIZE, 0] = PREFILL_TOKENS - 1
         valid_mask = None
-        first_cached_positions = torch.clamp(request_counts - WIN, min=0)
+        first_cached_positions = torch.full(
+            (batch,), max(PREFILL_TOKENS - WIN, 0), dtype=torch.int32
+        )
     if int(context_positions.min()) < 0 or int(context_positions.max()) >= ORI_MAX_BLOCKS * BLOCK_SIZE:
         raise ValueError("DSpark context positions exceed the logical KV block table")
     if int((positions + DSPARK_QUERY_WIDTH).max()) >= ORI_MAX_BLOCKS * BLOCK_SIZE:
@@ -969,13 +1037,78 @@ def build_tensor_specs(batch, *, mode="decode"):
     tables = _block_tables(batch)
     if int(tables.min()) < 0 or int(tables.max()) >= ORI_BLOCK_NUM:
         raise ValueError("DSpark block table references a physical KV block outside the cache")
-    context_slots = _context_slots(
-        tables,
-        context_positions,
-        context_request_ids,
-        valid_mask=valid_mask,
-        first_cached_positions=first_cached_positions,
+    if mode == "decode":
+        context_slots = _context_slots(
+            tables,
+            context_positions,
+            context_request_ids,
+            valid_mask=valid_mask,
+            first_cached_positions=first_cached_positions,
+        )
+    else:
+        # Model one real prompt split over the four rank-major token shards. Its
+        # query is owned by request zero on the group leader; other requests are
+        # valid computational fillers required by the B4/B8/B12/B16 ABI.
+        context_tables = tables.clone()
+        for rank in range(N_RANKS):
+            group_base = rank // DSPARK_CP_SIZE * DSPARK_CP_SIZE
+            context_tables[rank, :, 0] = tables[group_base, :, 0]
+        context_slots = _context_slots(
+            context_tables,
+            context_positions,
+            context_request_ids,
+            valid_mask=valid_mask,
+            first_cached_positions=first_cached_positions,
+        )
+    context_group_positions = torch.empty(
+        N_RANKS, DSPARK_CP_SIZE * local_context_tokens, dtype=torch.int32
     )
+    context_group_slots = torch.empty(
+        N_RANKS,
+        DSPARK_DRAFT_LAYERS,
+        DSPARK_CP_SIZE * local_context_tokens,
+        dtype=torch.int64,
+    )
+    query_positions_local = torch.zeros(N_RANKS, T_QUERY, dtype=torch.int32)
+    query_slots_local = torch.full(
+        (N_RANKS, DSPARK_DRAFT_LAYERS, T_QUERY), -1, dtype=torch.int64
+    )
+    for rank in range(N_RANKS):
+        group_base = rank // DSPARK_CP_SIZE * DSPARK_CP_SIZE
+        group_slice = slice(group_base, group_base + DSPARK_CP_SIZE)
+        context_group_positions[rank] = context_positions[group_slice].reshape(-1)
+        context_group_slots[rank] = context_slots[group_slice].permute(1, 0, 2).reshape(
+            DSPARK_DRAFT_LAYERS, -1
+        )
+        for request in range(batch):
+            anchor = int(positions[rank, request])
+            for offset in range(DSPARK_QUERY_WIDTH):
+                token = request * DSPARK_QUERY_WIDTH + offset
+                query_position = anchor + 1 + offset
+                query_positions_local[rank, token] = query_position
+                for layer in range(DSPARK_DRAFT_LAYERS):
+                    physical_block = int(
+                        tables[rank, layer, request, query_position // BLOCK_SIZE]
+                    )
+                    query_slots_local[rank, layer, token] = (
+                        physical_block * BLOCK_SIZE + query_position % BLOCK_SIZE
+                    )
+    query_group_positions = torch.empty(
+        N_RANKS, DSPARK_CP_SIZE * T_QUERY, dtype=torch.int32
+    )
+    query_group_slots = torch.empty(
+        N_RANKS,
+        DSPARK_DRAFT_LAYERS,
+        DSPARK_CP_SIZE * T_QUERY,
+        dtype=torch.int64,
+    )
+    for rank in range(N_RANKS):
+        group_base = rank // DSPARK_CP_SIZE * DSPARK_CP_SIZE
+        group_slice = slice(group_base, group_base + DSPARK_CP_SIZE)
+        query_group_positions[rank] = query_positions_local[group_slice].reshape(-1)
+        query_group_slots[rank] = query_slots_local[group_slice].permute(1, 0, 2).reshape(
+            DSPARK_DRAFT_LAYERS, -1
+        )
     request_ids = torch.arange(batch, dtype=torch.int64).unsqueeze(0)
     owner_ids = torch.arange(N_RANKS, dtype=torch.int64).unsqueeze(1)
     last_sampled = owner_ids * batch + request_ids + 1
@@ -995,11 +1128,15 @@ def build_tensor_specs(batch, *, mode="decode"):
         base = ((columns % 31) - 15) * 0.002
         for rank in range(N_RANKS):
             for row in range(local_context_tokens):
-                request = int(context_request_ids[row])
-                offset = int(context_offsets[row])
-                values[rank, row, :D] = (
-                    base + 0.01 * (rank + request + 1) + 0.001 * offset
-                ).to(torch.bfloat16)
+                if mode == "prefill":
+                    group = rank // DSPARK_CP_SIZE
+                    global_position = int(context_positions[rank, row])
+                    row_value = base + 0.01 * (group + 1) + 0.001 * global_position
+                else:
+                    request = int(context_request_ids[row])
+                    offset = int(context_offsets[row])
+                    row_value = base + 0.01 * (rank + request + 1) + 0.001 * offset
+                values[rank, row, :D] = row_value.to(torch.bfloat16)
         return values
 
     def init_main_proj_weight():
@@ -1054,7 +1191,7 @@ def build_tensor_specs(batch, *, mode="decode"):
         for rank in range(N_RANKS):
             for layer in range(DSPARK_DRAFT_LAYERS):
                 cache[rank, layer].fill_(
-                    layer + 1 + rank * 0.25
+                    layer + 1 + (rank // DSPARK_CP_SIZE) * 0.25
                 )
         return cache
 
@@ -1084,19 +1221,31 @@ def build_tensor_specs(batch, *, mode="decode"):
         ),
         ranked("embedding_weight", [VOCAB, D], torch.bfloat16, init_value=init_embedding_weight, resident=True),
         ranked(
-            "context_position_ids",
-            [local_context_tokens],
+            "context_group_position_ids",
+            [DSPARK_CP_SIZE * local_context_tokens],
             torch.int32,
-            init_value=lambda: context_positions,
+            init_value=lambda: context_group_positions,
         ),
         ranked(
-            "context_slot_mapping",
-            [DSPARK_DRAFT_LAYERS, local_context_tokens],
+            "context_group_slot_mapping",
+            [DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * local_context_tokens],
             torch.int64,
-            init_value=lambda: context_slots,
+            init_value=lambda: context_group_slots,
         ),
         ranked("anchor_positions", [batch], torch.int32, init_value=lambda: positions),
         ranked("block_tables", [DSPARK_DRAFT_LAYERS, batch, ORI_MAX_BLOCKS], torch.int32, init_value=lambda: tables),
+        ranked(
+            "query_group_position_ids",
+            [DSPARK_CP_SIZE * T_QUERY],
+            torch.int32,
+            init_value=lambda: query_group_positions,
+        ),
+        ranked(
+            "query_group_slot_mapping",
+            [DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * T_QUERY],
+            torch.int64,
+            init_value=lambda: query_group_slots,
+        ),
         ranked("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=1, resident=True),
         ranked("freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, resident=True),
     ]
@@ -1168,6 +1317,39 @@ def build_tensor_specs(batch, *, mode="decode"):
     return specs
 
 
+def _dspark_kv_cache_compare():
+    """Compare the KV golden and every replica in each DSA-CP group."""
+    import torch
+
+    from golden import ratio_allclose
+
+    strict_compare = ratio_allclose(
+        atol=1e-4,
+        rtol=1.0 / 128,
+        max_error_ratio=0.0,
+    )
+
+    def compare(actual, expected, **kwargs):
+        if actual.shape != expected.shape:
+            return False, f"    KV shape mismatch: actual={tuple(actual.shape)}, expected={tuple(expected.shape)}"
+        if actual.shape[0] != N_RANKS:
+            return False, f"    expected {N_RANKS} rank replicas, got {actual.shape[0]}"
+
+        for group_base in range(0, N_RANKS, DSPARK_CP_SIZE):
+            reference = actual[group_base]
+            for peer_rank in range(group_base + 1, group_base + DSPARK_CP_SIZE):
+                if not torch.equal(actual[peer_rank], reference):
+                    return False, (
+                        f"    DSA-CP KV replica mismatch: rank {peer_rank} "
+                        f"!= rank {group_base}"
+                    )
+
+        return strict_compare(actual, expected, **kwargs)
+
+    compare.__name__ = "dspark_kv_cache_compare"
+    return compare
+
+
 def golden_dspark_drafter(tensors):
     import torch
 
@@ -1212,8 +1394,9 @@ def golden_dspark_drafter(tensors):
     tensors["initial_hidden"].zero_()
     tensors["intermediate_hidden"].zero_()
     positions = tensors["anchor_positions"]
-    tables = tensors["block_tables"]
-    context_slots = tensors["context_slot_mapping"]
+    group_context_slots = tensors["context_group_slot_mapping"]
+    group_query_slots = tensors["query_group_slot_mapping"]
+    local_context_tokens = tensors["target_hidden"].shape[1]
     selected_anchor_ids = torch.where(
         tensors["num_sampled"] > 0,
         tensors["last_sampled"],
@@ -1233,35 +1416,42 @@ def golden_dspark_drafter(tensors):
         tensors["initial_hidden"][rank] = hidden
         hidden_by_rank.append(hidden)
 
-    active_tokens = positions.shape[1] * DSPARK_QUERY_WIDTH
     for layer in range(DSPARK_DRAFT_LAYERS):
         layer_state = []
-        query_slots_by_rank = []
         for rank in range(N_RANKS):
             mixed, post, combine = hc_pre_zero_function(hidden_by_rank[rank])
             query_normed = rms_norm(mixed[: DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH])
             layer_state.append((post, combine, query_normed))
-            query_slots = []
-            for request in range(positions.shape[1]):
-                anchor = int(positions[rank, request])
-                for offset in range(1, DSPARK_QUERY_WIDTH + 1):
-                    position = anchor + offset
-                    physical_block = int(tables[rank, layer, request, position // BLOCK_SIZE])
-                    query_slots.append(physical_block * BLOCK_SIZE + position % BLOCK_SIZE)
-            query_slots_by_rank.append(torch.tensor(query_slots, dtype=torch.int64))
 
         for rank in range(N_RANKS):
             cache = tensors["kv_caches"][rank, layer].view(-1, HEAD_DIM)
-            layer_context_slots = context_slots[rank, layer]
-            valid_context = layer_context_slots >= 0
-            valid_context_slots = layer_context_slots[valid_context].long()
-            cache[valid_context_slots] = project_kv(
-                main_x_by_rank[rank][valid_context]
-            )
-            query_normed = layer_state[rank][2]
-            cache[query_slots_by_rank[rank]] = project_kv(
-                query_normed[:active_tokens]
-            )
+            group_base = rank // DSPARK_CP_SIZE * DSPARK_CP_SIZE
+            for source_cp, source_rank in enumerate(
+                range(group_base, group_base + DSPARK_CP_SIZE)
+            ):
+                context_start = source_cp * local_context_tokens
+                layer_context_slots = group_context_slots[
+                    rank,
+                    layer,
+                    context_start : context_start + local_context_tokens,
+                ]
+                valid_context = layer_context_slots >= 0
+                valid_context_slots = layer_context_slots[valid_context].long()
+                cache[valid_context_slots] = project_kv(
+                    main_x_by_rank[source_rank][valid_context]
+                )
+                query_start = source_cp * T_QUERY
+                layer_query_slots = group_query_slots[
+                    rank,
+                    layer,
+                    query_start : query_start + T_QUERY,
+                ]
+                valid_query = layer_query_slots >= 0
+                valid_query_slots = layer_query_slots[valid_query].long()
+                query_normed = layer_state[source_rank][2]
+                cache[valid_query_slots] = project_kv(
+                    query_normed[valid_query]
+                )
 
         next_hidden_by_rank = []
         for rank in range(N_RANKS):
@@ -1296,7 +1486,7 @@ def golden_dspark_drafter(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import run_jit
 
     parser = argparse.ArgumentParser(description="Validate the multi-rank DeepSeek V4 DSpark drafter.")
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
@@ -1328,7 +1518,7 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "kv_caches": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "kv_caches": _dspark_kv_cache_compare(),
         },
     )
     if not result.passed:

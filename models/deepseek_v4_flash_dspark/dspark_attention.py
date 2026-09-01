@@ -8,11 +8,12 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 DSpark drafter attention over the paged sliding-window cache.
 
-One anchor-first draft query block per request. Every draft row sees the trailing
-context window plus the whole draft block, so the visible slot list is per request,
-not per token, and carries no causal mask inside the block. Context KV is already
-resident (see dspark_context_kv); this kernel commits the block's own KV first and
-then reads window and block back through one index list.
+One anchor-first draft query block per request. Query rows remain on their DSA-CP
+token owner, while the KV input contains the complete rank-major CP-group stream.
+Every draft row sees the trailing context window plus the whole draft block, so
+the visible slot list is per request and carries no causal mask inside the block.
+Context KV is already resident (see dspark_context_kv); this kernel commits the
+block's own group KV before reading window and block through one index list.
 """
 
 import pypto.language as pl
@@ -28,6 +29,7 @@ from config import (
 from decode_o_proj import LOCAL_T_PAD
 from qkv_proj_rope import (
     kv_proj_rope,
+    materialize_rope_rows_dynamic,
     q_proj_rope,
     rope_prepare,
 )
@@ -35,6 +37,7 @@ from qkv_proj_rope import (
 
 # Dynamic shape variables.
 ORI_BLOCK_NUM_DYN = pl.dynamic("DSPARK_ATTENTION_ORI_BLOCK_NUM_DYN")
+KV_T_DYN = pl.dynamic("DSPARK_ATTENTION_KV_T_DYN")
 
 # model config
 B = DECODE_BATCH // TP
@@ -68,6 +71,7 @@ NEG_INF = -1.0e20
 @pl.jit.inline
 def dspark_attention(
     x: pl.Tensor[[T, D], pl.BF16],
+    kv_x: pl.Tensor[[KV_T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -77,8 +81,9 @@ def dspark_attention(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T], pl.INT32],
+    kv_position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    kv_slot_mapping: pl.Tensor[[T], pl.INT64],
+    kv_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[B, INDEX_WIDTH], pl.INT32],
     swa_lens: pl.Tensor[[B], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -86,6 +91,7 @@ def dspark_attention(
         [O_GROUPS * LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16
     ],
 ):
+    kv_tokens = pl.tensor.dim(kv_position_ids, 0)
     rope_cos_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
     for rope_t in pl.spmd(T, name_hint="dspark_q_rope_rows"):
@@ -111,16 +117,37 @@ def dspark_attention(
         q, qr, qr_scale,
     )
 
-    # Query and KV rows have the same stable request owner in Decode.
+    kv_rope_cos_t = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.BF16)
+    kv_rope_sin_t = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.BF16)
+    materialize_rope_rows_dynamic(
+        freqs_cos,
+        freqs_sin,
+        kv_position_ids,
+        kv_rope_cos_t,
+        kv_rope_sin_t,
+    )
+    kv_rope_cos_il = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.FP32)
+    kv_rope_sin_signed = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.FP32)
+    kv_rope_swap_idx = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.INT32)
+    rope_prepare(
+        kv_rope_cos_t,
+        kv_rope_sin_t,
+        kv_rope_cos_il,
+        kv_rope_sin_signed,
+        kv_rope_swap_idx,
+    )
+
+    # DSA-CP keeps Q on its token owner while every rank updates the complete
+    # group KV stream before running attention for its local queries.
     late_dep = pl.system.task_dummy(deps=[])
-    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([kv_tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(
-        x,
+        kv_x,
         wkv,
         gamma_ckv,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
+        kv_rope_cos_il,
+        kv_rope_sin_signed,
+        kv_rope_swap_idx,
         kv,
         late_dep,
     )
@@ -131,7 +158,7 @@ def dspark_attention(
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     sparse_bias = pl.create_tensor([B, INDEX_WIDTH], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_kv_commit_valid_bias"):
-        for write_t in pl.range(T):
+        for write_t in pl.range(kv_tokens):
             write_row_i64 = pl.read(kv_slot_mapping, [write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
@@ -285,8 +312,9 @@ def dspark_attention_test(
     )
     kv_cache, o_packed_flat = dspark_attention(
         x,
+        x,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, position_ids,
+        freqs_cos, freqs_sin, position_ids, position_ids,
         kv_cache, slot_mapping, swa_indices, swa_lens,
         attn_sink, o_packed_flat,
     )
