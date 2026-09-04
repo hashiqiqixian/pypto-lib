@@ -349,10 +349,12 @@ def golden_prefill_compressor_ratio4(tensors):
     import torch
 
     x = tensors["x"].view(T, D).float()
-    compress_state_flat = tensors["compress_state"].view(
-        CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE,
+    compress_state = tensors["compress_state"]
+    assert tuple(compress_state.shape[1:]) == (
+        CSA_STATE_BLOCK_SIZE,
         COMPRESS_STATE_DIM,
     )
+    compress_state_flat = compress_state.view(-1, COMPRESS_STATE_DIM)
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]

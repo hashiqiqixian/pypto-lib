@@ -243,9 +243,13 @@ DECODE_BATCH = 4                  # B: requests per decode step
 DECODE_SEQ = 2                    # S: [previous, current] tokens per serving step
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
-PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
+PREFILL_BATCH = 1                 # B: prefill batch for each leaf attention/MoE program
 PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
 PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
+# The serving-facing full-forward dispatch owns four independent requests per
+# rank. Leaf attention/MoE programs intentionally keep PREFILL_BATCH == 1 and
+# reuse their fixed 128-token workspace serially for every request slot.
+PREFILL_DISPATCH_BATCH = 4
 MOE_TOKENS = DECODE_TOKENS
 
 # Implementation constants
