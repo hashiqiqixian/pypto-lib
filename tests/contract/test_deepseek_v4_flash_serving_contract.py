@@ -19,7 +19,7 @@ def test_deepseek_v4_flash_serving_capabilities() -> None:
     assert CONTRACT.schema_version == "1"
     assert CONTRACT.prefill_tile_tokens == 128
     assert CONTRACT.max_prefill_tokens_per_request == 8192
-    assert CONTRACT.max_prefill_requests_per_partition == 1
+    assert CONTRACT.max_prefill_requests_per_partition == 4
     assert CONTRACT.requires_homogeneous_prefill_decode is True
 
 
@@ -51,5 +51,8 @@ def test_deepseek_v4_flash_prefill_padding_rejects_non_integer_extents(
 
 
 def test_deepseek_v4_flash_contract_matches_kernel_prefill_shape() -> None:
-    assert config.PREFILL_BATCH == CONTRACT.max_prefill_requests_per_partition
+    assert config.PREFILL_DISPATCH_BATCH == CONTRACT.max_prefill_requests_per_partition
+    assert config.PREFILL_BATCH == 1
     assert config.PREFILL_SEQ == CONTRACT.prefill_tile_tokens
+    assert config.PREFILL_TOKENS == config.PREFILL_SEQ
+    assert config.PREFILL_DISPATCH_BATCH * config.PREFILL_SEQ == 512

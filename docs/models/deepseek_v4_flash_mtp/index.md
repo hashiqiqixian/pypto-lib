@@ -19,7 +19,7 @@ that every kernel imports as a bare sibling module.
 | Speculative decoding | MTP = 1 — one draft token verified against the previous one, so a decode step carries `S = 2` token rows per request |
 | Decode batch per card | 4 requests → 8 token rows per step (`DECODE_BATCH`, `DECODE_SEQ`) |
 | Decode context length | up to 16,384 positions, paged in 128-token pages (`max_position_embeddings`, `BLOCK_SIZE`) |
-| Prefill shape | one request per rank partition, each with up to 8,192 active tokens per dispatch; the program walks the dynamic extent in 128-token tiles (`PREFILL_BATCH`, `PREFILL_SEQ`) |
+| Prefill shape | up to four independent requests per rank partition in one full-forward dispatch, each with up to 8,192 active tokens; every request walks its dynamic extent in request-isolated 128-token leaf tiles (`PREFILL_DISPATCH_BATCH`, `PREFILL_SEQ`) |
 | Platform | Ascend A2/A3, single node |
 | Expert parallelism | `--ep 2/4/8`; the deployment point is EP 8, and each rank holds `256 / ep` routed experts |
 | LM-head parallelism | `--tp 2/4/8/16` vocab shards over DP row owners, `--tp <= --ep` |
@@ -88,10 +88,15 @@ three compressor states) are passed in flat and sliced per layer.
 ### `prefill_fwd`
 
 [prefill_fwd.py](../../../models/deepseek_v4_flash_mtp/prefill_fwd.py) mirrors
-that structure for a packed prompt: the same per-rank kernel shape, the same
-per-stage scopes, `prefill_{swa,hca,csa}` in place of the decode
-orchestrations, and the same `hc_head → rms_norm → lm_head` tail over selected
-hidden rows.
+that structure for four request slots in one rank-local program. Every slot has
+its own block/state tables, token metadata, hidden outputs, and LM-head windows,
+while weights and physical cache pools remain shared by the rank. The program
+walks each active request in 128-token tiles, skips empty slots, advances MoE
+epochs only for executed tiles, and clears the communication signals after the
+last active slot. The leaf
+`prefill_{swa,hca,csa}` and MoE programs therefore retain their B1/S128 shape;
+the fixed B4 dimension belongs to the full-forward dispatch rather than to an
+individual attention tile.
 
 ### `decode_fwd_mtp`
 

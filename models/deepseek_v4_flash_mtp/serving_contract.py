@@ -65,6 +65,6 @@ DEEPSEEK_V4_FLASH_SERVING_CONTRACT = DeepSeekV4FlashServingContract(
     schema_version="1",
     prefill_tile_tokens=128,
     max_prefill_tokens_per_request=8192,
-    max_prefill_requests_per_partition=1,
+    max_prefill_requests_per_partition=4,
     requires_homogeneous_prefill_decode=True,
 )

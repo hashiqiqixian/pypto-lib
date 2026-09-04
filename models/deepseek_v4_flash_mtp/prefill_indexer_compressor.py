@@ -526,10 +526,12 @@ def golden_prefill_indexer_compressor(tensors):
 
     kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()   # wkv stored [OUT_DIM, D] for b_trans
     score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
-    compress_state_flat = tensors["compress_state"].view(
-        INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE,
+    compress_state = tensors["compress_state"]
+    assert tuple(compress_state.shape[1:]) == (
+        INNER_STATE_BLOCK_SIZE,
         COMPRESS_STATE_DIM,
     )
+    compress_state_flat = compress_state.view(-1, COMPRESS_STATE_DIM)
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["inner_compress_state_block_table"]
