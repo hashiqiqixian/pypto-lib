@@ -72,6 +72,7 @@ AUX_SCALE = 0
 AUX_W = 1
 IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/w
              # (an FP32 tile can't hold it: INDEX->FP32 casts are unsupported).
+SIGNAL_PAD = 128  # 512-byte isolation stride per independently published epoch slot
 
 assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
@@ -96,6 +97,39 @@ def clear_moe_signals(
             pl.write(arrived, [src, 0], zero)
             pl.write(data_arrived, [src, 0], zero)
             pl.write(combine_arrived, [src, 0], zero)
+
+
+@pl.jit.inline
+def clear_prefill_moe_signals(
+    completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    consumed: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    final_epoch: pl.Scalar[pl.INT32],
+):
+    """Retire the final prefill MoE epoch before resetting its windows."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_retire") as _retire_tid:
+        _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
+        for src in pl.range(N_RANKS):
+            pld.system.wait(
+                signal=consumed,
+                offsets=[src, 0],
+                expected=final_epoch,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="moe_signal_clear",
+        deps=[_retire_tid],
+    ):
+        zero = pl.cast(0, pl.INT32)
+        for src in pl.range(N_RANKS):
+            pl.write(arrived, [src, 0], zero)
+            pl.write(data_arrived, [src, 0], zero)
+            pl.write(combine_arrived, [src, 0], zero)
+            pl.write(consumed, [src, 0], zero)
 
 
 # === Dispatch ================================================================
@@ -321,7 +355,7 @@ def combine(
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
     dispatch_push_tid: pl.Scalar[pl.TASK_ID],
-):
+) -> pl.Scalar[pl.TASK_ID]:
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL * RECV_MAX, D])
     # One SPMD block per LOCAL EXPERT: block e pushes expert e's compact rows back to
     # their origin rank (= the source lane src they arrived on) at their route offset.
@@ -394,6 +428,7 @@ def combine(
             ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
         else:
             ffn_out[t:t + 1, :] = sh[t:t + 1, :]
+    return _reduce_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -437,7 +472,9 @@ def moe(
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id for the shared flag windows (distinct from layer_id).
     moe_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+) -> pl.Scalar[pl.TASK_ID]:
+    reduce_tids = pl.array.create(1, pl.TASK_ID)
+
     # Non-output intermediates allocate locally, in their producer's scope.
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
@@ -488,14 +525,98 @@ def moe(
         )
 
         ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-        combine(
+        reduce_tid = combine(
             recv_y, recv_r_route_out, sh,
             ffn_out, recv_meta_local,
             routed_y_buf, combine_arrived,
             num_tokens, my_rank, moe_epoch, dispatch_push_tid,
         )
+        reduce_tids[0] = reduce_tid
 
         hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+    return reduce_tids[0]
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_moe(
+    # model inputs
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    # final output
+    x_next: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    # windows
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    consumed: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait"):
+        x_anchor = pl.read(x_hc, [0, 0, 0])
+        if moe_epoch > 1:
+            for src in pl.range(N_RANKS):
+                pld.system.wait(
+                    signal=consumed,
+                    offsets=[src, 0],
+                    expected=pl.cast(moe_epoch - 1, pl.INT32),
+                    cmp=pld.WaitCmp.Ge,
+                )
+        pl.write(x_hc, [0, 0, 0], x_anchor)
+
+    reduce_tid = moe(
+        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias, tid2eid, input_ids,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        x_next,
+        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+        routed_y_buf, combine_arrived,
+        layer_id, num_tokens, my_rank, moe_epoch,
+    )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="moe_consumed",
+        deps=[reduce_tid],
+    ):
+        for peer in pl.range(N_RANKS):
+            pld.system.notify(
+                target=consumed,
+                peer=peer,
+                offsets=[my_rank, 0],
+                value=moe_epoch,
+                op=pld.NotifyOp.Set,
+            )
     return x_next
 
 
