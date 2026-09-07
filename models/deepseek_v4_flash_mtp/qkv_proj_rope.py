@@ -91,6 +91,10 @@ def materialize_rope_rows(
                 rope_pos = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
                 rope_cos_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
                 rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+            else:
+                rope_zero = pl.full([1, ROPE_DIM], dtype=pl.BF16, value=0.0)
+                rope_cos_t[rope_t : rope_t + 1, 0:ROPE_DIM] = rope_zero
+                rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = rope_zero
 
 @pl.jit.inline
 def qkv_proj_rope(

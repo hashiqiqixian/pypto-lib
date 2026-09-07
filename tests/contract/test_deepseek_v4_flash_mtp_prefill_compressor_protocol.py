@@ -144,6 +144,33 @@ def test_invalid_partial_tail_slots_do_not_issue_keepalive_writes() -> None:
         assert not _mapping_guard(_context(function, name_hint)).orelse
 
 
+def test_inactive_rope_rows_are_defined_as_zero() -> None:
+    function = _function(_tree("qkv_proj_rope.py"), "materialize_rope_rows")
+    guards = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "rope_t < num_tokens"
+    ]
+    assert len(guards) == 1
+
+    zero_assignments = [node for node in guards[0].orelse if isinstance(node, ast.Assign)]
+    assert len(zero_assignments) == 3
+    zero_value = zero_assignments[0]
+    assert ast.unparse(zero_value.targets[0]) == "rope_zero"
+    assert isinstance(zero_value.value, ast.Call)
+    assert _call_name(zero_value.value.func) == "pl.full"
+    assert ast.unparse(zero_value.value.args[0]) == "[1, ROPE_DIM]"
+    assert ast.unparse(_keyword(zero_value.value, "dtype")) == "pl.BF16"
+    assert ast.literal_eval(_keyword(zero_value.value, "value")) == 0.0
+
+    zero_stores = zero_assignments[1:]
+    assert [ast.unparse(store.targets[0].value) for store in zero_stores] == [
+        "rope_cos_t",
+        "rope_sin_t",
+    ]
+    assert all(ast.unparse(store.value) == "rope_zero" for store in zero_stores)
+
+
 def test_active_pool_taskid_orders_state_update() -> None:
     cases = (
         (
