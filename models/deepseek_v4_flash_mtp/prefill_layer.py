@@ -678,7 +678,7 @@ def prefill_layer_core(
             )
             x_next_request = pl.reshape(x_next_profile, [T, HC_MULT, D])
 
-            _prefill_layer_tile(
+            x_next_request = _prefill_layer_tile(
                 x_hc_request,
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_w, wq_a, wq_b, wq_b_scale,
@@ -712,6 +712,12 @@ def prefill_layer_core(
                 arrived, data_arrived, routed_y_buf, combine_arrived, consumed,
                 layer_id, valid_n, my_rank, moe_epoch,
             )
+            # The fixed B1/S128 leaf workspace is shared by all four request
+            # streams.  An orchestration read waits for every producer of the
+            # request output before the next loop iteration can allocate and
+            # submit another leaf graph against that workspace.
+            workspace_completion = pl.read(x_next_request, [0, 0, 0])
+            pl.write(x_next_request, [0, 0, 0], workspace_completion)
 
     if moe_epoch > 0:
         final_request_profile = pl.slice(
