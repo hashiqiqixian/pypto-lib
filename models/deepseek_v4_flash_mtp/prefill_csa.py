@@ -230,7 +230,11 @@ def prefill_attention_csa(
     # and take the first HALF_ROPE columns (matches the golden's materialize_half_rope_tables).
     idx_cos = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
     idx_sin = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_idx_halfrope"):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_csa_idx_halfrope",
+        deps=[compressor_completion[0]],
+    ):
         for idx_t in pl.range(T):
             idx_pos = pl.cast(pl.read(position_ids, [idx_t]), pl.INDEX)
             idx_cos = pl.assemble(idx_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [idx_pos, 0]), target_type=pl.FP32), [idx_t, 0])

@@ -25,8 +25,8 @@ from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_SIZE,
     INNER_STATE_MAX_BLOCKS,
     STATE_LEN as INNER_STATE_LEN,
+    _prefill_indexer_compressor_with_completion,
     golden_prefill_indexer_compressor,
-    prefill_indexer_compressor,
 )
 
 # Dynamic shape variables.
@@ -262,13 +262,15 @@ def prefill_indexer(
         weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
     # === inner compressor: build the paged compressed index KV cache ===
-    idx_kv_cache_out, idx_kv_scale_out, inner_compress_state_out = prefill_indexer_compressor(
+    compressor_completion = pl.array.create(1, pl.TASK_ID)
+    idx_kv_cache_out, idx_kv_scale_out, inner_compress_state_out = _prefill_indexer_compressor_with_completion(
         x, inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape,
         inner_norm_w, freqs_cos, freqs_sin,
         hadamard, idx_kv_cache, idx_kv_scale,
         idx_block_table, position_ids, num_tokens,
         idx_slot_mapping, inner_state_slot_mapping,
+        compressor_completion,
     )
 
     # === score: decode-style W8A8C16 scoring over the packed paged cache. The compressor already
@@ -285,7 +287,12 @@ def prefill_indexer(
             score_wide[si : si + SCORE_INIT_TILE, :] = pl.full([SCORE_INIT_TILE, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
 
     score_token_groups = T // SCORE_TOKEN_TILE
-    for score_idx in pl.spmd(score_token_groups, name_hint="prefill_idx_score"):
+    with pl.spmd(
+        score_token_groups,
+        name_hint="prefill_idx_score",
+        deps=[compressor_completion[0]],
+    ) as _score_tid:
+        score_idx = pl.tile.get_block_idx()
         token0 = score_idx * SCORE_TOKEN_TILE
         last_pos = pl.read(position_ids, [num_tokens - 1])
         max_visible = pl.min((last_pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
