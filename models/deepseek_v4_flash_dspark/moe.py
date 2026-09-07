@@ -74,6 +74,7 @@ N_ROUTES = T * TOPK
 # src * MAX_PER_SRC + slot. One source sends <= T rows to a local expert.
 MAX_PER_SRC = T
 FP32_PER_CACHE_LINE = 16
+INT64_PER_CACHE_LINE = 8
 AUX_PAD = 8  # FP32 pack tile width (32 B min tile); cols: 0=scale 1=weight
 AUX_SCALE = 0
 AUX_W = 1
@@ -87,6 +88,7 @@ assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 assert RECV_MAX == N_RANKS * MAX_PER_SRC
 assert RECV_MAX % FP32_PER_CACHE_LINE == 0
+assert T % INT64_PER_CACHE_LINE == 0
 
 
 @pl.jit.inline
@@ -671,14 +673,18 @@ def prefill_moe(
                     input_id_tile = input_ids_rows[local_token : local_token + PREFILL_INPUT_ID_TILE, 0:1]
                     input_ids_wave_rows[token0 : token0 + PREFILL_INPUT_ID_TILE, 0:1] = input_id_tile
             else:
-                for token in pl.spmd(T, name_hint="prefill_moe_ids_stage_tail"):
-                    if token < wave_rows:
-                        local_token = local_wave_base + token
-                        input_id = pl.read(input_ids_rows, [local_token, 0])
+                for token_block in pl.spmd(
+                    T // INT64_PER_CACHE_LINE,
+                    name_hint="prefill_moe_ids_stage_tail",
+                ):
+                    token_begin = token_block * INT64_PER_CACHE_LINE
+                    for token_offset in pl.range(INT64_PER_CACHE_LINE):
+                        token = token_begin + token_offset
+                        input_id = pl.cast(0, pl.INT64)
+                        if token < wave_rows:
+                            local_token = local_wave_base + token
+                            input_id = pl.read(input_ids_rows, [local_token, 0])
                         pl.write(input_ids_wave_rows, [token, 0], input_id)
-                    else:
-                        input_id_zero = pl.cast(0, pl.INT64)
-                        pl.write(input_ids_wave_rows, [token, 0], input_id_zero)
             input_ids_wave = pl.reshape(input_ids_wave_rows, [T])
 
             ffn_wave = pl.create_tensor([T, D], dtype=pl.BF16)
