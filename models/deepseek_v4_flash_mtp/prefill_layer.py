@@ -564,7 +564,7 @@ def prefill_layer_core(
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[USER_BATCH, T, HC_MULT, D], pl.FP32]:
     moe_epoch: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
-    for request_id in pl.range(USER_BATCH):
+    for request_id in pl.unroll(USER_BATCH):
         request_index = pl.cast(request_id, pl.INDEX)
         valid_n: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
         for owner_rank in pl.range(N_RANKS):
