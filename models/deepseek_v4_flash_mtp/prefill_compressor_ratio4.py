@@ -77,11 +77,9 @@ def compressor_ratio4(
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
     completion: pl.Array[1, pl.TASK_ID],
 ):
-    state_block_num = pl.tensor.dim(compress_state, 0)
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp4_kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     cmp4_score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
-    compress_state_flat = pl.reshape(compress_state, [state_block_num * CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
@@ -151,13 +149,12 @@ def compressor_ratio4(
                     prev_phys_block_raw = pl.read(compress_state_block_table, [prev_state_block])
                     if prev_phys_block_raw >= 0:
                         prev_phys_block = pl.cast(prev_phys_block_raw, pl.INDEX)
-                        prev_state_row = prev_phys_block * CSA_STATE_BLOCK_SIZE + prev_state_intra
                         prev_kv_col0 = h0
                         prev_score_col0 = OUT_DIM + h0
-                        pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
-                            prev_state_row : prev_state_row + 1, prev_kv_col0 : prev_kv_col0 + HEAD_D_TILE]
-                        pool_score_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
-                            prev_state_row : prev_state_row + 1, prev_score_col0 : prev_score_col0 + HEAD_D_TILE]
+                        pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = compress_state[
+                            prev_phys_block, prev_state_intra : prev_state_intra + 1, prev_kv_col0 : prev_kv_col0 + HEAD_D_TILE]
+                        pool_score_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = compress_state[
+                            prev_phys_block, prev_state_intra : prev_state_intra + 1, prev_score_col0 : prev_score_col0 + HEAD_D_TILE]
 
                 cur_abs = cur_start + pool_s
                 back_slot = COMPRESS_RATIO + pool_s
@@ -168,13 +165,12 @@ def compressor_ratio4(
                 cur_phys_block_raw = pl.read(compress_state_block_table, [cur_state_block])
                 if cur_phys_block_raw >= 0:
                     cur_phys_block = pl.cast(cur_phys_block_raw, pl.INDEX)
-                    cur_state_row = cur_phys_block * CSA_STATE_BLOCK_SIZE + cur_state_intra
                     cur_kv_col0 = HEAD_DIM + h0
                     cur_score_col0 = OUT_DIM + HEAD_DIM + h0
-                    pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
-                        cur_state_row : cur_state_row + 1, cur_kv_col0 : cur_kv_col0 + HEAD_D_TILE]
-                    pool_score_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
-                        cur_state_row : cur_state_row + 1, cur_score_col0 : cur_score_col0 + HEAD_D_TILE]
+                    pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = compress_state[
+                        cur_phys_block, cur_state_intra : cur_state_intra + 1, cur_kv_col0 : cur_kv_col0 + HEAD_D_TILE]
+                    pool_score_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = compress_state[
+                        cur_phys_block, cur_state_intra : cur_state_intra + 1, cur_score_col0 : cur_score_col0 + HEAD_D_TILE]
 
             for pool_t in pl.range(T):
                 if pool_t < num_tokens:
@@ -303,6 +299,8 @@ def compressor_ratio4(
                 state_row_raw = pl.read(state_slot_mapping, [update_t])
                 if state_row_raw >= 0:
                     state_row = pl.cast(state_row_raw, pl.INDEX)
+                    state_phys_block = state_row // CSA_STATE_BLOCK_SIZE
+                    state_intra = state_row - state_phys_block * CSA_STATE_BLOCK_SIZE
                     update_pos = pl.read(position_ids, [update_t])
                     ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
                     for update_ob in pl.range(OUT_DIM // STATE_UPDATE_OUT_TILE):
@@ -312,8 +310,9 @@ def compressor_ratio4(
                             update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
                         ]
                         # Slices stay inline: naming one materializes an extra tile.
-                        compress_state_flat[
-                            state_row : state_row + 1,
+                        compress_state[
+                            state_phys_block,
+                            state_intra : state_intra + 1,
                             update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
                         ] = (
                             cmp4_kv_proj_scratch[
@@ -321,8 +320,9 @@ def compressor_ratio4(
                                 update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
                             ]
                         )
-                        compress_state_flat[
-                            state_row : state_row + 1,
+                        compress_state[
+                            state_phys_block,
+                            state_intra : state_intra + 1,
                             OUT_DIM + update_o0 : OUT_DIM + update_o0 + STATE_UPDATE_OUT_TILE,
                         ] = pl.add(
                             cmp4_score_proj_scratch[
@@ -334,7 +334,7 @@ def compressor_ratio4(
 
     completion[0] = pl.system.task_dummy(deps=[cache_write_tid, state_update_tid])
 
-    # The flattened views write through to these caller-owned roots. Returning
+    # The tensor views write through to these caller-owned roots. Returning
     # the roots keeps dynamic cache metadata intact when this helper is nested
     # inside baseline attention, while ``completion`` remains available to CP.
     return cmp_kv, compress_state
