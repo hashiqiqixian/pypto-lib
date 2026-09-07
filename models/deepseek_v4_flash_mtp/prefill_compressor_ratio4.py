@@ -128,7 +128,8 @@ def compressor_ratio4(
     # A contiguous active prefix can close at most ceil(num_tokens / ratio)
     # compressed rows, regardless of the absolute start-position alignment.
     active_pool_blocks = ((num_tokens + COMPRESS_RATIO - 1) // COMPRESS_RATIO) * (HEAD_DIM // HEAD_D_TILE)
-    for pool_idx in pl.spmd(active_pool_blocks, name_hint="prefill_c4_softmax_pool"):
+    with pl.spmd(active_pool_blocks, name_hint="prefill_c4_softmax_pool") as pool_tid:
+        pool_idx = pl.tile.get_block_idx()
         write_i = pool_idx // (HEAD_DIM // HEAD_D_TILE)
         hb = pool_idx - write_i * (HEAD_DIM // HEAD_D_TILE)
         h0 = hb * HEAD_D_TILE
@@ -285,15 +286,15 @@ def compressor_ratio4(
                 dst_row = pl.cast(dst_row_raw, pl.INDEX)
                 final_row = normed_kv[final_i : final_i + 1, 0:HEAD_DIM]
                 cmp_kv_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = pl.cast(final_row, target_type=pl.BF16, mode="rint")
-            else:
-                keepalive_row = cmp_block_num * CMP_STORAGE_BLOCK_SIZE - MAX_CMP_WRITES + final_i
-                cmp_kv_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = cmp_kv_flat[
-                    keepalive_row : keepalive_row + 1,
-                    0:HEAD_DIM,
-                ]
 
-    # State writeback uses two-token tasks and 256-element output chunks.
-    with pl.spmd(T // STATE_UPDATE_TOKEN_TILE, name_hint="prefill_c4_state_update") as state_update_tid:
+    # State writeback must start after every active pool task has finished
+    # reading the old state. A zero-weighted pooled value is not a reliable
+    # ordering edge (and NaN * 0 remains NaN).
+    with pl.spmd(
+        T // STATE_UPDATE_TOKEN_TILE,
+        name_hint="prefill_c4_state_update",
+        deps=[pool_tid],
+    ) as state_update_tid:
         update_tb = pl.tile.get_block_idx()
         update_base = update_tb * STATE_UPDATE_TOKEN_TILE
         for update_dt in pl.range(STATE_UPDATE_TOKEN_TILE):
@@ -304,7 +305,6 @@ def compressor_ratio4(
                     state_row = pl.cast(state_row_raw, pl.INDEX)
                     update_pos = pl.read(position_ids, [update_t])
                     ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                    pool_dep = pl.mul(pooled_kv[0:1, 0:STATE_UPDATE_OUT_TILE], 0.0)
                     for update_ob in pl.range(OUT_DIM // STATE_UPDATE_OUT_TILE):
                         update_o0 = update_ob * STATE_UPDATE_OUT_TILE
                         ape_row = ape[
@@ -315,25 +315,21 @@ def compressor_ratio4(
                         compress_state_flat[
                             state_row : state_row + 1,
                             update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
-                        ] = pl.add(
+                        ] = (
                             cmp4_kv_proj_scratch[
                                 update_t : update_t + 1,
                                 update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
-                            ],
-                            pool_dep,
+                            ]
                         )
                         compress_state_flat[
                             state_row : state_row + 1,
                             OUT_DIM + update_o0 : OUT_DIM + update_o0 + STATE_UPDATE_OUT_TILE,
                         ] = pl.add(
-                            pl.add(
-                                cmp4_score_proj_scratch[
-                                    update_t : update_t + 1,
-                                    update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
-                                ],
-                                ape_row,
-                            ),
-                            pool_dep,
+                            cmp4_score_proj_scratch[
+                                update_t : update_t + 1,
+                                update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
+                            ],
+                            ape_row,
                         )
 
     completion[0] = pl.system.task_dummy(deps=[cache_write_tid, state_update_tid])
