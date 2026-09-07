@@ -215,6 +215,19 @@ def build_dspark_metadata(
                 query_position = anchor_position + 1 + query_offset
                 pl.write(query_positions, [token], pl.cast(query_position, pl.INT32))
 
+        for lens_request in pl.range(metadata_core, DSPARK_MAX_BATCH):
+            lens_visible_len = pl.cast(0, pl.INT32)
+            if lens_request < batch:
+                lens_anchor_position = pl.read(anchor_positions, [lens_request])
+                lens_prefix_len = lens_anchor_position + 1
+                lens_start_position = pl.cast(pl.max(lens_prefix_len - WIN, 0), pl.INT32)
+                lens_visible_len = pl.cast(
+                    lens_prefix_len + DSPARK_QUERY_WIDTH - lens_start_position,
+                    pl.INT32,
+                )
+            for lens_layer in pl.range(DSPARK_DRAFT_LAYERS):
+                pl.write(swa_lens, [lens_layer, lens_request], lens_visible_len)
+
     for request in pl.spmd(DSPARK_MAX_BATCH, name_hint="dspark_visible_metadata"):
         start_position = pl.cast(0, pl.INT32)
         visible_len = pl.cast(0, pl.INT32)
@@ -227,7 +240,6 @@ def build_dspark_metadata(
                 pl.INT32,
             )
         for layer in pl.range(DSPARK_DRAFT_LAYERS):
-            pl.write(swa_lens, [layer, request], visible_len)
             for visible_offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
                 visible_slot = pl.cast(-1, pl.INT32)
                 if visible_offset < visible_len:
