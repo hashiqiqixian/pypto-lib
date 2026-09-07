@@ -308,7 +308,7 @@ def prefill_attention_csa(
             )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    sparse_attn(
+    attn_out = sparse_attn(
         q, kv_cache, swa_indices,
         cmp_kv, cmp_block_table, pl.cast(CMP_STORAGE_BLOCK_SIZE, pl.INT32),
         cmp_topk_indices,
