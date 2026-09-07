@@ -125,7 +125,7 @@ def _prefill_indexer_compressor_with_completion(
     # cache_write.
     write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_write_map"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_write_map") as pool_seed_tid:
         write_pos_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
         write_dst_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
@@ -138,11 +138,27 @@ def _prefill_indexer_compressor_with_completion(
                     map_seen = map_seen + 1
         write_pos_map[0:1, 0:MAX_CMP_WRITES] = write_pos_tile
         write_dst_map[0:1, 0:MAX_CMP_WRITES] = write_dst_tile
+        # Fixed-width normalization reads every compressed row, including the inactive tail.
+        # Seed that tail here so the dynamic pool can overwrite only its active prefix.
+        for seed_r0 in pl.range(0, MAX_CMP_WRITES, PACKED_RMS_TILE):
+            for seed_h0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+                pooled_kv[
+                    seed_r0 : seed_r0 + PACKED_RMS_TILE,
+                    seed_h0 : seed_h0 + HEAD_TILE,
+                ] = pl.full(
+                    [PACKED_RMS_TILE, HEAD_TILE],
+                    dtype=pl.FP32,
+                    value=0.0,
+                )
 
     # A contiguous active prefix can close at most ceil(num_tokens / ratio)
     # compressed rows, regardless of the absolute start-position alignment.
     active_pool_blocks = ((num_tokens + COMPRESS_RATIO - 1) // COMPRESS_RATIO) * (HEAD_DIM // HEAD_D_TILE)
-    with pl.spmd(active_pool_blocks, name_hint="prefill_idx_c4_softmax_pool") as pool_tid:
+    with pl.spmd(
+        active_pool_blocks,
+        name_hint="prefill_idx_c4_softmax_pool",
+        deps=[pool_seed_tid],
+    ) as pool_tid:
         pool_idx = pl.tile.get_block_idx()
         write_i = pool_idx // (HEAD_DIM // HEAD_D_TILE)
         hb = pool_idx - write_i * (HEAD_DIM // HEAD_D_TILE)
@@ -277,7 +293,12 @@ def _prefill_indexer_compressor_with_completion(
             pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_rmsnorm_rope"):
+    with pl.spmd(
+        MAX_CMP_WRITES // PACKED_RMS_TILE,
+        name_hint="prefill_idx_c4_rmsnorm_rope",
+        deps=[pool_tid],
+    ):
+        final_block = pl.tile.get_block_idx()
         final_base = final_block * PACKED_RMS_TILE
         cos_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)

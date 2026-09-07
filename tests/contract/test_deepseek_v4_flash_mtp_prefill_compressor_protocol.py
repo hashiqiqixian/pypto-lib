@@ -144,6 +144,64 @@ def test_invalid_partial_tail_slots_do_not_issue_keepalive_writes() -> None:
         assert not _mapping_guard(_context(function, name_hint)).orelse
 
 
+def test_write_map_seeds_the_full_pool_before_dynamic_pool_and_fixed_reader() -> None:
+    cases = (
+        (
+            "prefill_compressor_ratio4.py",
+            "compressor_ratio4",
+            "prefill_c4_write_map",
+            "prefill_c4_softmax_pool",
+            "prefill_c4_rmsnorm_rope",
+        ),
+        (
+            "prefill_indexer_compressor.py",
+            "_prefill_indexer_compressor_with_completion",
+            "prefill_idx_c4_write_map",
+            "prefill_idx_c4_softmax_pool",
+            "prefill_idx_c4_rmsnorm_rope",
+        ),
+    )
+    for file_name, function_name, seed_hint, pool_hint, reader_hint in cases:
+        function = _function(_tree(file_name), function_name)
+        seed = _context(function, seed_hint)
+        assert _call_name(seed.items[0].context_expr.func) == "pl.at"
+        seed_tid = seed.items[0].optional_vars
+        assert isinstance(seed_tid, ast.Name)
+
+        seed_stores = [
+            node
+            for node in ast.walk(seed)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Subscript)
+            and ast.unparse(node.targets[0].value) == "pooled_kv"
+        ]
+        assert len(seed_stores) == 1
+        seed_target = seed_stores[0].targets[0]
+        assert isinstance(seed_target.slice, ast.Tuple)
+        assert [ast.unparse(dimension) for dimension in seed_target.slice.elts] == [
+            "seed_r0:seed_r0 + PACKED_RMS_TILE",
+            "seed_h0:seed_h0 + HEAD_TILE",
+        ]
+        seed_value = seed_stores[0].value
+        assert isinstance(seed_value, ast.Call)
+        assert _call_name(seed_value.func) == "pl.full"
+        assert ast.unparse(seed_value.args[0]) == "[PACKED_RMS_TILE, HEAD_TILE]"
+        assert ast.unparse(_keyword(seed_value, "dtype")) == "pl.FP32"
+        assert ast.literal_eval(_keyword(seed_value, "value")) == 0.0
+        seed_ranges = [ast.unparse(node.iter) for node in ast.walk(seed) if isinstance(node, ast.For)]
+        assert "pl.range(0, MAX_CMP_WRITES, PACKED_RMS_TILE)" in seed_ranges
+        assert "pl.range(0, HEAD_DIM, HEAD_TILE)" in seed_ranges
+
+        pool = _context(function, pool_hint)
+        pool_tid = pool.items[0].optional_vars
+        assert isinstance(pool_tid, ast.Name)
+        pool_deps = _keyword(pool.items[0].context_expr, "deps")
+        assert ast.unparse(pool_deps) == f"[{seed_tid.id}]"
+
+        reader_deps = _keyword(_context(function, reader_hint).items[0].context_expr, "deps")
+        assert ast.unparse(reader_deps) == f"[{pool_tid.id}]"
+
+
 def test_active_pool_taskid_orders_state_update() -> None:
     cases = (
         (
