@@ -135,6 +135,8 @@ D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
+ROPE_HALF = ROPE_DIM // 2
+NOPE_DIM = M.nope_head_dim
 Q_LORA = M.q_lora_rank
 MAX_SEQ_LEN = M.max_position_embeddings
 HC_MULT = M.hc_mult
@@ -263,8 +265,14 @@ def draft_layer(
     wkv: pl.Tensor[[DSPARK_DRAFT_LAYERS * D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[DSPARK_DRAFT_LAYERS * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[DSPARK_DRAFT_LAYERS * HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    query_freqs_cos: pl.Tensor[[T_QUERY, ROPE_DIM], pl.BF16],
+    query_freqs_sin: pl.Tensor[[T_QUERY, ROPE_DIM], pl.BF16],
+    query_group_freqs_cos: pl.Tensor[
+        [DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16
+    ],
+    query_group_freqs_sin: pl.Tensor[
+        [DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16
+    ],
     query_positions: pl.Tensor[[T_QUERY], pl.INT32],
     query_group_positions: pl.Tensor[[DSPARK_CP_SIZE * T_QUERY], pl.INT32],
     kv_cache: pl.Tensor[[KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -391,7 +399,9 @@ def draft_layer(
         query_normed,
         query_group,
         layer_wq_a, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_gamma_cq, layer_gamma_ckv,
-        freqs_cos, freqs_sin, query_positions, query_group_positions,
+        query_freqs_cos, query_freqs_sin,
+        query_group_freqs_cos, query_group_freqs_sin,
+        query_positions, query_group_positions,
         kv_cache, query_group_slot_mapping, swa_indices, swa_lens,
         layer_attn_sink, o_packed_heads,
     )
@@ -517,8 +527,16 @@ def dspark_drafter(
     query_group_slot_mapping: pl.Tensor[
         [DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * T_QUERY], pl.INT64
     ],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    context_group_freqs_cos: pl.Tensor[[CP_CONTEXT_T_DYN, ROPE_DIM], pl.BF16],
+    context_group_freqs_sin: pl.Tensor[[CP_CONTEXT_T_DYN, ROPE_DIM], pl.BF16],
+    query_freqs_cos: pl.Tensor[[T_QUERY, ROPE_DIM], pl.BF16],
+    query_freqs_sin: pl.Tensor[[T_QUERY, ROPE_DIM], pl.BF16],
+    query_group_freqs_cos: pl.Tensor[
+        [DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16
+    ],
+    query_group_freqs_sin: pl.Tensor[
+        [DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16
+    ],
     hc_attn_fn: pl.Tensor[[DSPARK_DRAFT_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[DSPARK_DRAFT_LAYERS * MIX_HC], pl.FP32],
@@ -586,6 +604,8 @@ def dspark_drafter(
     Every rank in the four-rank group must provide the same number of local
     ``target_hidden`` rows. Group position and slot metadata must contain exactly
     four times that row count in rank-major order; padded rows use slot ``-1``.
+    The context and group-query RoPE rows use the same rank-major order as their
+    position metadata; local-query RoPE rows follow the local query order.
     Physical slots use one group-global block namespace replicated on all ranks.
     The group row count must not exceed ``PREFILL_GROUP_CAP`` (8192). The runtime
     does not validate relationships between dynamic tensor axes, so the
@@ -594,6 +614,8 @@ def dspark_drafter(
     target_hidden.bind_dynamic(0, T_MAIN_DYN)
     context_group_position_ids.bind_dynamic(0, CP_CONTEXT_T_DYN)
     context_group_slot_mapping.bind_dynamic(1, CP_CONTEXT_T_DYN)
+    context_group_freqs_cos.bind_dynamic(0, CP_CONTEXT_T_DYN)
+    context_group_freqs_sin.bind_dynamic(0, CP_CONTEXT_T_DYN)
     num_sampled.bind_dynamic(0, B_DYN)
     last_sampled.bind_dynamic(0, B_DYN)
     next_prefill_tokens.bind_dynamic(0, B_DYN)
@@ -639,15 +661,18 @@ def dspark_drafter(
         dsa_cp_rank,
     )
     dspark_context_kv(
-        group_main_x, wkv_0, gamma_ckv_0, freqs_cos, freqs_sin,
+        group_main_x, wkv_0, gamma_ckv_0,
+        context_group_freqs_cos, context_group_freqs_sin,
         context_group_position_ids, context_group_slot_mapping, pl.const(0, pl.INT32), kv_cache_0,
     )
     dspark_context_kv(
-        group_main_x, wkv_1, gamma_ckv_1, freqs_cos, freqs_sin,
+        group_main_x, wkv_1, gamma_ckv_1,
+        context_group_freqs_cos, context_group_freqs_sin,
         context_group_position_ids, context_group_slot_mapping, pl.const(1, pl.INT32), kv_cache_1,
     )
     dspark_context_kv(
-        group_main_x, wkv_2, gamma_ckv_2, freqs_cos, freqs_sin,
+        group_main_x, wkv_2, gamma_ckv_2,
+        context_group_freqs_cos, context_group_freqs_sin,
         context_group_position_ids, context_group_slot_mapping, pl.const(2, pl.INT32), kv_cache_2,
     )
 
@@ -679,7 +704,9 @@ def dspark_drafter(
         initial_hidden, pl.const(0, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, query_positions, query_group_position_ids,
+        query_freqs_cos, query_freqs_sin,
+        query_group_freqs_cos, query_group_freqs_sin,
+        query_positions, query_group_position_ids,
         kv_cache_0, query_group_slot_mapping[0], swa_indices_0, swa_lens_0,
         attn_sink, wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_w,
@@ -699,7 +726,9 @@ def dspark_drafter(
         hidden_1, pl.const(1, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, query_positions, query_group_position_ids,
+        query_freqs_cos, query_freqs_sin,
+        query_group_freqs_cos, query_group_freqs_sin,
+        query_positions, query_group_position_ids,
         kv_cache_1, query_group_slot_mapping[1], swa_indices_1, swa_lens_1,
         attn_sink, wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_w,
@@ -719,7 +748,9 @@ def dspark_drafter(
         hidden_2, pl.const(2, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, query_positions, query_group_position_ids,
+        query_freqs_cos, query_freqs_sin,
+        query_group_freqs_cos, query_group_freqs_sin,
+        query_positions, query_group_position_ids,
         kv_cache_2, query_group_slot_mapping[2], swa_indices_2, swa_lens_2,
         attn_sink, wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_w,
@@ -776,8 +807,20 @@ def l3_dspark_drafter(
     query_group_slot_mapping: pl.Tensor[
         [N_RANKS, DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * T_QUERY], pl.INT64
     ],
-    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    context_group_freqs_cos: pl.Tensor[
+        [N_RANKS, CP_CONTEXT_T_DYN, ROPE_DIM], pl.BF16
+    ],
+    context_group_freqs_sin: pl.Tensor[
+        [N_RANKS, CP_CONTEXT_T_DYN, ROPE_DIM], pl.BF16
+    ],
+    query_freqs_cos: pl.Tensor[[N_RANKS, T_QUERY, ROPE_DIM], pl.BF16],
+    query_freqs_sin: pl.Tensor[[N_RANKS, T_QUERY, ROPE_DIM], pl.BF16],
+    query_group_freqs_cos: pl.Tensor[
+        [N_RANKS, DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16
+    ],
+    query_group_freqs_sin: pl.Tensor[
+        [N_RANKS, DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16
+    ],
     hc_attn_fn: pl.Tensor[[N_RANKS, DSPARK_DRAFT_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, DSPARK_DRAFT_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, DSPARK_DRAFT_LAYERS * MIX_HC], pl.FP32],
@@ -822,6 +865,8 @@ def l3_dspark_drafter(
     target_hidden.bind_dynamic(1, T_MAIN_DYN)
     context_group_position_ids.bind_dynamic(1, CP_CONTEXT_T_DYN)
     context_group_slot_mapping.bind_dynamic(2, CP_CONTEXT_T_DYN)
+    context_group_freqs_cos.bind_dynamic(1, CP_CONTEXT_T_DYN)
+    context_group_freqs_sin.bind_dynamic(1, CP_CONTEXT_T_DYN)
     num_sampled.bind_dynamic(1, B_DYN)
     last_sampled.bind_dynamic(1, B_DYN)
     next_prefill_tokens.bind_dynamic(1, B_DYN)
@@ -882,7 +927,9 @@ def l3_dspark_drafter(
             context_group_position_ids[rank], context_group_slot_mapping[rank],
             anchor_positions[rank], block_tables[rank],
             query_group_position_ids[rank], query_group_slot_mapping[rank],
-            freqs_cos[rank], freqs_sin[rank],
+            context_group_freqs_cos[rank], context_group_freqs_sin[rank],
+            query_freqs_cos[rank], query_freqs_sin[rank],
+            query_group_freqs_cos[rank], query_group_freqs_sin[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_w[rank],
             wq_a[rank], wq_b[rank], wq_b_scale[rank], wkv[rank], gamma_cq[rank], gamma_ckv[rank],
             kv_caches[rank], attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank],
@@ -990,6 +1037,7 @@ def _balanced_routes():
 def build_tensor_specs(batch, *, mode="decode"):
     import torch
     from golden import TensorSpec
+    from utils import token_local_rope
 
     if batch not in DSPARK_SUPPORTED_BATCHES:
         raise ValueError(f"unsupported DSpark batch {batch}; expected one of {DSPARK_SUPPORTED_BATCHES}")
@@ -1109,6 +1157,25 @@ def build_tensor_specs(batch, *, mode="decode"):
         query_group_slots[rank] = query_slots_local[group_slice].permute(1, 0, 2).reshape(
             DSPARK_DRAFT_LAYERS, -1
         )
+
+    def selected_rope(position_rows):
+        cos, sin = token_local_rope(
+            M,
+            0,
+            position_rows,
+            max_seq_len=MAX_SEQ_LEN,
+            dtype=torch.bfloat16,
+        )
+        shape = (*position_rows.shape, ROPE_DIM)
+        return cos.reshape(shape).contiguous(), sin.reshape(shape).contiguous()
+
+    context_group_freqs_cos, context_group_freqs_sin = selected_rope(
+        context_group_positions
+    )
+    query_freqs_cos, query_freqs_sin = selected_rope(query_positions_local)
+    query_group_freqs_cos, query_group_freqs_sin = selected_rope(
+        query_group_positions
+    )
     request_ids = torch.arange(batch, dtype=torch.int64).unsqueeze(0)
     owner_ids = torch.arange(N_RANKS, dtype=torch.int64).unsqueeze(1)
     last_sampled = owner_ids * batch + request_ids + 1
@@ -1244,8 +1311,42 @@ def build_tensor_specs(batch, *, mode="decode"):
             torch.int64,
             init_value=lambda: query_group_slots,
         ),
-        ranked("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=1, resident=True),
-        ranked("freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, resident=True),
+        ranked(
+            "context_group_freqs_cos",
+            [DSPARK_CP_SIZE * local_context_tokens, ROPE_DIM],
+            torch.bfloat16,
+            init_value=lambda: context_group_freqs_cos,
+        ),
+        ranked(
+            "context_group_freqs_sin",
+            [DSPARK_CP_SIZE * local_context_tokens, ROPE_DIM],
+            torch.bfloat16,
+            init_value=lambda: context_group_freqs_sin,
+        ),
+        ranked(
+            "query_freqs_cos",
+            [T_QUERY, ROPE_DIM],
+            torch.bfloat16,
+            init_value=lambda: query_freqs_cos,
+        ),
+        ranked(
+            "query_freqs_sin",
+            [T_QUERY, ROPE_DIM],
+            torch.bfloat16,
+            init_value=lambda: query_freqs_sin,
+        ),
+        ranked(
+            "query_group_freqs_cos",
+            [DSPARK_CP_SIZE * T_QUERY, ROPE_DIM],
+            torch.bfloat16,
+            init_value=lambda: query_group_freqs_cos,
+        ),
+        ranked(
+            "query_group_freqs_sin",
+            [DSPARK_CP_SIZE * T_QUERY, ROPE_DIM],
+            torch.bfloat16,
+            init_value=lambda: query_group_freqs_sin,
+        ),
     ]
 
     specs.extend(
@@ -1354,10 +1455,25 @@ def golden_dspark_drafter(tensors):
         inv_rms = torch.rsqrt(hidden_fp32.square().mean(dim=-1, keepdim=True) + M.rms_norm_eps)
         return (hidden_fp32 * inv_rms).to(torch.bfloat16)
 
-    def project_kv(hidden):
+    def project_kv(hidden, rope_cos, rope_sin):
         projected = hidden.float()[..., :HEAD_DIM]
         inv_rms = torch.rsqrt(projected.square().mean(dim=-1, keepdim=True) + M.rms_norm_eps)
-        return (projected * inv_rms).to(torch.bfloat16)
+        kv_full = projected * inv_rms
+        rope_pairs = kv_full[:, NOPE_DIM:].unflatten(-1, (-1, 2))
+        rope_even = rope_pairs[..., 0]
+        rope_odd = rope_pairs[..., 1]
+        cos_half = rope_cos.float()[:, :ROPE_HALF]
+        sin_half = rope_sin.float()[:, :ROPE_HALF]
+        rotated_even = (rope_even * cos_half - rope_odd * sin_half).to(
+            torch.bfloat16
+        )
+        rotated_odd = (rope_even * sin_half + rope_odd * cos_half).to(
+            torch.bfloat16
+        )
+        rotated = torch.stack([rotated_even, rotated_odd], dim=-1).flatten(-2)
+        return torch.cat(
+            [kv_full[:, :NOPE_DIM], rotated.float()], dim=-1
+        ).to(torch.bfloat16)
 
     def hc_coefficients(token_count):
         pre = torch.full((token_count, HC_MULT), 0.5 + M.hc_eps, dtype=torch.float32)
@@ -1433,8 +1549,18 @@ def golden_dspark_drafter(tensors):
                 ]
                 valid_context = layer_context_slots >= 0
                 valid_context_slots = layer_context_slots[valid_context].long()
+                context_freqs_cos = tensors["context_group_freqs_cos"][
+                    rank,
+                    context_start : context_start + local_context_tokens,
+                ]
+                context_freqs_sin = tensors["context_group_freqs_sin"][
+                    rank,
+                    context_start : context_start + local_context_tokens,
+                ]
                 cache[valid_context_slots] = project_kv(
-                    main_x_by_rank[source_rank][valid_context]
+                    main_x_by_rank[source_rank][valid_context],
+                    context_freqs_cos[valid_context],
+                    context_freqs_sin[valid_context],
                 )
                 query_start = source_cp * T_QUERY
                 layer_query_slots = group_query_slots[
@@ -1445,8 +1571,18 @@ def golden_dspark_drafter(tensors):
                 valid_query = layer_query_slots >= 0
                 valid_query_slots = layer_query_slots[valid_query].long()
                 query_normed = layer_state[source_rank][2]
+                query_freqs_cos = tensors["query_group_freqs_cos"][
+                    rank,
+                    query_start : query_start + T_QUERY,
+                ]
+                query_freqs_sin = tensors["query_group_freqs_sin"][
+                    rank,
+                    query_start : query_start + T_QUERY,
+                ]
                 cache[valid_query_slots] = project_kv(
-                    query_normed[valid_query]
+                    query_normed[valid_query],
+                    query_freqs_cos[valid_query],
+                    query_freqs_sin[valid_query],
                 )
 
         next_hidden_by_rank = []

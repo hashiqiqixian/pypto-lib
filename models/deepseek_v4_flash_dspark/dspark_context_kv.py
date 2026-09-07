@@ -27,12 +27,7 @@ from config import (
     PREFILL_SEQ,
     TP,
 )
-from qkv_proj_rope import (
-    kv_proj_rope,
-    materialize_rope_rows,
-    materialize_rope_rows_dynamic,
-    rope_prepare,
-)
+from qkv_proj_rope import kv_proj_rope, rope_prepare
 
 
 # Dynamic shape variables.
@@ -60,8 +55,8 @@ def dspark_context_kv(
     main_x: pl.Tensor[[T_DYN, D], pl.BF16],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     slot_mapping: pl.Tensor[[DSPARK_CONTEXT_LAYERS, T_DYN], pl.INT64],
     layer_index: pl.Scalar[pl.INT32],
@@ -69,16 +64,10 @@ def dspark_context_kv(
 ):
     t_dim = pl.tensor.dim(position_ids, 0)
 
-    rope_cos_t = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.BF16)
-    materialize_rope_rows_dynamic(
-        freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t
-    )
-
     rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
-    rope_prepare(rope_cos_t, rope_sin_t, rope_cos_il, rope_sin_signed, rope_swap_idx)
+    rope_prepare(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
 
     # This no-work source task seeds the explicit kv_proj dependency chain.
     late_dep = pl.system.task_dummy(deps=[])
@@ -102,28 +91,17 @@ def dspark_context_kv_query(
     main_x: pl.Tensor[[DSPARK_QUERY_TOKENS, D], pl.BF16],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[DSPARK_QUERY_TOKENS, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[DSPARK_QUERY_TOKENS, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[DSPARK_QUERY_TOKENS], pl.INT32],
     slot_mapping: pl.Tensor[[DSPARK_QUERY_TOKENS], pl.INT64],
     kv_cache: pl.Tensor[[KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
 ):
     """Project a padded DSpark query-width context without dynamic shape variables."""
-    rope_cos_t = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.BF16)
-    materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
-        position_ids,
-        DSPARK_QUERY_TOKENS,
-        rope_cos_t,
-        rope_sin_t,
-    )
-
     rope_cos_il = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.FP32)
     rope_swap_idx = pl.create_tensor([DSPARK_QUERY_TOKENS, ROPE_DIM], dtype=pl.INT32)
-    rope_prepare(rope_cos_t, rope_sin_t, rope_cos_il, rope_sin_signed, rope_swap_idx)
+    rope_prepare(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
 
     kv = pl.create_tensor([DSPARK_QUERY_TOKENS, HEAD_DIM], dtype=pl.BF16)
     late_dep = pl.system.task_dummy(deps=[])
@@ -152,13 +130,15 @@ def dspark_context_kv_test(
     main_x: pl.Tensor[[T_DYN, D], pl.BF16],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     slot_mapping: pl.Tensor[[DSPARK_CONTEXT_LAYERS, T_DYN], pl.INT64],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
 ):
     main_x.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
     position_ids.bind_dynamic(0, T_DYN)
     slot_mapping.bind_dynamic(1, T_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
@@ -184,9 +164,8 @@ def golden_dspark_context_kv(tensors):
     inv_rms = torch.rsqrt(kv_proj.square().mean(-1, keepdim=True) + EPS)
     kv_full = kv_proj * inv_rms * tensors["gamma_ckv"].float()
 
-    positions = tensors["position_ids"].long()
-    rope_cos = tensors["freqs_cos"].index_select(0, positions).float()[:, :ROPE_HALF]
-    rope_sin = tensors["freqs_sin"].index_select(0, positions).float()[:, :ROPE_HALF]
+    rope_cos = tensors["freqs_cos"].float()[:, :ROPE_HALF]
+    rope_sin = tensors["freqs_sin"].float()[:, :ROPE_HALF]
     rope_pairs = kv_full[:, NOPE_DIM:].unflatten(-1, (-1, 2))
     rope_even = rope_pairs[..., 0]
     rope_odd = rope_pairs[..., 1]
@@ -208,14 +187,13 @@ def build_tensor_specs(batch, seq):
     from golden import TensorSpec
     from utils import (
         block_table,
-        build_rope_tables,
         paged_slot_mapping,
         position_ids_from_starts,
         swa_decode_start_set,
+        token_local_rope,
     )
 
     t = batch * seq
-    freqs_cos, freqs_sin = build_rope_tables(M, 0, dtype=torch.bfloat16)
 
     def init_start_pos():
         if seq == DECODE_SEQ:
@@ -227,6 +205,18 @@ def build_tensor_specs(batch, seq):
 
     def init_position_ids():
         return position_ids_from_starts(init_start_pos(), seq=seq).reshape(-1).contiguous()
+
+    def init_freqs_cos():
+        cos, _ = token_local_rope(
+            M, 0, init_position_ids(), max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16
+        )
+        return cos
+
+    def init_freqs_sin():
+        _, sin = token_local_rope(
+            M, 0, init_position_ids(), max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16
+        )
+        return sin
 
     def init_slot_mapping():
         slots = paged_slot_mapping(
@@ -249,8 +239,8 @@ def build_tensor_specs(batch, seq):
         TensorSpec("main_x", [t, D], torch.bfloat16, init_value=init_main_x),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=lambda: torch.ones(HEAD_DIM)),
-        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_cos.clone()),
-        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_sin.clone()),
+        TensorSpec("freqs_cos", [t, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [t, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("position_ids", [t], torch.int32, init_value=init_position_ids),
         TensorSpec(
             "slot_mapping",
