@@ -160,17 +160,27 @@ def block_table(
     table_blocks: int,
     physical_blocks: int | None = None,
     permuted: bool = False,
+    request_slots: int | None = None,
 ) -> torch.Tensor:
     physical_blocks = table_blocks if physical_blocks is None else physical_blocks
+    request_slots = batch if request_slots is None else request_slots
+    if request_slots <= 0:
+        raise ValueError(f"request_slots must be positive, got {request_slots}")
+    if request_slots < batch:
+        raise ValueError(f"request_slots must be >= batch, got {request_slots} < {batch}")
+    if physical_blocks % request_slots:
+        raise ValueError(
+            f"physical_blocks must be divisible by request_slots, got {physical_blocks} and {request_slots}"
+        )
     table_cols = torch.arange(table_blocks, dtype=torch.int32)
     physical_cols = table_cols % physical_blocks
     if permuted and physical_blocks > 1:
         physical_cols = (physical_cols * 7 + 3) % physical_blocks
     # The physical pool is global and does not grow with batch. Interleave the
-    # fixture's request-local logical pages inside that fixed pool; production
-    # serving supplies allocator-owned block tables under the same contract.
+    # fixture's logical pages across allocator request slots. ``batch`` may be
+    # smaller than the deployment slot count for focused fixtures.
     request_offsets = torch.arange(batch, dtype=torch.int32).unsqueeze(1)
-    return (physical_cols.unsqueeze(0) * batch + request_offsets) % physical_blocks
+    return (physical_cols.unsqueeze(0) * request_slots + request_offsets) % physical_blocks
 
 
 def cache_row_from_table(

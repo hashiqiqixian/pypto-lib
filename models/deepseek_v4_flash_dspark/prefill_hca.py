@@ -9,12 +9,11 @@
 # ci: devices=2
 """DeepSeek-V4 packed prefill HCA (ratio-128) attention over one contiguous run of <=T tokens."""
 
-import functools
-
 import pypto.language as pl
 
 from config import (
     BLOCK_SIZE,
+    DECODE_BATCH,
     FLASH as M,
     HCA_STATE_PHYSICAL_BLOCKS,
     INT8_AMAX_EPS,
@@ -547,19 +546,10 @@ def golden_prefill_attention_hca(tensors):
     tensors["x_out"][:] = y
 
 
-@functools.lru_cache(maxsize=None)
-def _state_block_table(max_blocks, physical_blocks):
-    """Constant scrambled state block table [max_blocks]."""
-    import torch
-
-    blocks = torch.arange(max_blocks, dtype=torch.int32)
-    return (blocks * 17 + 3) % physical_blocks
-
-
 def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
     import torch
     from golden import TensorSpec
-    from utils import cache_row_from_table, quant_w_per_channel, token_local_rope
+    from utils import block_table, cache_row_from_table, quant_w_per_channel, token_local_rope
 
     # Single-request geometry: the physical token dimension is q_len.
     context_len = start_pos
@@ -700,7 +690,12 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
             * 0.0539
         )
 
-    state_table = _state_block_table(HCA_STATE_MAX_BLOCKS, HCA_STATE_PHYSICAL_BLOCKS)
+    state_table = block_table(
+        batch=1,
+        table_blocks=HCA_STATE_MAX_BLOCKS,
+        physical_blocks=HCA_STATE_PHYSICAL_BLOCKS,
+        request_slots=DECODE_BATCH,
+    )[0]
 
     def init_compress_state_block_table():
         return state_table.clone().unsqueeze(0)
@@ -1480,6 +1475,7 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
     compress_state_block_table = make_block_table(
         batch=2, table_blocks=HCA_STATE_MAX_BLOCKS,
         physical_blocks=HCA_STATE_BLOCK_NUM,
+        request_slots=DECODE_BATCH,
     )
 
     ori_mappings = []
