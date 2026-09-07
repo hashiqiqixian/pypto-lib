@@ -9,8 +9,6 @@
 # ci: devices=2
 """DeepSeek-V4 packed prefill CSA attention with compression, indexing, and cache writeback."""
 
-import functools
-
 import pypto.language as pl
 
 from config import (
@@ -18,6 +16,7 @@ from config import (
     BLOCK_SIZE,
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
     CSA_STATE_PHYSICAL_BLOCKS,
+    DECODE_BATCH,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     KV_ORI_BLOCK_NUM,
@@ -689,15 +688,6 @@ def golden_prefill_attention_csa(tensors):
     tensors["x_out"][:] = y
 
 
-@functools.lru_cache(maxsize=None)
-def _state_block_table(max_blocks, physical_blocks):
-    """Constant scrambled state block table [max_blocks]."""
-    import torch
-
-    blocks = torch.arange(max_blocks, dtype=torch.int32)
-    return (blocks * 17 + 3) % physical_blocks
-
-
 def build_tensor_specs(
     start_pos: int = START_POS,
     token_count: int = PREFILL_SEQ,
@@ -705,6 +695,7 @@ def build_tensor_specs(
     import torch
     from golden import TensorSpec
     from utils import (
+        block_table,
         int8_quant_per_row,
         quant_w_per_channel,
         token_local_rope,
@@ -887,7 +878,12 @@ def build_tensor_specs(
             * 0.1916
         )
 
-    state_table = _state_block_table(CSA_STATE_MAX_BLOCKS, CSA_STATE_PHYSICAL_BLOCKS)
+    state_table = block_table(
+        batch=1,
+        table_blocks=CSA_STATE_MAX_BLOCKS,
+        physical_blocks=CSA_STATE_PHYSICAL_BLOCKS,
+        request_slots=DECODE_BATCH,
+    )[0]
 
     def init_compress_state_block_table():
         return state_table.clone().unsqueeze(0)
@@ -928,10 +924,12 @@ def build_tensor_specs(
             * 0.2663
         )
 
-    inner_state_table = _state_block_table(
-        INNER_STATE_MAX_BLOCKS,
-        CSA_INNER_STATE_PHYSICAL_BLOCKS,
-    )
+    inner_state_table = block_table(
+        batch=1,
+        table_blocks=INNER_STATE_MAX_BLOCKS,
+        physical_blocks=CSA_INNER_STATE_PHYSICAL_BLOCKS,
+        request_slots=DECODE_BATCH,
+    )[0]
 
     def init_inner_compress_state_block_table():
         return inner_state_table.clone().unsqueeze(0)
@@ -1878,10 +1876,12 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
     compress_state_block_table = make_block_table(
         batch=2, table_blocks=CSA_STATE_MAX_BLOCKS,
         physical_blocks=CSA_STATE_BLOCK_NUM,
+        request_slots=DECODE_BATCH,
     )
     inner_compress_state_block_table = make_block_table(
         batch=2, table_blocks=INNER_STATE_MAX_BLOCKS,
         physical_blocks=INNER_STATE_BLOCK_NUM,
+        request_slots=DECODE_BATCH,
     )
 
     ori_mappings = []

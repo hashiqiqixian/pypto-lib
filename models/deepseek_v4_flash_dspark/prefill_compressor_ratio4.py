@@ -14,6 +14,8 @@ from config import (
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     CSA_STATE_PHYSICAL_BLOCKS,
+    DECODE_BATCH,
+    DECODE_SEQ,
     FLASH as M,
     FP32_NEG_INF,
     PREFILL_SEQ,
@@ -44,6 +46,7 @@ OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
+STATE_STORAGE_LEN = STATE_LEN + DECODE_SEQ
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = PREFILL_STATE_TILE // COMPRESS_RATIO
 CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -52,6 +55,9 @@ CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 CSA_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 CSA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + CSA_STATE_BLOCK_SIZE - 1) // CSA_STATE_BLOCK_SIZE
 CSA_STATE_BLOCK_NUM = CSA_STATE_PHYSICAL_BLOCKS
+CSA_STATE_BLOCKS_PER_REQUEST = (
+    STATE_STORAGE_LEN + CSA_STATE_BLOCK_SIZE - 1
+) // CSA_STATE_BLOCK_SIZE
 
 # tiling
 K_TILE = 512  # projection D (K) reduction tile
@@ -67,6 +73,7 @@ PACKED_RMS_TILE = 16
 assert PREFILL_STATE_TILE % PROJ_ROW_TILE == 0
 assert PREFILL_STATE_TILE % COMPRESS_RATIO == 0
 assert MAX_CMP_WRITES % PACKED_RMS_TILE == 0
+assert CSA_STATE_BLOCK_NUM == DECODE_BATCH * CSA_STATE_BLOCKS_PER_REQUEST
 
 
 @pl.jit.inline(auto_scope=False)
@@ -230,45 +237,10 @@ def _prefill_compressor_ratio4_tile(
                 pl.write(write_src_map, [0, map_seen], pl.cast(map_global, pl.INT32))
                 map_seen = map_seen + 1
 
-    # Scatter the whole tile before pooling. The production state ring has 520
-    # physical rows, so a 512-row tile plus the ratio-4 eight-row read window
-    # cannot overwrite a live row within this tile. The fence orders reuse by
-    # the following tile.
-    with pl.spmd(tile_rows, name_hint="prefill_c4_state_scatter_pre"):
-        scatter_local = pl.tile.get_block_idx()
-        scatter_order = pl.read(state_order_fence, [0])
-        if scatter_order >= 0:
-            scatter_global = tile_base + scatter_local
-            scatter_row_raw = pl.read(state_slot_mapping, [scatter_global])
-            if scatter_row_raw >= 0:
-                scatter_row = pl.cast(scatter_row_raw, pl.INDEX)
-                scatter_pos = pl.read(position_ids, [scatter_global])
-                scatter_ape_slot = pl.cast(scatter_pos % COMPRESS_RATIO, pl.INDEX)
-                for scatter_ob in pl.range(OUT_DIM // OUT_TILE):
-                    scatter_o0 = scatter_ob * OUT_TILE
-                    compress_state_flat[
-                        scatter_row : scatter_row + 1,
-                        scatter_o0 : scatter_o0 + OUT_TILE,
-                    ] = kv_proj_scratch[
-                        scatter_local : scatter_local + 1,
-                        scatter_o0 : scatter_o0 + OUT_TILE,
-                    ]
-                    compress_state_flat[
-                        scatter_row : scatter_row + 1,
-                        OUT_DIM + scatter_o0 : OUT_DIM + scatter_o0 + OUT_TILE,
-                    ] = pl.add(
-                        score_proj_scratch[
-                            scatter_local : scatter_local + 1,
-                            scatter_o0 : scatter_o0 + OUT_TILE,
-                        ],
-                        ape[
-                            scatter_ape_slot : scatter_ape_slot + 1,
-                            scatter_o0 : scatter_o0 + OUT_TILE,
-                        ],
-                    )
-
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
-    for write_i in pl.spmd(MAX_CMP_WRITES, name_hint="prefill_c4_softmax_pool"):
+    with pl.spmd(MAX_CMP_WRITES, name_hint="prefill_c4_softmax_pool") as pool_tid:
+        write_i = pl.tile.get_block_idx()
+        _state_order_anchor = pl.read(state_order_fence, [0])
         pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_D_TILE], dtype=pl.FP32)
         pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_D_TILE], dtype=pl.FP32)
         write_slot_raw = pl.read(write_dst_map, [0, write_i])
@@ -334,6 +306,49 @@ def _prefill_compressor_ratio4_tile(
                         OUT_DIM + HEAD_DIM : COMPRESS_STATE_DIM,
                     ]
 
+            # Current-tile rows come from projection scratch. Persistent state
+            # remains the source only for history preceding this tile.
+            write_src = pl.cast(pl.read(write_src_map, [0, write_i]), pl.INDEX)
+            tile_end = tile_base + tile_rows
+            for overlay_s in pl.range(COMPRESS_RATIO):
+                if write_pos >= STATE_LEN - 1:
+                    prev_abs = prev_start + overlay_s
+                    prev_source = write_src - pl.cast(write_pos - prev_abs, pl.INDEX)
+                    if prev_source >= tile_base:
+                        if prev_source < tile_end:
+                            prev_local = prev_source - tile_base
+                            prev_ape_slot = pl.cast(prev_abs % COMPRESS_RATIO, pl.INDEX)
+                            pool_kv_tile[overlay_s : overlay_s + 1, 0:HEAD_D_TILE] = kv_proj_scratch[
+                                prev_local : prev_local + 1,
+                                0:HEAD_DIM,
+                            ]
+                            pool_score_tile[overlay_s : overlay_s + 1, 0:HEAD_D_TILE] = pl.add(
+                                score_proj_scratch[
+                                    prev_local : prev_local + 1,
+                                    0:HEAD_DIM,
+                                ],
+                                ape[prev_ape_slot : prev_ape_slot + 1, 0:HEAD_DIM],
+                            )
+
+                cur_abs = cur_start + overlay_s
+                cur_source = write_src - pl.cast(write_pos - cur_abs, pl.INDEX)
+                if cur_source >= tile_base:
+                    if cur_source < tile_end:
+                        cur_local = cur_source - tile_base
+                        cur_slot = COMPRESS_RATIO + overlay_s
+                        cur_ape_slot = pl.cast(cur_abs % COMPRESS_RATIO, pl.INDEX)
+                        pool_kv_tile[cur_slot : cur_slot + 1, 0:HEAD_D_TILE] = kv_proj_scratch[
+                            cur_local : cur_local + 1,
+                            HEAD_DIM:OUT_DIM,
+                        ]
+                        pool_score_tile[cur_slot : cur_slot + 1, 0:HEAD_D_TILE] = pl.add(
+                            score_proj_scratch[
+                                cur_local : cur_local + 1,
+                                HEAD_DIM:OUT_DIM,
+                            ],
+                            ape[cur_ape_slot : cur_ape_slot + 1, HEAD_DIM:OUT_DIM],
+                        )
+
             init_slot = STATE_LEN - 1
             mi_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
             li_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
@@ -370,9 +385,49 @@ def _prefill_compressor_ratio4_tile(
             pooled_zero = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
             pooled_kv[write_i : write_i + 1, 0:HEAD_DIM] = pooled_zero
 
-    # A single-output GM task closes the state RAW/WAR chain before the next
-    # dynamic tile reuses the 520-row ring.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c4_state_order_commit"):
+    tail_rows = pl.min(tile_rows, STATE_STORAGE_LEN)
+    tail_base = tile_rows - tail_rows
+    with pl.spmd(
+        tail_rows,
+        name_hint="prefill_c4_state_tail_update",
+        deps=[pool_tid],
+    ) as state_update_tid:
+        tail_i = pl.tile.get_block_idx()
+        update_local = tail_base + tail_i
+        update_global = tile_base + update_local
+        state_row_raw = pl.read(state_slot_mapping, [update_global])
+        if state_row_raw >= 0:
+            state_row = pl.cast(state_row_raw, pl.INDEX)
+            update_pos = pl.read(position_ids, [update_global])
+            ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
+            for update_ob in pl.range(OUT_DIM // OUT_TILE):
+                update_o0 = update_ob * OUT_TILE
+                compress_state_flat[
+                    state_row : state_row + 1,
+                    update_o0 : update_o0 + OUT_TILE,
+                ] = kv_proj_scratch[
+                    update_local : update_local + 1,
+                    update_o0 : update_o0 + OUT_TILE,
+                ]
+                compress_state_flat[
+                    state_row : state_row + 1,
+                    OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
+                ] = pl.add(
+                    score_proj_scratch[
+                        update_local : update_local + 1,
+                        update_o0 : update_o0 + OUT_TILE,
+                    ],
+                    ape[
+                        ape_slot : ape_slot + 1,
+                        update_o0 : update_o0 + OUT_TILE,
+                    ],
+                )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_c4_state_order_commit",
+        deps=[state_update_tid],
+    ):
         pool_sample = pl.read(pooled_kv, [0, 0])
         fence_bit = pl.cast(pool_sample == pool_sample, pl.INT32)
         pl.write(state_order_fence, [0], fence_bit * fence_bit)
@@ -500,7 +555,10 @@ def compressor_ratio4(
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
-    """Compress packed requests independently through ordered 512-row state tiles."""
+    """Compress packed requests independently through ordered 512-row state tiles.
+
+    Each request slice delimited by ``query_start_loc`` must use consecutive positions.
+    """
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     rope_dup_idx_template = pl.create_tensor([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     rope_swap_idx_template = pl.create_tensor([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
@@ -594,16 +652,6 @@ def golden_prefill_compressor_ratio4(tensors):
     for tile_base in range(0, token_count, PREFILL_STATE_TILE):
         tile_end = min(tile_base + PREFILL_STATE_TILE, token_count)
 
-        # Device scatter precedes pool. A 520-row ring leaves the full eight-row
-        # pooling window live while any one 512-row tile is resident.
-        for token_id in range(tile_base, tile_end):
-            dst_row = int(tensors["state_slot_mapping"][token_id].item())
-            if dst_row < 0:
-                continue
-            pos = int(position_ids[token_id].item())
-            kv_state_flat[dst_row] = kv_proj[token_id]
-            score_state_flat[dst_row] = score_proj[token_id] + ape[pos % COMPRESS_RATIO]
-
         for token_id in range(tile_base, tile_end):
             dst_row = int(tensors["cmp_slot_mapping"][token_id].item())
             if dst_row < 0:
@@ -636,6 +684,22 @@ def golden_prefill_compressor_ratio4(tensors):
                         HEAD_DIM:OUT_DIM,
                     ]
 
+            for source_id in range(tile_base, tile_end):
+                source_pos = int(position_ids[source_id].item())
+                if source_pos > write_pos or source_pos < prev_start:
+                    continue
+                if source_pos < cur_start:
+                    pool_slot = source_pos - prev_start
+                    pool_col0 = 0
+                else:
+                    pool_slot = COMPRESS_RATIO + source_pos - cur_start
+                    pool_col0 = HEAD_DIM
+                pool_kv[pool_slot] = kv_proj[source_id, pool_col0 : pool_col0 + HEAD_DIM]
+                pool_score[pool_slot] = (
+                    score_proj[source_id, pool_col0 : pool_col0 + HEAD_DIM]
+                    + ape[source_pos % COMPRESS_RATIO, pool_col0 : pool_col0 + HEAD_DIM]
+                )
+
             init_slot = STATE_LEN - 1
             mi = pool_score[init_slot : init_slot + 1].clone()
             li = torch.exp(mi - mi)
@@ -663,6 +727,15 @@ def golden_prefill_compressor_ratio4(tensors):
             rot_odd = rope_even * sin + rope_odd * cos
             normed[:, NOPE_HEAD_DIM:HEAD_DIM] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
             cache_rows[dst_row] = normed.to(torch.bfloat16)[0]
+
+        tail_base = max(tile_base, tile_end - STATE_STORAGE_LEN)
+        for token_id in range(tail_base, tile_end):
+            dst_row = int(tensors["state_slot_mapping"][token_id].item())
+            if dst_row < 0:
+                continue
+            pos = int(position_ids[token_id].item())
+            kv_state_flat[dst_row] = kv_proj[token_id]
+            score_state_flat[dst_row] = score_proj[token_id] + ape[pos % COMPRESS_RATIO]
 
 
 @pl.jit
@@ -716,7 +789,7 @@ def prefill_compressor_ratio4_test(
 def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
     import torch
     from golden import TensorSpec
-    from utils import token_local_rope
+    from utils import block_table, token_local_rope
 
     if token_count <= 0 or token_count > MAX_SEQ_LEN:
         raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
@@ -725,16 +798,22 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     if start_pos + token_count > MAX_SEQ_LEN:
         raise ValueError("start_pos + token_count exceeds max_position_embeddings")
 
+    state_table = block_table(
+        batch=1,
+        table_blocks=CSA_STATE_MAX_BLOCKS,
+        physical_blocks=CSA_STATE_BLOCK_NUM,
+        request_slots=DECODE_BATCH,
+    )[0]
+
     def init_compress_state_block_table():
-        logical_blocks = torch.arange(CSA_STATE_MAX_BLOCKS, dtype=torch.int64)
-        return ((logical_blocks * 17 + 3) % CSA_STATE_PHYSICAL_BLOCKS).to(torch.int32).unsqueeze(0)
+        return state_table.unsqueeze(0)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
         block = abs_pos // CSA_STATE_BLOCK_SIZE
         intra = abs_pos % CSA_STATE_BLOCK_SIZE
-        physical_block = (block * 17 + 3) % CSA_STATE_PHYSICAL_BLOCKS
+        physical_block = int(state_table[block].item())
         return physical_block * CSA_STATE_BLOCK_SIZE + intra
 
     def init_x():
