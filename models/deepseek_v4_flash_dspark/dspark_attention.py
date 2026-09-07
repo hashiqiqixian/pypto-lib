@@ -29,7 +29,6 @@ from config import (
 from decode_o_proj import LOCAL_T_PAD
 from qkv_proj_rope import (
     kv_proj_rope,
-    materialize_rope_rows_dynamic,
     q_proj_rope,
     rope_prepare,
 )
@@ -78,8 +77,10 @@ def dspark_attention(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_cos_local: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T], pl.INT32],
     kv_position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -92,21 +93,16 @@ def dspark_attention(
     ],
 ):
     kv_tokens = pl.tensor.dim(kv_position_ids, 0)
-    rope_cos_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
-    for rope_t in pl.spmd(T, name_hint="dspark_q_rope_rows"):
-        rope_position = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
-        rope_cos_t[rope_t : rope_t + 1, :] = freqs_cos[
-            rope_position : rope_position + 1, :
-        ]
-        rope_sin_t[rope_t : rope_t + 1, :] = freqs_sin[
-            rope_position : rope_position + 1, :
-        ]
-
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_swap_idx = pl.create_tensor([T, ROPE_DIM], dtype=pl.INT32)
-    rope_prepare(rope_cos_t, rope_sin_t, rope_cos_il, rope_sin_signed, rope_swap_idx)
+    rope_prepare(
+        freqs_cos_local,
+        freqs_sin_local,
+        rope_cos_il,
+        rope_sin_signed,
+        rope_swap_idx,
+    )
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
@@ -117,21 +113,12 @@ def dspark_attention(
         q, qr, qr_scale,
     )
 
-    kv_rope_cos_t = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.BF16)
-    kv_rope_sin_t = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.BF16)
-    materialize_rope_rows_dynamic(
-        freqs_cos,
-        freqs_sin,
-        kv_position_ids,
-        kv_rope_cos_t,
-        kv_rope_sin_t,
-    )
     kv_rope_cos_il = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.FP32)
     kv_rope_sin_signed = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.FP32)
     kv_rope_swap_idx = pl.create_tensor([kv_tokens, ROPE_DIM], dtype=pl.INT32)
     rope_prepare(
-        kv_rope_cos_t,
-        kv_rope_sin_t,
+        freqs_cos,
+        freqs_sin,
         kv_rope_cos_il,
         kv_rope_sin_signed,
         kv_rope_swap_idx,
@@ -252,8 +239,12 @@ def dspark_attention(
         attn_rope = attn_normed[:, NOPE_DIM:HEAD_DIM]
         rope_even = pl.gather(attn_rope, mask_pattern=pl.tile.MaskPattern.P0101)
         rope_odd = pl.gather(attn_rope, mask_pattern=pl.tile.MaskPattern.P1010)
-        cos_half = rope_cos_t[merge_token_idx : merge_token_idx + 1, 0:ROPE_HALF]
-        sin_half = rope_sin_t[merge_token_idx : merge_token_idx + 1, 0:ROPE_HALF]
+        cos_half = freqs_cos_local[
+            merge_token_idx : merge_token_idx + 1, 0:ROPE_HALF
+        ]
+        sin_half = freqs_sin_local[
+            merge_token_idx : merge_token_idx + 1, 0:ROPE_HALF
+        ]
         cos_fp32 = pl.cast(cos_half, target_type=pl.FP32, mode="none")
         sin_fp32 = pl.cast(sin_half, target_type=pl.FP32, mode="none")
         inverse_even_cos = pl.col_expand_mul(rope_even, cos_fp32)
@@ -293,8 +284,10 @@ def dspark_attention_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_cos_local: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[T], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -305,6 +298,8 @@ def dspark_attention_test(
         pl.Tensor[[O_GROUPS, LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16]
     ],
 ):
+    freqs_cos.bind_dynamic(0, KV_T_DYN)
+    freqs_sin.bind_dynamic(0, KV_T_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     o_packed_flat = pl.reshape(
         o_packed_heads,
@@ -314,7 +309,8 @@ def dspark_attention_test(
         x,
         x,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, position_ids, position_ids,
+        freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
+        position_ids, position_ids,
         kv_cache, slot_mapping, swa_indices, swa_lens,
         attn_sink, o_packed_flat,
     )
@@ -325,15 +321,13 @@ def golden_dspark_attention(tensors):
     import torch
     from qkv_proj_rope import golden_qkv_proj_rope
 
-    positions = tensors["position_ids"].long()
-    rope_cos = tensors["freqs_cos"].index_select(0, positions)
-    rope_sin = tensors["freqs_sin"].index_select(0, positions)
+    rope_cos = tensors["freqs_cos_local"]
+    rope_sin = tensors["freqs_sin_local"]
 
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
-    kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    golden_qkv_proj_rope({
+    local_projection = {
         "x": tensors["x"],
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
@@ -344,10 +338,23 @@ def golden_dspark_attention(tensors):
         "gamma_cq": tensors["gamma_cq"],
         "gamma_ckv": tensors["gamma_ckv"],
         "q": q,
-        "kv": kv,
+        "kv": torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16),
         "qr": qr,
         "qr_scale": qr_scale,
+    }
+    golden_qkv_proj_rope(local_projection)
+
+    kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
+    group_projection = dict(local_projection)
+    group_projection.update({
+        "rope_cos": tensors["freqs_cos"],
+        "rope_sin": tensors["freqs_sin"],
+        "q": torch.zeros_like(q),
+        "kv": kv,
+        "qr": torch.zeros_like(qr),
+        "qr_scale": torch.zeros_like(qr_scale),
     })
+    golden_qkv_proj_rope(group_projection)
 
     kv_cache_flat = tensors["kv_cache"].view(-1, HEAD_DIM)
     slots = tensors["slot_mapping"]
@@ -398,15 +405,13 @@ def build_tensor_specs(start_pos=None):
     from golden import TensorSpec
     from utils import (
         block_table,
-        build_rope_tables,
         paged_slot_mapping,
         position_ids_from_starts,
         quant_w_per_channel,
         resolve_start_positions,
         swa_decode_start_set,
+        token_local_rope,
     )
-
-    freqs_cos, freqs_sin = build_rope_tables(M, 0, dtype=torch.bfloat16)
 
     def init_start_pos():
         return resolve_start_positions(
@@ -422,6 +427,36 @@ def build_tensor_specs(start_pos=None):
 
     def init_position_ids():
         return position_ids_from_starts(init_start_pos(), seq=S).reshape(-1).contiguous()
+
+    def init_freqs_cos():
+        cos, _ = token_local_rope(
+            M, 0, init_position_ids(), max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16
+        )
+        return cos
+
+    def init_freqs_sin():
+        _, sin = token_local_rope(
+            M, 0, init_position_ids(), max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16
+        )
+        return sin
+
+    def init_group_freqs_cos():
+        positions = torch.remainder(
+            init_position_ids().to(torch.int64) + 1, MAX_SEQ_LEN
+        )
+        cos, _ = token_local_rope(
+            M, 0, positions, max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16
+        )
+        return cos
+
+    def init_group_freqs_sin():
+        positions = torch.remainder(
+            init_position_ids().to(torch.int64) + 1, MAX_SEQ_LEN
+        )
+        _, sin = token_local_rope(
+            M, 0, positions, max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16
+        )
+        return sin
 
     def init_slot_mapping():
         return paged_slot_mapping(
@@ -473,8 +508,10 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=lambda: torch.ones(Q_LORA)),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=lambda: torch.ones(HEAD_DIM)),
-        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_cos.clone()),
-        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=lambda: freqs_sin.clone()),
+        TensorSpec("freqs_cos_local", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin_local", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_group_freqs_cos),
+        TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_group_freqs_sin),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         TensorSpec(
             "kv_cache",
