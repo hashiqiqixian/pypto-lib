@@ -566,18 +566,28 @@ def prefill_dispatch(
 ):
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait") as _reuse_tid:
+    # Keep epoch one free of a zero-condition deferred task.  The array carries
+    # the selected dependency through inline lowering and the request loop.
+    reuse_dep = pl.array.create(1, pl.TASK_ID)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_anchor") as _reuse_anchor_tid:
         _indices_anchor = pl.read(indices, [0, 0])
-        if moe_epoch > 1:
+    reuse_dep[0] = _reuse_anchor_tid
+    if moe_epoch > 1:
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="moe_reuse_wait",
+            deps=[_reuse_anchor_tid],
+        ) as _reuse_wait_tid:
             for src in pl.range(N_RANKS):
                 pld.system.defer_wait(
                     signal=consumed, offsets=[src, 0],
                     expected=pl.cast(moe_epoch - 1, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )
+        reuse_dep[0] = _reuse_wait_tid
 
     aux_src = pl.create_tensor([N_ROUTES, AUX_PAD], dtype=pl.FP32)
     route_src = pl.create_tensor([N_ROUTES, IDX_PAD], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_stage", deps=[_reuse_tid]) as _stage_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_stage", deps=[reuse_dep[0]]) as _stage_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -602,7 +612,7 @@ def prefill_dispatch(
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="dispatch_meta",
-        deps=[_reuse_tid],
+        deps=[reuse_dep[0]],
     ) as _meta_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -662,7 +672,7 @@ def prefill_dispatch(
                 final_count = pl.yield_(next_acc)
             pl.write(recv_count_out, [e, 0], final_count)
 
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push", deps=[_reuse_tid, _stage_tid]) as _push_tid:
+    with pl.spmd(N_LOCAL, name_hint="dispatch_push", deps=[reuse_dep[0], _stage_tid]) as _push_tid:
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:

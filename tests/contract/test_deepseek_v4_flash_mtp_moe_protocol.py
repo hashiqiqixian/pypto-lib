@@ -88,7 +88,6 @@ def test_prefill_protocol_keeps_reduce_taskid_local() -> None:
     call_names = {_call_name(call.func) for call in ast.walk(prefill_moe) if isinstance(call, ast.Call)}
     assert {"prefill_dispatch", "prefill_combine"} <= call_names
     assert {"moe", "dispatch", "combine"}.isdisjoint(call_names)
-    assert "pl.TASK_ID" not in ast.unparse(dispatch)
     assert "_reduce_tid" not in ast.unparse(dispatch)
     assert "pl.TASK_ID" not in ast.unparse(prefill_moe)
     assert "_reduce_tid" not in ast.unparse(prefill_moe)
@@ -163,15 +162,26 @@ def test_prefill_dispatch_uses_padded_set_epoch_grid() -> None:
         assert ast.unparse(_keyword(call, "expected")) == expected
         assert ast.unparse(_keyword(call, "cmp")) == "pld.WaitCmp.Ge"
 
-    reuse_source = ast.unparse(_context(dispatch, "moe_reuse_wait"))
-    assert "_indices_anchor = pl.read(indices, [0, 0])" in reuse_source
-    assert "if moe_epoch > 1" in reuse_source
+    anchor_source = ast.unparse(_context(dispatch, "moe_reuse_anchor"))
+    assert "_indices_anchor = pl.read(indices, [0, 0])" in anchor_source
+    reuse_wait = _context(dispatch, "moe_reuse_wait")
+    reuse_source = ast.unparse(reuse_wait)
+    assert "deps=[_reuse_anchor_tid]" in reuse_source
     assert "pld.system.defer_wait" in reuse_source
     assert "pld.system.wait" not in reuse_source
+    epoch_guard = next(
+        node
+        for node in ast.walk(dispatch)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "moe_epoch > 1"
+    )
+    assert reuse_wait in epoch_guard.body
+    assert "reuse_dep = pl.array.create(1, pl.TASK_ID)" in ast.unparse(dispatch)
+    assert "reuse_dep[0] = _reuse_anchor_tid" in ast.unparse(dispatch)
+    assert "reuse_dep[0] = _reuse_wait_tid" in ast.unparse(epoch_guard)
     dependencies = {
-        "dispatch_stage": (dispatch, "pl.at", None, "[_reuse_tid]"),
-        "dispatch_meta": (dispatch, "pl.at", None, "[_reuse_tid]"),
-        "dispatch_push": (dispatch, "pl.spmd", "N_LOCAL", "[_reuse_tid, _stage_tid]"),
+        "dispatch_stage": (dispatch, "pl.at", None, "[reuse_dep[0]]"),
+        "dispatch_meta": (dispatch, "pl.at", None, "[reuse_dep[0]]"),
+        "dispatch_push": (dispatch, "pl.spmd", "N_LOCAL", "[reuse_dep[0], _stage_tid]"),
         "dispatch_wait": (dispatch, "pl.spmd", "N_LOCAL", "[_meta_tid, _push_tid]"),
         "dispatch_gather": (dispatch, "pl.spmd", "N_LOCAL", "[_wait_tid, _push_tid]"),
         "combine_wait": (combine, "pl.spmd", "N_LOCAL", "[_cscatter_tid]"),
