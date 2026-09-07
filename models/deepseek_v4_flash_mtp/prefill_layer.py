@@ -372,6 +372,7 @@ def _prefill_layer_tile(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    x_attn_debug: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     x_next: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -387,7 +388,7 @@ def _prefill_layer_tile(
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
-    x_attn = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
+    x_attn = x_attn_debug
     with pl.scope():
         if LAYER_ID < 2:
             prefill_attention_swa(
@@ -547,6 +548,7 @@ def prefill_layer_core(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    x_attn_debug: pl.Out[pl.Tensor[[USER_BATCH, T, HC_MULT, D], pl.FP32]],
     x_next: pl.Out[pl.Tensor[[USER_BATCH, T, HC_MULT, D], pl.FP32]],
     num_tokens_per_owner: pl.Tensor[[USER_BATCH, N_RANKS], pl.INT32],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
@@ -661,6 +663,14 @@ def prefill_layer_core(
                 [INNER_STATE_MAX_BLOCKS],
                 [request_index * INNER_STATE_MAX_BLOCKS],
             )
+            x_attn_debug_profile = pl.slice(
+                x_attn_debug,
+                [1, T, HC_MULT, D],
+                [request_index, 0, 0, 0],
+            )
+            x_attn_debug_request = pl.reshape(
+                x_attn_debug_profile, [T, HC_MULT, D]
+            )
             x_next_profile = pl.slice(
                 x_next,
                 [1, T, HC_MULT, D],
@@ -697,7 +707,7 @@ def prefill_layer_core(
                 routed_w2, routed_w2_scale,
                 shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
                 shared_w2, shared_w2_scale,
-                x_next_request,
+                x_attn_debug_request, x_next_request,
                 recv_meta, recv_x, recv_aux, recv_route,
                 arrived, data_arrived, routed_y_buf, combine_arrived, consumed,
                 layer_id, valid_n, my_rank, moe_epoch,
@@ -827,6 +837,9 @@ def l3_prefill_layer(
     shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    x_attn_debug: pl.Out[
+        pl.Tensor[[N_RANKS, USER_BATCH, T, HC_MULT, D], pl.FP32]
+    ],
     x_next: pl.Out[pl.Tensor[[N_RANKS, USER_BATCH, T, HC_MULT, D], pl.FP32]],
     num_tokens_per_owner: pl.Tensor[[USER_BATCH, N_RANKS], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
@@ -888,7 +901,7 @@ def l3_prefill_layer(
             routed_w2[rank], routed_w2_scale[rank],
             shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
             shared_w2[rank], shared_w2_scale[rank],
-            x_next[rank],
+            x_attn_debug[rank], x_next[rank],
             num_tokens_per_owner,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived, consumed,
@@ -974,6 +987,7 @@ HOST_TENSOR_ORDER = (
     "shared_w3_scale",
     "shared_w2",
     "shared_w2_scale",
+    "x_attn_debug",
     "x_next",
     "num_tokens_per_owner",
 )
@@ -1348,6 +1362,9 @@ def build_tensor_specs(layer_id=2, start_pos=0, num_tokens=T):
             tensor_specs.append(spec)
 
     tensor_specs.append(TensorSpec(
+        "x_attn_debug", [N_RANKS, USER_BATCH, total_tokens, HC_MULT, D], torch.float32
+    ))
+    tensor_specs.append(TensorSpec(
         "x_next", [N_RANKS, USER_BATCH, total_tokens, HC_MULT, D], torch.float32
     ))
 
@@ -1448,7 +1465,7 @@ def golden_prefill_layer(tensors):
 
     for request_id in range(USER_BATCH):
         valid = int(valid_per_request[request_id])
-        x_attn = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
+        x_attn = tensors["x_attn_debug"][:, request_id]
         for rank in range(N_RANKS):
             attn_tensors = {}
             for spec in attn_specs:
@@ -1485,6 +1502,70 @@ def golden_prefill_layer(tensors):
         moe_tensors["x_next"] = x_next_request
         golden_moe(moe_tensors)
         x_next[:, request_id].copy_(x_next_request)
+
+
+def _conditioned_x_next_compare(valid_rows):
+    """Diagnose MoE against the device-produced attention activation."""
+    import torch
+    from golden import error_distribution, ratio_reldiff
+
+    measure = error_distribution(always_pass=False)
+    gate = ratio_reldiff(
+        diff_thd=0.01,
+        pct_thd=0.05,
+        valid_rows=valid_rows,
+        valid_axis=2,
+    )
+
+    def cmp(
+        actual,
+        expected,
+        *,
+        actual_outputs,
+        expected_outputs,
+        inputs,
+        rtol,
+        atol,
+    ):
+        device_attn = actual_outputs["x_attn_debug"].cpu()
+        conditioned = torch.zeros_like(expected)
+        valid_per_request = inputs["num_tokens_per_owner"].max(dim=1).values
+        for request_id in range(USER_BATCH):
+            valid = int(valid_per_request[request_id])
+            moe_tensors = dict(inputs)
+            moe_tensors["x_hc"] = device_attn[:, request_id]
+            moe_tensors["input_ids"] = inputs["input_ids"][:, request_id]
+            moe_tensors["num_tokens"] = valid
+            request_out = torch.zeros(
+                N_RANKS, T, HC_MULT, D, dtype=torch.float32
+            )
+            moe_tensors["x_next"] = request_out
+            golden_moe(moe_tensors)
+            conditioned[:, request_id].copy_(request_out)
+
+        kwargs = {
+            "actual_outputs": actual_outputs,
+            "expected_outputs": expected_outputs,
+            "inputs": inputs,
+            "rtol": rtol,
+            "atol": atol,
+        }
+        print("[DIAG] x_next vs ordinary golden M(golden attention):")
+        measure(
+            actual.narrow(2, 0, valid_rows),
+            expected.narrow(2, 0, valid_rows),
+            **kwargs,
+        )
+        print("[DIAG] x_next vs conditioned M(device attention):")
+        measure(
+            actual.narrow(2, 0, valid_rows),
+            conditioned.narrow(2, 0, valid_rows),
+            **kwargs,
+        )
+        return gate(actual, conditioned, **kwargs)
+
+    cmp.__name__ = "conditioned_x_next_on_device_attention"
+    return cmp
 
 
 if __name__ == "__main__":
@@ -1549,12 +1630,13 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "x_next": ratio_reldiff(
+            "x_attn_debug": ratio_reldiff(
                 diff_thd=0.01,
                 pct_thd=0.05,
                 valid_rows=args.num_tokens,
                 valid_axis=2,
             ),
+            "x_next": _conditioned_x_next_compare(args.num_tokens),
             "kv_cache": mapped_pool_ratio_allclose(
                 "ori_slot_mapping",
                 mapping_shape=(N_RANKS, USER_BATCH, T),
