@@ -803,14 +803,22 @@ def prefill_combine(
         deps=[_cwait_tid],
     )
 
+    consumed_epoch_row = pl.create_tensor([1, SIGNAL_PAD], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_consumed", deps=[_reduce_tid]):
+        epoch_tile = pl.tile.full([1, SIGNAL_PAD], dtype=pl.INT32, value=0)
+        pl.tile.write(epoch_tile, [0, 0], moe_epoch)
+        pl.store(epoch_tile, [0, 0], consumed_epoch_row)
+        pl.system.cacheinvalid()
+        pl.system.fence()
         for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=consumed, peer=peer, offsets=[my_rank, 0],
-                    value=moe_epoch, op=pld.NotifyOp.Set,
-                )
-        pl.write(consumed, [my_rank, 0], moe_epoch)
+            pld.tensor.put(
+                dst=consumed,
+                peer=peer,
+                src=consumed_epoch_row,
+                dst_offsets=[my_rank, 0],
+                src_offsets=[0, 0],
+                shape=[1, SIGNAL_PAD],
+            )
 
 
 @pl.jit.inline(auto_scope=False)

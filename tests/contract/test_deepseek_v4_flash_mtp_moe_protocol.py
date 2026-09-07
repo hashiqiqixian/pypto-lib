@@ -102,20 +102,20 @@ def test_prefill_protocol_keeps_reduce_taskid_local() -> None:
         node for node in combine.body if isinstance(node, ast.Assign) and node.value is submissions[0]
     )
     assert ast.unparse(assignment.targets[0]) == "(ffn_out, _reduce_tid)"
-    publication = combine.body[combine.body.index(assignment) + 1]
-    assert publication is _context(combine, "moe_consumed")
+    publication = _context(combine, "moe_consumed")
+    assert combine.body.index(publication) > combine.body.index(assignment)
     publication_call = publication.items[0].context_expr
     assert ast.unparse(_keyword(publication_call, "deps")) == "[_reduce_tid]"
-    consumed_notify = _calls(publication, "pld.system.notify")
-    assert len(consumed_notify) == 1
-    assert ast.unparse(_keyword(consumed_notify[0], "target")) == "consumed"
-    assert "if peer != my_rank" in ast.unparse(publication)
-    consumed_writes = [
-        call for call in _calls(publication, "pl.write") if ast.unparse(call.args[0]) == "consumed"
-    ]
-    assert len(consumed_writes) == 1
-    assert ast.unparse(consumed_writes[0].args[1]) == "[my_rank, 0]"
-    assert ast.unparse(consumed_writes[0].args[2]) == "moe_epoch"
+    assert not _calls(publication, "pld.system.notify")
+    consumed_put = _calls(publication, "pld.tensor.put")
+    assert len(consumed_put) == 1
+    assert ast.unparse(_keyword(consumed_put[0], "dst")) == "consumed"
+    assert ast.unparse(_keyword(consumed_put[0], "peer")) == "peer"
+    assert ast.unparse(_keyword(consumed_put[0], "dst_offsets")) == "[my_rank, 0]"
+    assert ast.unparse(_keyword(consumed_put[0], "src_offsets")) == "[0, 0]"
+    assert ast.unparse(_keyword(consumed_put[0], "shape")) == "[1, SIGNAL_PAD]"
+    assert len(_calls(publication, "pl.system.cacheinvalid")) == 1
+    assert len(_calls(publication, "pl.system.fence")) == 1
     assert all("_reduce_tid" not in ast.unparse(node.value) for node in ast.walk(combine) if isinstance(node, ast.Return))
 
 
@@ -134,13 +134,12 @@ def test_prefill_dispatch_uses_padded_set_epoch_grid() -> None:
     assert "NotifyOp.AtomicAdd" not in ast.unparse(combine)
 
     notifications = _calls(dispatch, "pld.system.notify") + _calls(combine, "pld.system.notify")
-    assert len(notifications) == 4
+    assert len(notifications) == 3
     notify_by_target = {ast.unparse(_keyword(call, "target")): call for call in notifications}
     expected_notifies = {
         "arrived": ("dst", "[my_rank, 0]"),
         "data_arrived": ("dst", "[my_rank, loc_e, 0]"),
         "combine_arrived": ("peer", "[my_rank, e, 0]"),
-        "consumed": ("peer", "[my_rank, 0]"),
     }
     assert set(notify_by_target) == set(expected_notifies)
     for target, (peer, offsets) in expected_notifies.items():
