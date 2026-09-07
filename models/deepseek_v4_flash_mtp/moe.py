@@ -570,7 +570,7 @@ def prefill_dispatch(
         _indices_anchor = pl.read(indices, [0, 0])
         if moe_epoch > 1:
             for src in pl.range(N_RANKS):
-                pld.system.wait(
+                pld.system.defer_wait(
                     signal=consumed, offsets=[src, 0],
                     expected=pl.cast(moe_epoch - 1, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )

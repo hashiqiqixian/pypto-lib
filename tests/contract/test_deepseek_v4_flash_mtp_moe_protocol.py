@@ -143,9 +143,13 @@ def test_prefill_dispatch_uses_padded_set_epoch_grid() -> None:
         assert ast.unparse(_keyword(call, "value")) == "moe_epoch"
         assert ast.unparse(_keyword(call, "op")) == "pld.NotifyOp.Set"
 
-    waits = _calls(dispatch, "pld.system.wait") + _calls(combine, "pld.system.wait")
-    assert len(waits) == 4
-    wait_by_signal = {ast.unparse(_keyword(call, "signal")): call for call in waits}
+    blocking_waits = _calls(dispatch, "pld.system.wait") + _calls(combine, "pld.system.wait")
+    deferred_waits = _calls(dispatch, "pld.system.defer_wait") + _calls(combine, "pld.system.defer_wait")
+    assert len(blocking_waits) == 3
+    assert len(deferred_waits) == 1
+    wait_by_signal = {
+        ast.unparse(_keyword(call, "signal")): call for call in blocking_waits + deferred_waits
+    }
     expected_waits = {
         "consumed": ("[src, 0]", "pl.cast(moe_epoch - 1, pl.INT32)"),
         "arrived": ("[src, 0]", "moe_epoch"),
@@ -162,6 +166,8 @@ def test_prefill_dispatch_uses_padded_set_epoch_grid() -> None:
     reuse_source = ast.unparse(_context(dispatch, "moe_reuse_wait"))
     assert "_indices_anchor = pl.read(indices, [0, 0])" in reuse_source
     assert "if moe_epoch > 1" in reuse_source
+    assert "pld.system.defer_wait" in reuse_source
+    assert "pld.system.wait" not in reuse_source
     dependencies = {
         "dispatch_stage": (dispatch, "pl.at", None, "[_reuse_tid]"),
         "dispatch_meta": (dispatch, "pl.at", None, "[_reuse_tid]"),
