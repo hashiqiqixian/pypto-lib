@@ -109,6 +109,13 @@ def test_prefill_protocol_keeps_reduce_taskid_local() -> None:
     consumed_notify = _calls(publication, "pld.system.notify")
     assert len(consumed_notify) == 1
     assert ast.unparse(_keyword(consumed_notify[0], "target")) == "consumed"
+    assert "if peer != my_rank" in ast.unparse(publication)
+    consumed_writes = [
+        call for call in _calls(publication, "pl.write") if ast.unparse(call.args[0]) == "consumed"
+    ]
+    assert len(consumed_writes) == 1
+    assert ast.unparse(consumed_writes[0].args[1]) == "[my_rank, 0]"
+    assert ast.unparse(consumed_writes[0].args[2]) == "moe_epoch"
     assert all("_reduce_tid" not in ast.unparse(node.value) for node in ast.walk(combine) if isinstance(node, ast.Return))
 
 
@@ -239,16 +246,16 @@ def test_clear_prefill_moe_signals_retires_then_resets_local_slots() -> None:
     assert contexts == [_context(clear, "moe_signal_retire")]
     read = _calls(clear, "pl.read")
     waits = _calls(clear, "pld.system.wait")
-    notifies = _calls(clear, "pld.system.notify")
+    writes = _calls(clear, "pl.write")
     assert len(read) == 1 and ast.unparse(read[0].args[0]) == "completion_anchor"
     assert len(waits) == 1 and ast.unparse(_keyword(waits[0], "signal")) == "consumed"
     assert ast.unparse(_keyword(waits[0], "expected")) == "final_epoch"
     assert ast.unparse(_keyword(waits[0], "cmp")) == "pld.WaitCmp.Ge"
-    assert read[0].lineno < waits[0].lineno < min(call.lineno for call in notifies)
-    assert not _calls(clear, "pl.write")
-    assert len(notifies) == 4
+    assert read[0].lineno < waits[0].lineno < min(call.lineno for call in writes)
+    assert not _calls(clear, "pld.system.notify")
+    assert len(writes) == 4
 
-    reset_by_target = {ast.unparse(_keyword(call, "target")): call for call in notifies}
+    reset_by_target = {ast.unparse(call.args[0]): call for call in writes}
     expected_offsets = {
         "arrived": "[src, 0]",
         "consumed": "[src, 0]",
@@ -258,10 +265,8 @@ def test_clear_prefill_moe_signals_retires_then_resets_local_slots() -> None:
     assert set(reset_by_target) == set(expected_offsets)
     for target, offsets in expected_offsets.items():
         call = reset_by_target[target]
-        assert ast.unparse(_keyword(call, "peer")) == "my_rank"
-        assert ast.unparse(_keyword(call, "offsets")) == offsets
-        assert ast.unparse(_keyword(call, "value")) == "0"
-        assert ast.unparse(_keyword(call, "op")) == "pld.NotifyOp.Set"
+        assert ast.unparse(call.args[1]) == offsets
+        assert ast.unparse(call.args[2]) == "pl.cast(0, pl.INT32)"
 
     caller_trees = (_tree("prefill_fwd.py"), _tree("prefill_layer.py"))
     calls = [call for tree in caller_trees for call in _calls(tree, "clear_prefill_moe_signals")]

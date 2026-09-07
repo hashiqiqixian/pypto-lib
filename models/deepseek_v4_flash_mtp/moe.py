@@ -120,23 +120,11 @@ def clear_prefill_moe_signals(
                 cmp=pld.WaitCmp.Ge,
             )
         for src in pl.range(N_RANKS):
-            pld.system.notify(
-                target=arrived, peer=my_rank, offsets=[src, 0],
-                value=0, op=pld.NotifyOp.Set,
-            )
-            pld.system.notify(
-                target=consumed, peer=my_rank, offsets=[src, 0],
-                value=0, op=pld.NotifyOp.Set,
-            )
+            pl.write(arrived, [src, 0], pl.cast(0, pl.INT32))
+            pl.write(consumed, [src, 0], pl.cast(0, pl.INT32))
             for e in pl.range(N_LOCAL):
-                pld.system.notify(
-                    target=data_arrived, peer=my_rank, offsets=[src, e, 0],
-                    value=0, op=pld.NotifyOp.Set,
-                )
-                pld.system.notify(
-                    target=combine_arrived, peer=my_rank, offsets=[src, e, 0],
-                    value=0, op=pld.NotifyOp.Set,
-                )
+                pl.write(data_arrived, [src, e, 0], pl.cast(0, pl.INT32))
+                pl.write(combine_arrived, [src, e, 0], pl.cast(0, pl.INT32))
 
 
 # === Dispatch ================================================================
@@ -817,10 +805,12 @@ def prefill_combine(
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_consumed", deps=[_reduce_tid]):
         for peer in pl.range(N_RANKS):
-            pld.system.notify(
-                target=consumed, peer=peer, offsets=[my_rank, 0],
-                value=moe_epoch, op=pld.NotifyOp.Set,
-            )
+            if peer != my_rank:
+                pld.system.notify(
+                    target=consumed, peer=peer, offsets=[my_rank, 0],
+                    value=moe_epoch, op=pld.NotifyOp.Set,
+                )
+        pl.write(consumed, [my_rank, 0], moe_epoch)
 
 
 @pl.jit.inline(auto_scope=False)
