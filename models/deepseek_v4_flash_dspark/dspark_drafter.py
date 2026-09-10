@@ -100,7 +100,7 @@ DSPARK_DRAFT_LAYERS = 3
 DSPARK_QUERY_WIDTH = 7
 DSPARK_QUERY_PAD = 8
 DSPARK_NOISE_TOKEN_ID = 128799
-DSPARK_SUPPORTED_BATCHES = (4, 8, 12, 16)
+DSPARK_SUPPORTED_BATCHES = (1, 2, 4, 8, 12, 16)
 DSPARK_MAX_BATCH = max(DSPARK_SUPPORTED_BATCHES)
 # Each rank owns complete seven-row request blocks; a CP group therefore carries
 # exactly DSPARK_CP_SIZE times one supported local batch.
@@ -1046,7 +1046,7 @@ def _balanced_routes():
     return routes.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
 
-def build_tensor_specs(batch, *, mode="decode"):
+def build_tensor_specs(batch, *, mode="decode", anchor_position=None, context_tokens=None):
     import torch
     from golden import TensorSpec
     from utils import token_local_rope
@@ -1055,12 +1055,26 @@ def build_tensor_specs(batch, *, mode="decode"):
         raise ValueError(f"unsupported DSpark batch {batch}; expected one of {DSPARK_SUPPORTED_BATCHES}")
     if mode not in ("decode", "prefill"):
         raise ValueError(f"unsupported DSpark mode {mode!r}; expected 'decode' or 'prefill'")
+    if mode != "decode" and (anchor_position is not None or context_tokens is not None):
+        raise ValueError("anchor_position and context_tokens overrides require decode mode")
+    if anchor_position is not None and (
+        not isinstance(anchor_position, int) or not 0 <= anchor_position < MAX_SEQ_LEN - DSPARK_QUERY_WIDTH
+    ):
+        raise ValueError("anchor_position must leave room for the complete draft block")
+    if context_tokens is not None and (
+        not isinstance(context_tokens, int) or not 1 <= context_tokens <= DECODE_SEQ
+    ):
+        raise ValueError(f"context_tokens must be between 1 and {DECODE_SEQ}")
 
     if mode == "decode":
         local_context_tokens = batch * DECODE_SEQ
         positions = _anchor_position_set(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        if anchor_position is not None:
+            positions.fill_(anchor_position)
         valid_pattern = torch.tensor([1, 4, 7, 2, 5, 8, 3, 6], dtype=torch.int32)
         valid_counts = valid_pattern.repeat((batch + valid_pattern.numel() - 1) // valid_pattern.numel())[:batch]
+        if context_tokens is not None:
+            valid_counts.fill_(context_tokens)
         context_request_ids = torch.arange(batch, dtype=torch.int64).repeat_interleave(DECODE_SEQ)
         context_offsets = torch.arange(DECODE_SEQ, dtype=torch.int32).repeat(batch)
         valid_mask = context_offsets < valid_counts.repeat_interleave(DECODE_SEQ)
@@ -1632,14 +1646,21 @@ if __name__ == "__main__":
     import argparse
     from golden import run
 
-    parser = argparse.ArgumentParser(description="Validate the multi-rank DeepSeek V4 DSpark drafter.")
+    parser = argparse.ArgumentParser(
+        description="Validate the multi-rank DeepSeek V4 DSpark drafter.", allow_abbrev=False,
+    )
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
     parser.add_argument("--tp", type=int, choices=(4,), default=TP_SIZE)
     parser.add_argument("--ep", type=int, choices=(4, 8, 16), default=N_RANKS)
+    parser.add_argument("--full-experts", action="store_true", help="Keep all 256 routed experts at every EP size.")
+    parser.add_argument("--anchor-position", type=int, default=None, help="Uniform decode fixture anchor position.")
+    parser.add_argument("--context-tokens", type=int, default=None, help="Context-update rows per decode request.")
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)))
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
+    parser.add_argument("--save-data", action="store_true", help="Persist inputs and golden outputs for replay.")
+    parser.add_argument("--golden-data", type=str, default=None, help="Directory containing saved golden data.")
     args = parser.parse_args()
 
     device_ids = [int(device) for device in args.device.split(",")]
@@ -1648,8 +1669,12 @@ if __name__ == "__main__":
     assert len(device_ids) >= N_RANKS
     result = run(
         fn=l3_dspark_drafter,
-        specs=build_tensor_specs(args.batch),
+        specs=build_tensor_specs(
+            args.batch, anchor_position=args.anchor_position, context_tokens=args.context_tokens,
+        ),
         golden_fn=golden_dspark_drafter,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         compile_only=args.compile_only,
         config=dict(
             dump_passes=args.dump_passes,
