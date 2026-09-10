@@ -486,7 +486,7 @@ def draft_layer(
 
     attention_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     hc_post_prefill(
-        o_local[0:T, :],
+        o_local,
         query_hc,
         post,
         combine,
