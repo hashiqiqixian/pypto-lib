@@ -150,6 +150,7 @@ ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 MAIN_IN = DSPARK_DRAFT_LAYERS * D
 
 WIN = M.sliding_window
+PAD_D_TILE = 512
 
 # Three draft layers plus their MoE communication graph exceed the runtime's
 # default per-ring heap. Match the established large-model harness allocation.
@@ -484,9 +485,18 @@ def draft_layer(
         tp_rank,
     )
 
+    padded_attention = pl.create_tensor([T, D], dtype=pl.BF16)
+    for pad_idx in pl.spmd(T * (D // PAD_D_TILE), name_hint="dspark_attention_pad"):
+        pad_token = pad_idx // (D // PAD_D_TILE)
+        pad_col = (pad_idx % (D // PAD_D_TILE)) * PAD_D_TILE
+        output_tile = pl.full([1, PAD_D_TILE], dtype=pl.BF16, value=0.0)
+        if pad_token < active_tokens:
+            output_tile = o_local[pad_token : pad_token + 1, pad_col : pad_col + PAD_D_TILE]
+        padded_attention[pad_token : pad_token + 1, pad_col : pad_col + PAD_D_TILE] = output_tile
+
     attention_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     hc_post_prefill(
-        o_local,
+        padded_attention,
         query_hc,
         post,
         combine,
