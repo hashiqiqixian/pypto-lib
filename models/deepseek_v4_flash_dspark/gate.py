@@ -172,9 +172,8 @@ def gate(
             inactive_x_norm_i8 = pl.cast(inactive_x_norm_f16, target_type=pl.INT8, mode="trunc")
             inactive_x_norm_i8 = pl.set_validshape(inactive_x_norm_i8, zero_rows, D)
             pl.store(inactive_x_norm_i8, [zt, 0], x_norm_i8)
-            inactive_scale = pl.tile.full([T_TILE, ROW_PAD], dtype=pl.FP32, value=0.0)
-            inactive_scale = pl.set_validshape(inactive_scale, zero_rows, 1)
-            pl.store(inactive_scale, [zt, 0], x_norm_scale)
+            for zs in pl.range(zt, zt + zero_rows):
+                pl.write(x_norm_scale, [zs, 0], pl.cast(0.0, pl.FP32))
             inactive_indices = pl.tile.full([T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
             inactive_indices = pl.set_validshape(inactive_indices, zero_rows, TOPK)
             pl.store(inactive_indices, [zt, 0], indices)
