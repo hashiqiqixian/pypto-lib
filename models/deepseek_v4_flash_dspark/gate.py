@@ -164,15 +164,23 @@ def gate(
 
     # Zero inactive fixed-tile inputs/outputs and mask padded expert scores.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
-        for zt in pl.range(T):
-            if zt >= active_tokens:
-                inactive_x_norm_f16 = pl.full([1, D], dtype=pl.FP16, value=0.0)
-                inactive_x_norm_i8 = pl.cast(inactive_x_norm_f16, target_type=pl.INT8, mode="trunc")
-                x_norm_i8[zt : zt + 1, :] = inactive_x_norm_i8
-                pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
-                for zk in pl.range(TOPK):
-                    pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
-                    pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
+        # Keep inactive metadata in one task; tile stores avoid a scalar GM
+        # write for every route, with valid shapes preserving the active prefix.
+        for zt in pl.range(active_tokens, T, T_TILE):
+            zero_rows = pl.min(T_TILE, T - zt)
+            inactive_x_norm_f16 = pl.full([T_TILE, D], dtype=pl.FP16, value=0.0)
+            inactive_x_norm_i8 = pl.cast(inactive_x_norm_f16, target_type=pl.INT8, mode="trunc")
+            inactive_x_norm_i8 = pl.set_validshape(inactive_x_norm_i8, zero_rows, D)
+            pl.store(inactive_x_norm_i8, [zt, 0], x_norm_i8)
+            inactive_scale = pl.full([T_TILE, ROW_PAD], dtype=pl.FP32, value=0.0)
+            inactive_scale = pl.set_validshape(inactive_scale, zero_rows, 1)
+            pl.store(inactive_scale, [zt, 0], x_norm_scale)
+            inactive_indices = pl.full([T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
+            inactive_indices = pl.set_validshape(inactive_indices, zero_rows, TOPK)
+            pl.store(inactive_indices, [zt, 0], indices)
+            inactive_weights = pl.full([T_TILE, TOPK_PAD], dtype=pl.FP32, value=0.0)
+            inactive_weights = pl.set_validshape(inactive_weights, zero_rows, TOPK)
+            pl.store(inactive_weights, [zt, 0], weights)
         if N_EXPERTS < SCORE_PAD:
             biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = \
                 pl.full([T_PAD, SCORE_PAD - N_EXPERTS], dtype=pl.FP32, value=FP32_NEG_INF)
