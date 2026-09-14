@@ -258,9 +258,9 @@ def gate(
             # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
             # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
             # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
+            sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
             for sr_tt in pl.range(GATE_T_TILE):
                 sr_row = biased_scores_buf[t1 + sr_tt : t1 + sr_tt + 1, :]
-                sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
                 sr_sorted = pl.sort32(sr_row, sr_idx_init)
                 sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
                 sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
