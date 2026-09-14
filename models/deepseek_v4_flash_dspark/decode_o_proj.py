@@ -63,6 +63,7 @@ T_DYN = pl.dynamic("T_DYN")
 # tiling and collective-native layouts
 TOKEN_TILE = 16
 COMM_ROW_TILE = 8
+O_A2A_GATHER_T_TILE = 2  # Keep small-batch gathers spread across AIV workers.
 ATTENTION_PUBLISH_WORKERS = 48
 O_RS_REDUCE_WORKERS = 48   # 128 row blocks; 8 left 40 of 48 AIV idle
 O_RS_PUBLISH_WORKERS = 24    # put is fabric-bound; more workers only burn cores
@@ -268,15 +269,21 @@ def o_group_a2a_gather(
     worker = pl.tile.get_block_idx()
     for local_group in pl.range(LOCAL_O_GROUPS):
         group_base_row = local_group * GROUP_T_PAD
-        for group_row in pl.range(worker, group_t, ATTENTION_PUBLISH_WORKERS):
+        for group_row in pl.range(
+            worker * O_A2A_GATHER_T_TILE,
+            group_t,
+            ATTENTION_PUBLISH_WORKERS * O_A2A_GATHER_T_TILE,
+        ):
             copy_row = group_base_row + group_row
-            local_groups_out[
-                copy_row : copy_row + 1,
-                0:O_GROUP_IN,
-            ] = exchange_window[
-                copy_row : copy_row + 1,
-                0:O_GROUP_IN,
-            ]
+            copy_rows = pl.min(O_A2A_GATHER_T_TILE, group_t - group_row)
+            group_tile = pl.load(
+                exchange_window,
+                [copy_row, 0],
+                [O_A2A_GATHER_T_TILE, O_GROUP_IN],
+                valid_shape=[copy_rows, O_GROUP_IN],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            pl.store(group_tile, [copy_row, 0], local_groups_out)
     return local_groups_out
 
 
