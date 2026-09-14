@@ -103,6 +103,7 @@ O_B_N_TILE = 256
 O_B_D_TILE = 512
 ACT_T_TILE = 16
 ACT_N_TILE = 512
+ACT_TASK_T_TILE = 32
 
 # fixture
 FIXTURE_LOCAL_T = max(1, LOCAL_T - 1)
@@ -122,6 +123,8 @@ if D % O_B_D_TILE != 0 or O_B_D_TILE % O_B_N_TILE != 0:
     raise ValueError("O-B output tiles must divide the hidden dimension")
 if D % ACT_N_TILE != 0:
     raise ValueError(f"O-B activation tile {ACT_N_TILE} must divide hidden size {D}")
+if ACT_TASK_T_TILE % ACT_T_TILE != 0:
+    raise ValueError(f"O-B activation task tile {ACT_TASK_T_TILE} must divide into row tiles {ACT_T_TILE}")
 if D % O_RS_D_TILE != 0:
     raise ValueError(f"O-B ReduceScatter tile {O_RS_D_TILE} must divide hidden size {D}")
 if O_RS_REDUCE_WORKERS % TP_SIZE != 0:
@@ -526,12 +529,6 @@ def o_proj_reduce_scatter(
     tp_rank: pl.Scalar[pl.INT32],
 ):
     """Project O-B tiles directly into their ReduceScatter owner windows."""
-    group_t = TP_SIZE * local_t
-    o_a_rows = (group_t + O_A_T_TILE - 1) // O_A_T_TILE
-    o_b_rows = (group_t + O_B_T_TILE - 1) // O_B_T_TILE
-    o_b_group_t = o_b_rows * O_B_T_TILE
-    owner_rows = (local_t + ACT_T_TILE - 1) // ACT_T_TILE
-
     attn_2d = pl.reshape(attention_local_groups, [LOCAL_O_GROUPS * GROUP_T_PAD, O_GROUP_IN])
     wo_a_flat = pl.reshape(wo_a, [LOCAL_O_WIDTH, O_GROUP_IN])
     # Owner-private buffers and group-local A -> quant -> B dependencies.
@@ -542,7 +539,7 @@ def o_proj_reduce_scatter(
     own_b_t = own_b_rows * O_B_T_TILE
     own_quant_blocks = (local_t + QUANT_T_TILE - 1) // QUANT_T_TILE
     own_pad_blocks = (own_b_t + QUANT_T_TILE - 1) // QUANT_T_TILE
-    own_act_rows = (local_t + ACT_T_TILE - 1) // ACT_T_TILE
+    own_act_tasks = (local_t + ACT_TASK_T_TILE - 1) // ACT_TASK_T_TILE
 
     for owner in pl.parallel(TP_SIZE):
         own_base = owner * local_t
@@ -631,31 +628,44 @@ def o_proj_reduce_scatter(
             optimizations=[pl.cross_core_slot(slot_num=2)],
         ):
             dq_worker = pl.tile.get_block_idx()
-            for dq_blk in pl.range(dq_worker, own_act_rows * (D // ACT_N_TILE), O_RS_DEQUANT_WORKERS):
-                dq_rb = dq_blk // (D // ACT_N_TILE)
-                dq_nb = dq_blk - dq_rb * (D // ACT_N_TILE)
-                dq_row = dq_rb * ACT_T_TILE
+            for dq_blk in pl.range(dq_worker, own_act_tasks * (D // ACT_N_TILE), O_RS_DEQUANT_WORKERS):
+                dq_task = dq_blk // (D // ACT_N_TILE)
+                dq_nb = dq_blk - dq_task * (D // ACT_N_TILE)
+                dq_task_row = dq_task * ACT_TASK_T_TILE
                 dq_n0 = dq_nb * ACT_N_TILE
-                dq_rows = pl.min(ACT_T_TILE, local_t - dq_row)
-                dq_acc = pl.full([ACT_T_TILE, ACT_N_TILE], dtype=pl.FP32, value=0.0)
-                for dq_group in pl.pipeline(LOCAL_O_GROUPS, stage=2):
-                    dq_col = dq_group * D + dq_n0
-                    dq_i32 = pl.slice(
-                        own_b_i32,
-                        [ACT_T_TILE, ACT_N_TILE],
-                        [dq_row, dq_col],
-                        valid_shape=[dq_rows, ACT_N_TILE],
-                    )
-                    dq_fp32 = pl.cast(dq_i32, target_type=pl.FP32, mode="none")
-                    dq_srow = pl.slice(own_scale, [1, ACT_T_TILE], [dq_group, dq_row], valid_shape=[1, dq_rows])
-                    dq_scol = pl.reshape(dq_srow, [ACT_T_TILE, 1])
-                    dq_acc = pl.add(dq_acc, pl.row_expand_mul(dq_fp32, dq_scol))
                 dq_wscale = pl.reshape(wo_b_scale[dq_n0 : dq_n0 + ACT_N_TILE], [1, ACT_N_TILE])
-                dq_bf16 = pl.cast(pl.col_expand_mul(dq_acc, dq_wscale), target_type=pl.BF16, mode="rint")
-                dq_stage = owner * LOCAL_T_PAD + dq_row
-                publish_all[dq_stage : dq_stage + ACT_T_TILE, dq_n0 : dq_n0 + ACT_N_TILE] = pl.set_validshape(
-                    dq_bf16, dq_rows, ACT_N_TILE
-                )
+                for dq_inner in pl.range(ACT_TASK_T_TILE // ACT_T_TILE):
+                    dq_row = dq_task_row + dq_inner * ACT_T_TILE
+                    if dq_row < local_t:
+                        dq_rows = pl.min(ACT_T_TILE, local_t - dq_row)
+                        dq_acc = pl.full([ACT_T_TILE, ACT_N_TILE], dtype=pl.FP32, value=0.0)
+                        for dq_group in pl.pipeline(LOCAL_O_GROUPS, stage=2):
+                            dq_col = dq_group * D + dq_n0
+                            dq_i32 = pl.slice(
+                                own_b_i32,
+                                [ACT_T_TILE, ACT_N_TILE],
+                                [dq_row, dq_col],
+                                valid_shape=[dq_rows, ACT_N_TILE],
+                            )
+                            dq_fp32 = pl.cast(dq_i32, target_type=pl.FP32, mode="none")
+                            dq_srow = pl.slice(
+                                own_scale,
+                                [1, ACT_T_TILE],
+                                [dq_group, dq_row],
+                                valid_shape=[1, dq_rows],
+                            )
+                            dq_scol = pl.reshape(dq_srow, [ACT_T_TILE, 1])
+                            dq_acc = pl.add(dq_acc, pl.row_expand_mul(dq_fp32, dq_scol))
+                        dq_bf16 = pl.cast(
+                            pl.col_expand_mul(dq_acc, dq_wscale),
+                            target_type=pl.BF16,
+                            mode="rint",
+                        )
+                        dq_stage = owner * LOCAL_T_PAD + dq_row
+                        publish_all[
+                            dq_stage : dq_stage + ACT_T_TILE,
+                            dq_n0 : dq_n0 + ACT_N_TILE,
+                        ] = pl.set_validshape(dq_bf16, dq_rows, ACT_N_TILE)
 
     with pl.spmd(
         O_RS_PUBLISH_WORKERS,
