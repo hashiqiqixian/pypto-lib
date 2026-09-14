@@ -234,8 +234,8 @@ def dispatch(
         indices_tile = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
         weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
         # This block's rows fill the contiguous lane (loc_e, my_rank, 0..n), so aux
-        # and route ship as one remote_store. The lane tile always stores
-        # MAX_PER_SRC rows; slots >= n are never read back.
+        # and route ship as one remote_store for a nonempty lane. Each store
+        # covers MAX_PER_SRC rows; slots >= n are never read back.
         aux_lane = pl.tile.full([MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
         route_lane = pl.tile.full([MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
         slot_ctr = pl.array.create(1, pl.INT32)
@@ -262,8 +262,9 @@ def dispatch(
                         pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
                         pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [t, k]))
                         pl.tile.write(route_lane, [slot, 0], pl.cast(t * TOPK + k, pl.INT32))
-        pld.tile.remote_store(aux_lane, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
-        pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
+        if slot_ctr[0] > 0:
+            pld.tile.remote_store(aux_lane, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
+            pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
 
         # Payload-arrival notify folded into the push: a block signals its own
         # destination after its own puts, so a peer sees N_LOCAL notifies per
