@@ -54,11 +54,14 @@ def hc_post(
             if t < t_dim:
                 # One cast per token: all HC_MULT outputs share the x row.
                 x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
+                comb_row = pl.load(
+                    comb, [t, 0], [1, HC_MULT * HC_MULT], target_memory=pl.MemorySpace.Vec
+                )
                 for out_h in pl.unroll(HC_MULT):
                     post_w = pl.read(post, [t, out_h])
                     y_row = pl.mul(x_row, post_w)
                     for in_h in pl.pipeline(HC_MULT, stage=4):
-                        comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
+                        comb_w = pl.tile.read(comb_row, [0, in_h * HC_MULT + out_h])
                         res_d = in_h * D
                         # residual is already FP32 (hc stream is FP32 end-to-end): no cast, read straight.
                         res_row = residual_flat[t : t + 1, res_d : res_d + D]
