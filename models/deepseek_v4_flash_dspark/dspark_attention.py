@@ -329,7 +329,8 @@ def dspark_attention(
         sink_col = pl.reshape(attn_sink[merge_head0 : merge_head0 + H_TILE], [H_TILE, 1])
         sink_exp = pl.exp(pl.sub(sink_col, running_max))
         denominator = pl.add(running_sum, sink_exp)
-        attn_normed = pl.row_expand_div(running_out, denominator)
+        inv_denominator = pl.recip(denominator)
+        attn_normed = pl.row_expand_mul(running_out, inv_denominator)
 
         attn_normed_bf16 = pl.cast(attn_normed, target_type=pl.BF16, mode="rint")
         attn_nope = attn_normed_bf16[:, 0:NOPE_DIM]
