@@ -25,8 +25,10 @@ EPS = M.rms_norm_eps
 
 # tiling
 D_TILE = 128
+APPLY_D_TILE = 256
 T_TILE = 8
 assert D % D_TILE == 0, "D must be divisible by D_TILE"
+assert D % APPLY_D_TILE == 0, "D must be divisible by APPLY_D_TILE"
 assert (DECODE_BATCH // TP * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
@@ -77,13 +79,13 @@ def _rms_norm_full_tile(
     x_inv_rms = pl.create_tensor([1, T_TILE], dtype=pl.FP32)
     inverse_result = rms_norm_inverse(norm_sq_sum)
     x_inv_rms[:, :] = inverse_result
-    for apply_db in pl.pipeline(D // D_TILE, stage=2):
-        apply_d0 = apply_db * D_TILE
-        apply_x_input = x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE]
-        norm_w_input = norm_w[apply_d0 : apply_d0 + D_TILE]
-        norm_w_row = pl.reshape(norm_w_input, [1, D_TILE])
+    for apply_db in pl.pipeline(D // APPLY_D_TILE, stage=2):
+        apply_d0 = apply_db * APPLY_D_TILE
+        apply_x_input = x[tg : tg + T_TILE, apply_d0 : apply_d0 + APPLY_D_TILE]
+        norm_w_input = norm_w[apply_d0 : apply_d0 + APPLY_D_TILE]
+        norm_w_row = pl.reshape(norm_w_input, [1, APPLY_D_TILE])
         x_normed_chunk = rms_norm_apply(apply_x_input, norm_w_row, x_inv_rms)
-        x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = x_normed_chunk
+        x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + APPLY_D_TILE] = x_normed_chunk
 
 
 @pl.jit.inline
@@ -119,22 +121,22 @@ def _rms_norm_tail_tile(
         x_sq_sum = pl.add(x_sq_sum, rms_x_row_sum)
     x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
     x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
-    for apply_db in pl.pipeline(D // D_TILE, stage=2):
-        apply_d0 = apply_db * D_TILE
+    for apply_db in pl.pipeline(D // APPLY_D_TILE, stage=2):
+        apply_d0 = apply_db * APPLY_D_TILE
         apply_x_input = pl.load(
             x,
             [tg, apply_d0],
-            [T_TILE, D_TILE],
-            valid_shape=[valid_rows, D_TILE],
+            [T_TILE, APPLY_D_TILE],
+            valid_shape=[valid_rows, APPLY_D_TILE],
             target_memory=pl.MemorySpace.Vec,
         )
         apply_x_chunk = pl.cast(apply_x_input, target_type=pl.FP32)
-        norm_w_input = pl.load(norm_w, [apply_d0], [D_TILE], target_memory=pl.MemorySpace.Vec)
-        norm_w_chunk = pl.cast(pl.reshape(norm_w_input, [1, D_TILE]), pl.FP32)
+        norm_w_input = pl.load(norm_w, [apply_d0], [APPLY_D_TILE], target_memory=pl.MemorySpace.Vec)
+        norm_w_chunk = pl.cast(pl.reshape(norm_w_input, [1, APPLY_D_TILE]), pl.FP32)
         x_scaled = pl.row_expand_mul(apply_x_chunk, x_inv_rms_t)
         x_normed_chunk = pl.col_expand_mul(x_scaled, norm_w_chunk)
         x_normed_bf16 = pl.cast(x_normed_chunk, target_type=pl.BF16, mode="rint")
-        x_normed_valid = pl.set_validshape(x_normed_bf16, valid_rows, D_TILE)
+        x_normed_valid = pl.set_validshape(x_normed_bf16, valid_rows, APPLY_D_TILE)
         pl.store(x_normed_valid, [tg, apply_d0], x_normed)
 
 
