@@ -243,25 +243,22 @@ def dispatch(
         for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
                 eid = pl.tile.read(indices_tile, [t, k])
-                d = eid // N_LOCAL
-                le = eid - d * N_LOCAL
-                if le == loc_e:
-                    if d == dst:
-                        slot = slot_ctr[0]
-                        slot_ctr[0] = slot + 1
-                        # lane (loc_e, my_rank, slot) on peer=dst
-                        row = e_lane_base + slot
-                        pld.tensor.put(
-                            dst=recv_x,
-                            peer=dst,
-                            src=x_norm_i8,
-                            dst_offsets=[row, 0],
-                            src_offsets=[t, 0],
-                            shape=[1, D],
-                        )
-                        pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
-                        pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [t, k]))
-                        pl.tile.write(route_lane, [slot, 0], pl.cast(t * TOPK + k, pl.INT32))
+                if eid == push_block:
+                    slot = slot_ctr[0]
+                    slot_ctr[0] = slot + 1
+                    # lane (loc_e, my_rank, slot) on peer=dst
+                    row = e_lane_base + slot
+                    pld.tensor.put(
+                        dst=recv_x,
+                        peer=dst,
+                        src=x_norm_i8,
+                        dst_offsets=[row, 0],
+                        src_offsets=[t, 0],
+                        shape=[1, D],
+                    )
+                    pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
+                    pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [t, k]))
+                    pl.tile.write(route_lane, [slot, 0], pl.cast(t * TOPK + k, pl.INT32))
         if slot_ctr[0] > 0:
             pld.tile.remote_store(aux_lane, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
             pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
