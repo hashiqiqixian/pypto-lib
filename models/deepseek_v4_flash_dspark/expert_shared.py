@@ -115,11 +115,8 @@ def expert_shared(
         )
         for init_block in pl.spmd(SH_M_TILE // 16, name_hint="sh_h_tile_i8_init"):
             init_row = init_block * 16
-            h_tile_i8[init_row : init_row + 16, :] = pl.cast(
-                pl.full([16, MOE_INTER], dtype=pl.FP16, value=0.0),
-                target_type=pl.INT8,
-                mode="trunc",
-            )
+            h_zero_f16 = pl.full([16, MOE_INTER // 2], dtype=pl.FP16, value=0.0)
+            h_tile_i8[init_row : init_row + 16, :] = pl.reinterpret_view(h_zero_f16, pl.INT8)
         for row_block in pl.spmd(
             SH_VALID_M // SH_ROWS_PER_BLOCK,
             name_hint="sh_gate_up_act_q",
