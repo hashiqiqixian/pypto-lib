@@ -778,12 +778,11 @@ def dspark_drafter(
     padded_head_hidden = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_head(hidden_3, hc_head_fn, hc_head_scale, hc_head_base, padded_head_hidden)
     head_hidden_flat = pl.reshape(head_hidden, [batch * DSPARK_QUERY_WIDTH, D])
-    for token in pl.spmd(T, name_hint="dspark_head_unpad"):
-        if token < active_tokens:
-            head_hidden_flat[token : token + 1, :] = padded_head_hidden[
-                token : token + 1,
-                :,
-            ]
+    for token in pl.spmd(batch * DSPARK_QUERY_WIDTH, name_hint="dspark_head_unpad"):
+        head_hidden_flat[token : token + 1, :] = padded_head_hidden[
+            token : token + 1,
+            :,
+        ]
     return head_hidden
 
 @pl.jit.host
