@@ -69,8 +69,13 @@ QK_PV_READY_EVENT = 2
 SPARSE_BLOCKS = (VISIBLE_ROWS + ATTN_K_TILE - 1) // ATTN_K_TILE
 INDEX_WIDTH = SPARSE_BLOCKS * ATTN_K_TILE
 BIAS_B_TILE = 8                          # 2 request blocks
+KV_COMMIT_D_TILE = 256                   # 512-byte cache bands; two writers
+KV_COMMIT_WORKERS = HEAD_DIM // KV_COMMIT_D_TILE
 H_TILE = 16                              # 4 head blocks
 NEG_INF = -1.0e20
+
+if HEAD_DIM % KV_COMMIT_D_TILE != 0:
+    raise ValueError(f"KV commit tile {KV_COMMIT_D_TILE} must divide head dim {HEAD_DIM}")
 
 
 @pl.jit.inline
@@ -146,18 +151,28 @@ def dspark_attention(
     )
 
     # Commit the block's own KV and build the visible-length mask in one task; the
-    # gather below reads those rows back through swa_indices.
+    # gather below reads those rows back through swa_indices.  Each worker owns a
+    # disjoint 512-byte cache band but retains token order within that band, so
+    # repeated ring slots keep the serial path's last-writer semantics.
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     sparse_bias = pl.create_tensor([B, INDEX_WIDTH], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_kv_commit_valid_bias"):
+    with pl.spmd(KV_COMMIT_WORKERS, name_hint="dspark_kv_commit_valid_bias"):
+        commit_worker = pl.tile.get_block_idx()
+        commit_d0 = commit_worker * KV_COMMIT_D_TILE
         for write_t in pl.range(kv_tokens):
             write_row_i64 = pl.read(kv_slot_mapping, [write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
+                kv_cache_flat[
+                    write_row : write_row + 1,
+                    commit_d0 : commit_d0 + KV_COMMIT_D_TILE,
+                ] = kv[
+                    write_t : write_t + 1,
+                    commit_d0 : commit_d0 + KV_COMMIT_D_TILE,
+                ]
         v_col = pl.cast(pl.arange(0, [1, INDEX_WIDTH], dtype=pl.INT32), target_type=pl.FP32)
-        for v_blk in pl.range(B // BIAS_B_TILE):
+        for v_blk in pl.range(commit_worker, B // BIAS_B_TILE, KV_COMMIT_WORKERS):
             v_b0 = v_blk * BIAS_B_TILE
             v_col_m = pl.col_expand(pl.full([BIAS_B_TILE, INDEX_WIDTH], dtype=pl.FP32, value=0.0), v_col)
             v_lens = pl.cast(pl.reshape(swa_lens[v_b0 : v_b0 + BIAS_B_TILE], [BIAS_B_TILE, 1]), target_type=pl.FP32)
