@@ -282,7 +282,6 @@ def q_proj_qr(
             x_view = pl.reshape(x, [t_dim, D])
             qr_t_matmul = ((tile_rows + QR_M_TILE - 1) // QR_M_TILE) * QR_M_TILE
             qr_full_rows = (tile_rows // QR_DENSE_M_TILE) * QR_DENSE_M_TILE
-            qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
 
             # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024): QR_N_TILE N-groups expanded
             # QR_OK-fold into cube blocks that atomic-add their K partials into a zero-seeded
@@ -333,6 +332,7 @@ def q_proj_qr(
                 tg = tg_idx * T_TILE
                 valid_rows = pl.min(T_TILE, tile_rows - tg)
                 out_tg = tile_base + tg
+                gamma_cq_fp32 = pl.cast(gamma_cq, target_type=pl.FP32)
                 qr_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
                 qr_amax_g = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
                 for qr_rms_col0 in pl.pipeline(0, Q_LORA, Q_LORA_TILE, stage=2):
@@ -340,7 +340,7 @@ def q_proj_qr(
                     qr_rms_sq = pl.mul(qr_rms_chunk, qr_rms_chunk)
                     qr_rms_row_sum = pl.reshape(pl.row_sum(qr_rms_sq), [1, T_TILE])
                     qr_sq_sum = pl.add(qr_sq_sum, qr_rms_row_sum)
-                    gamma_rms_cast = pl.cast(gamma_cq[qr_rms_col0 : qr_rms_col0 + Q_LORA_TILE], target_type=pl.FP32)
+                    gamma_rms_cast = pl.slice(gamma_cq_fp32, [Q_LORA_TILE], [qr_rms_col0])
                     gamma_rms_chunk = pl.reshape(gamma_rms_cast, [1, Q_LORA_TILE])
                     qr_g = pl.col_expand_mul(qr_rms_chunk, gamma_rms_chunk)
                     qr_g_abs = pl.abs(qr_g)
@@ -370,7 +370,7 @@ def q_proj_qr(
 
                 for qa in pl.pipeline(0, Q_LORA, QUANT_TILE, stage=2):
                     qr_chunk = qr_fp32[tg : tg + T_TILE, qa : qa + QUANT_TILE]
-                    gamma_q_cast = pl.cast(gamma_cq[qa : qa + QUANT_TILE], target_type=pl.FP32)
+                    gamma_q_cast = pl.slice(gamma_cq_fp32, [QUANT_TILE], [qa])
                     gamma_q_chunk = pl.reshape(gamma_q_cast, [1, QUANT_TILE])
                     qr_q_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk, qr_inv_rms_t), gamma_q_chunk)
                     qr_q_scaled = pl.row_expand_mul(qr_q_normed, qr_scale_quant_t)
