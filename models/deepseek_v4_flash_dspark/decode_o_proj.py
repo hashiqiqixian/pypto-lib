@@ -65,10 +65,11 @@ TOKEN_TILE = 16
 COMM_ROW_TILE = 8
 O_A2A_GATHER_T_TILE = 2  # Keep small-batch gathers spread across AIV workers.
 ATTENTION_PUBLISH_WORKERS = 48
-O_RS_REDUCE_WORKERS = 48   # 128 row blocks; 8 left 40 of 48 AIV idle
+O_RS_REDUCE_WORKERS = 48   # 64 two-row blocks at TP4 full capacity
 O_RS_PUBLISH_WORKERS = 24    # put is fabric-bound; more workers only burn cores
 O_RS_DEQUANT_WORKERS = 12    # per owner; 4 owners -> one AIV wave
 O_RS_PUT_T_TILE = 8          # 4 owners x 16 row blocks -> 64 puts over 24 workers
+O_RS_REDUCE_T_TILE = 2
 O_RS_D_TILE = 4096
 LOCAL_T_PAD = (LOCAL_T + TOKEN_TILE - 1) // TOKEN_TILE * TOKEN_TILE
 T_PAD = LOCAL_T_PAD
@@ -479,19 +480,35 @@ def tp_o_rs_reduce(
 ):
     """Sum the received O-projection partials for the local tokens."""
     worker = pl.tile.get_block_idx()
-    for block in pl.range(worker, local_t * (D // O_RS_D_TILE), O_RS_REDUCE_WORKERS):
-        local_row = block // (D // O_RS_D_TILE)
-        d_block = block - local_row * (D // O_RS_D_TILE)
+    row_tiles = (local_t + O_RS_REDUCE_T_TILE - 1) // O_RS_REDUCE_T_TILE
+    for block in pl.range(worker, row_tiles * (D // O_RS_D_TILE), O_RS_REDUCE_WORKERS):
+        row_tile = block // (D // O_RS_D_TILE)
+        d_block = block - row_tile * (D // O_RS_D_TILE)
+        local_row = row_tile * O_RS_REDUCE_T_TILE
+        valid_rows = pl.min(O_RS_REDUCE_T_TILE, local_t - local_row)
         d0 = d_block * O_RS_D_TILE
-        own_partial = pl.load(reduce_window, [local_row, d0], [1, O_RS_D_TILE])
+        own_partial = pl.load(
+            reduce_window,
+            [local_row, d0],
+            [O_RS_REDUCE_T_TILE, O_RS_D_TILE],
+            valid_shape=[valid_rows, O_RS_D_TILE],
+            target_memory=pl.MemorySpace.Vec,
+        )
         reduce_acc = pl.cast(own_partial, target_type=pl.FP32, mode="none")
         for source_tp in pl.range(1, TP_SIZE):
             source_row = source_tp * LOCAL_T_PAD + local_row
-            source_partial = pl.load(reduce_window, [source_row, d0], [1, O_RS_D_TILE])
+            source_partial = pl.load(
+                reduce_window,
+                [source_row, d0],
+                [O_RS_REDUCE_T_TILE, O_RS_D_TILE],
+                valid_shape=[valid_rows, O_RS_D_TILE],
+                target_memory=pl.MemorySpace.Vec,
+            )
             source_fp32 = pl.cast(source_partial, target_type=pl.FP32, mode="none")
             reduce_acc = pl.add(reduce_acc, source_fp32)
         reduced = pl.cast(reduce_acc, target_type=pl.BF16, mode="rint")
-        pl.store(reduced, [local_row, d0], local_out)
+        reduced_valid = pl.set_validshape(reduced, valid_rows, O_RS_D_TILE)
+        pl.store(reduced_valid, [local_row, d0], local_out)
     return local_out
 
 
