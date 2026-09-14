@@ -49,6 +49,10 @@ MAX_SEQ_LEN = M.max_position_embeddings
 ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 EPS = M.rms_norm_eps
 
+# tiling
+SCATTER_D_TILE = 256
+assert HEAD_DIM % SCATTER_D_TILE == 0
+
 
 @pl.jit.inline
 def dspark_context_kv(
@@ -76,12 +80,16 @@ def dspark_context_kv(
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_context_kv_scatter"):
+    # Each block owns one cache-column stripe and retains token write order.
+    for column_block in pl.spmd(HEAD_DIM // SCATTER_D_TILE, name_hint="dspark_context_kv_scatter"):
+        d0 = column_block * SCATTER_D_TILE
         for write_t in pl.range(t_dim):
             write_row_i64 = pl.read(slot_mapping, [layer_index, write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
+                kv_cache_flat[write_row : write_row + 1, d0 : d0 + SCATTER_D_TILE] = kv[
+                    write_t : write_t + 1, d0 : d0 + SCATTER_D_TILE
+                ]
 
     return kv_cache
 
