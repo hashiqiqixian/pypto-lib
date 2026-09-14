@@ -199,13 +199,14 @@ def dspark_attention(
         pl.system.set_ffts(ffts_workspace)
         for qk_t in pl.range(qk_core, T, NUM_QK_CORES):
             qk_b = qk_t // S
+            qk_visible_len_aic = pl.read(swa_lens, [qk_b])
             qk_q = pl.load(
                 q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
             )
             for qk_tick in pl.range(SPARSE_BLOCKS + QK_PRE_LAUNCH):
                 if qk_tick < SPARSE_BLOCKS:
                     qk_sb = qk_tick
-                    if qk_sb * ATTN_K_TILE < pl.read(swa_lens, [qk_b]):
+                    if qk_sb * ATTN_K_TILE < qk_visible_len_aic:
                         qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
                         qk_kv_row = qk_b * INDEX_WIDTH + qk_sb * ATTN_K_TILE
                         qk_transfer_row = qk_slot * H
@@ -221,7 +222,7 @@ def dspark_attention(
                         )
                 if qk_tick >= QK_PRE_LAUNCH:
                     pv_sb = qk_tick - QK_PRE_LAUNCH
-                    if pv_sb * ATTN_K_TILE < pl.read(swa_lens, [qk_b]):
+                    if pv_sb * ATTN_K_TILE < qk_visible_len_aic:
                         pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
                         pv_kv_row = qk_b * INDEX_WIDTH + pv_sb * ATTN_K_TILE
                         pv_transfer_row = pv_slot * H
@@ -244,6 +245,7 @@ def dspark_attention(
             for qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                 pl.system.set_ffts(ffts_workspace)
                 qk_lane_head = qk_aiv * (H // 2)
+                qk_visible_len_aiv = pl.read(swa_lens, [qk_b])
                 qk_reduce_tmp = pl.create_tile([H // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                 running_m = pl.load(attn_sink_col, [qk_lane_head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
                 running_l = pl.tile.muls(running_m, 0.0)
@@ -255,7 +257,7 @@ def dspark_attention(
                 ):
                     if qk_tick < SPARSE_BLOCKS:
                         qk_sb = qk_tick
-                        if qk_sb * ATTN_K_TILE < pl.read(swa_lens, [qk_b]):
+                        if qk_sb * ATTN_K_TILE < qk_visible_len_aiv:
                             qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
                             qk_transfer_row = qk_slot * H
                             qk_s0 = qk_sb * ATTN_K_TILE
@@ -282,7 +284,7 @@ def dspark_attention(
                             )
                     if qk_tick >= QK_PRE_LAUNCH:
                         pv_sb = qk_tick - QK_PRE_LAUNCH
-                        if pv_sb * ATTN_K_TILE < pl.read(swa_lens, [qk_b]):
+                        if pv_sb * ATTN_K_TILE < qk_visible_len_aiv:
                             pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
                             pv_transfer_row = pv_slot * H
                             pl.system.sync_wait(QK_PV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
