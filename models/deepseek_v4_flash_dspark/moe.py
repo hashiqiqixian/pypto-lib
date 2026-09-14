@@ -374,15 +374,18 @@ def combine(
         active_tokens = pl.cast(T, pl.INDEX)
     with pl.spmd(T // COMBINE_TOKEN_TILE, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
         t0 = pl.tile.get_block_idx() * COMBINE_TOKEN_TILE
-        for t in pl.range(t0, t0 + COMBINE_TOKEN_TILE):
-            if t < active_tokens:
-                acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
-                for k in pl.range(TOPK):
-                    r = t * TOPK + k
-                    acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
-                ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            else:
-                ffn_out[t:t + 1, :] = sh[t:t + 1, :]
+        if t0 >= active_tokens:
+            ffn_out[t0:t0 + COMBINE_TOKEN_TILE, :] = sh[t0:t0 + COMBINE_TOKEN_TILE, :]
+        else:
+            for t in pl.range(t0, t0 + COMBINE_TOKEN_TILE):
+                if t < active_tokens:
+                    acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
+                    for k in pl.range(TOPK):
+                        r = t * TOPK + k
+                        acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
+                    ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                else:
+                    ffn_out[t:t + 1, :] = sh[t:t + 1, :]
     return _reduce_tid
 
 
