@@ -113,13 +113,14 @@ def expert_shared(
         h_tile_scale_dq = pl.create_tensor(
             [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
         )
-        for init_block in pl.spmd(SH_M_TILE // 16, name_hint="sh_h_tile_i8_init"):
-            init_row = init_block * 16
-            h_tile_i8[init_row : init_row + 16, :] = pl.cast(
-                pl.full([16, MOE_INTER], dtype=pl.FP16, value=0.0),
-                target_type=pl.INT8,
-                mode="trunc",
-            )
+        if SH_VALID_M < SH_M_TILE:
+            for init_block in pl.spmd(SH_M_TILE // 16, name_hint="sh_h_tile_i8_init"):
+                init_row = init_block * 16
+                h_tile_i8[init_row : init_row + 16, :] = pl.cast(
+                    pl.full([16, MOE_INTER], dtype=pl.FP16, value=0.0),
+                    target_type=pl.INT8,
+                    mode="trunc",
+                )
         for row_block in pl.spmd(
             SH_VALID_M // SH_ROWS_PER_BLOCK,
             name_hint="sh_gate_up_act_q",
