@@ -206,16 +206,22 @@ def build_dspark_metadata(
 ):
     batch = pl.tensor.dim(anchor_positions, 0)
     active_tokens = batch * DSPARK_QUERY_WIDTH
+    query_positions_row = pl.reshape(query_positions, [1, DSPARK_QUERY_TOKENS])
+    swa_indices_flat = pl.reshape(
+        swa_indices, [DSPARK_DRAFT_LAYERS * DSPARK_MAX_BATCH, DSPARK_SWA_INDEX_WIDTH]
+    )
     for metadata_core in pl.spmd(1, name_hint="dspark_query_metadata"):
+        position_tile = pl.tile.full([1, DSPARK_QUERY_TOKENS], dtype=pl.INT32, value=0)
         for token in pl.range(metadata_core, DSPARK_QUERY_TOKENS):
-            pl.write(query_positions, [token], pl.cast(0, pl.INT32))
             if token < active_tokens:
                 request = token // DSPARK_QUERY_WIDTH
                 query_offset = token % DSPARK_QUERY_WIDTH
                 anchor_position = pl.read(anchor_positions, [request])
                 query_position = anchor_position + 1 + query_offset
-                pl.write(query_positions, [token], pl.cast(query_position, pl.INT32))
+                pl.write(position_tile, [0, token], pl.cast(query_position, pl.INT32))
+        pl.store(position_tile, [0, 0], query_positions_row)
 
+        lens_tile = pl.tile.full([DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH], dtype=pl.INT32, value=0)
         for lens_request in pl.range(metadata_core, DSPARK_MAX_BATCH):
             lens_visible_len = pl.cast(0, pl.INT32)
             if lens_request < batch:
@@ -227,7 +233,8 @@ def build_dspark_metadata(
                     pl.INT32,
                 )
             for lens_layer in pl.range(DSPARK_DRAFT_LAYERS):
-                pl.write(swa_lens, [lens_layer, lens_request], lens_visible_len)
+                pl.write(lens_tile, [lens_layer, lens_request], lens_visible_len)
+        pl.store(lens_tile, [0, 0], swa_lens)
 
     for request in pl.spmd(DSPARK_MAX_BATCH, name_hint="dspark_visible_metadata"):
         start_position = pl.cast(0, pl.INT32)
@@ -241,8 +248,8 @@ def build_dspark_metadata(
                 pl.INT32,
             )
         for layer in pl.range(DSPARK_DRAFT_LAYERS):
+            index_tile = pl.tile.full([1, DSPARK_SWA_INDEX_WIDTH], dtype=pl.INT32, value=-1)
             for visible_offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
-                visible_slot = pl.cast(-1, pl.INT32)
                 if visible_offset < visible_len:
                     visible_position = start_position + visible_offset
                     logical_block = visible_position // BLOCK_SIZE
@@ -254,7 +261,8 @@ def build_dspark_metadata(
                         physical_block * BLOCK_SIZE + block_offset,
                         pl.INT32,
                     )
-                pl.write(swa_indices, [layer, request, visible_offset], visible_slot)
+                    pl.write(index_tile, [0, visible_offset], visible_slot)
+            pl.store(index_tile, [layer * DSPARK_MAX_BATCH + request, 0], swa_indices_flat)
     return (
         swa_indices,
         swa_lens,
