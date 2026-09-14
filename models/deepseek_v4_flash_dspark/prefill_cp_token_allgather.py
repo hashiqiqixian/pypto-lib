@@ -99,18 +99,18 @@ def prefill_cp_token_allgather_step(
 
     # Copy peer payloads and publish local readback completion.
     group_rows = TP_SIZE * local_rows
-    full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="prefill_cp_token_allgather_readback",
         deps=[_push_tid, _payload_wait_tid],
     ) as _readback_tid:
-        for tile_row in pl.range(0, full_rows, READBACK_ROW_TILE):
-            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:D]
-            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = window_tile
-        for tail_row in pl.range(full_rows, group_rows):
-            window_row = gather_window[tail_row : tail_row + 1, 0:D]
-            group_out[tail_row : tail_row + 1, 0:D] = window_row
+        for tile_row in pl.range(0, group_rows, READBACK_ROW_TILE):
+            valid_rows = pl.min(READBACK_ROW_TILE, group_rows - tile_row)
+            window_tile = pl.load(
+                gather_window, [tile_row, 0], [READBACK_ROW_TILE, D],
+                valid_shape=[valid_rows, D], target_memory=pl.MemorySpace.Vec,
+            )
+            pl.store(window_tile, [tile_row, 0], group_out)
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:
                 pld.system.notify(
