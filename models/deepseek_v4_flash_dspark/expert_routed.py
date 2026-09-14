@@ -101,17 +101,17 @@ def expert_routed_tile(
         with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
             block = pl.tile.get_block_idx()
             inter_base = block * (ACT_GATE_INNER * ACT_INTER_TILE)
+            x_scale = pl.reshape(
+                recv_scale_dq[
+                    local_e : local_e + 1,
+                    tile_row : tile_row + RECV_TILE,
+                ],
+                [RECV_TILE, 1],
+            )
             for inner in pl.pipeline(ACT_GATE_INNER, stage=2):
                 inter0 = inter_base + inner * ACT_INTER_TILE
                 gate_i32 = gate_tile_i32[:, inter0 : inter0 + ACT_INTER_TILE]
                 up_i32 = up_tile_i32[:, inter0 : inter0 + ACT_INTER_TILE]
-                x_scale = pl.reshape(
-                    recv_scale_dq[
-                        local_e : local_e + 1,
-                        tile_row : tile_row + RECV_TILE,
-                    ],
-                    [RECV_TILE, 1],
-                )
                 gate_fp32 = pl.col_expand_mul(
                     pl.row_expand_mul(
                         pl.cast(gate_i32, target_type=pl.FP32, mode="none"),
