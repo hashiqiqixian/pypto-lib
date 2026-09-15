@@ -33,6 +33,7 @@ INTER_K = 512
 MM_INTER_TILE = 256
 MM_GATE_INNER = 4
 ACT_INTER_TILE = 64
+ACT_GATE_INNER = 4
 D_OUT_TILE = 256
 QUANT_TILE = 512
 QUANT_ROW_TILE = 16
@@ -97,21 +98,20 @@ def expert_routed_tile(
                 up_tile_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
 
         h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
-        with pl.spmd(RECV_TILE // QUANT_ROW_TILE, name_hint="exp_gate_up_quant") as quant_tid:
-            quant_block = pl.tile.get_block_idx()
-            quant_row = quant_block * QUANT_ROW_TILE
-            quant_valid_rows = pl.min(QUANT_ROW_TILE, pl.max(valid_rows - quant_row, 0))
-            x_scale = pl.reshape(
-                recv_scale_dq[
-                    local_e : local_e + 1,
-                    tile_row + quant_row : tile_row + quant_row + QUANT_ROW_TILE,
-                ],
-                [QUANT_ROW_TILE, 1],
-            )
-            row_amax = pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for inter0 in pl.pipeline(0, MOE_INTER, ACT_INTER_TILE, stage=2):
-                gate_i32 = gate_tile_i32[quant_row : quant_row + QUANT_ROW_TILE, inter0 : inter0 + ACT_INTER_TILE]
-                up_i32 = up_tile_i32[quant_row : quant_row + QUANT_ROW_TILE, inter0 : inter0 + ACT_INTER_TILE]
+        with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
+            block = pl.tile.get_block_idx()
+            inter_base = block * (ACT_GATE_INNER * ACT_INTER_TILE)
+            for inner in pl.pipeline(ACT_GATE_INNER, stage=2):
+                inter0 = inter_base + inner * ACT_INTER_TILE
+                gate_i32 = gate_tile_i32[:, inter0 : inter0 + ACT_INTER_TILE]
+                up_i32 = up_tile_i32[:, inter0 : inter0 + ACT_INTER_TILE]
+                x_scale = pl.reshape(
+                    recv_scale_dq[
+                        local_e : local_e + 1,
+                        tile_row : tile_row + RECV_TILE,
+                    ],
+                    [RECV_TILE, 1],
+                )
                 gate_fp32 = pl.col_expand_mul(
                     pl.row_expand_mul(
                         pl.cast(gate_i32, target_type=pl.FP32, mode="none"),
@@ -137,10 +137,16 @@ def expert_routed_tile(
                     up_fp32 = pl.maximum(pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
                 sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_fp32)), 1.0))
                 activated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
-                activated = pl.set_validshape(activated, quant_valid_rows, ACT_INTER_TILE)
-                activated = pl.fillpad(activated, pad_value=pl.PadValue.zero)
-                h_tile_fp32[quant_row : quant_row + QUANT_ROW_TILE, inter0 : inter0 + ACT_INTER_TILE] = activated
-                h_abs = pl.maximum(activated, pl.neg(activated))
+                activated = pl.set_validshape(activated, valid_rows, ACT_INTER_TILE)
+                h_tile_fp32[:, inter0 : inter0 + ACT_INTER_TILE] = pl.fillpad(activated, pad_value=pl.PadValue.zero)
+
+        with pl.spmd(RECV_TILE // QUANT_ROW_TILE, name_hint="exp_h_q") as quant_tid:
+            quant_block = pl.tile.get_block_idx()
+            quant_row = quant_block * QUANT_ROW_TILE
+            row_amax = pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
+                h_amax_chunk = h_tile_fp32[quant_row : quant_row + QUANT_ROW_TILE, k0 : k0 + QUANT_TILE]
+                h_abs = pl.maximum(h_amax_chunk, pl.neg(h_amax_chunk))
                 row_amax = pl.maximum(row_amax, pl.reshape(pl.row_max(h_abs), [1, QUANT_ROW_TILE]))
             quant_scale = pl.div(pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
             dequant_scale_col = pl.reshape(pl.recip(quant_scale), [QUANT_ROW_TILE, 1])
