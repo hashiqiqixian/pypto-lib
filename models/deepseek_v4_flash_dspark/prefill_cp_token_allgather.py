@@ -48,7 +48,7 @@ PREFILL_LOCAL_CAP = PREFILL_GROUP_CAP // TP_SIZE
 
 # tiling
 COMM_ROW_TILE = 8
-READBACK_ROW_TILE = 8
+READBACK_ROW_TILE = 16
 
 # fixture
 FIXTURE_ROUNDS = 2
@@ -105,7 +105,7 @@ def prefill_cp_token_allgather_step(
         name_hint="prefill_cp_token_allgather_readback",
         deps=[_push_tid, _payload_wait_tid],
     ) as _readback_tid:
-        for tile_row in pl.pipeline(0, full_rows, READBACK_ROW_TILE, stage=2):
+        for tile_row in pl.range(0, full_rows, READBACK_ROW_TILE):
             window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:D]
             group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = window_tile
         for tail_row in pl.range(full_rows, group_rows):
