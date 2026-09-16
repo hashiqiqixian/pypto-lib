@@ -535,7 +535,7 @@ def o_proj_reduce_scatter(
             attention_row = local_group * GROUP_T_PAD + own_base
             o_a_col = local_group * O_LORA
 
-            with pl.spmd(own_a_rows * (O_LORA // O_A_N_TILE), name_hint="tp_o_a") as pa_tid:
+            with pl.spmd(own_a_rows * (O_LORA // O_A_N_TILE), name_hint="tp_o_a", allow_early_resolve=True) as pa_tid:
                 pa_unit = pl.tile.get_block_idx()
                 pa_rb = pa_unit // (O_LORA // O_A_N_TILE)
                 pa_nb = pa_unit - pa_rb * (O_LORA // O_A_N_TILE)
@@ -554,7 +554,7 @@ def o_proj_reduce_scatter(
                 pa_valid = pl.set_validshape(pa_acc, pa_rows, O_A_N_TILE)
                 own_a_fp32[pa_t0 : pa_t0 + O_A_T_TILE, pa_wrow : pa_wrow + O_A_N_TILE] = pa_valid
 
-            with pl.spmd(O_A_QUANT_WORKERS, name_hint="tp_o_a_quant", deps=[pa_tid]) as q_tid:
+            with pl.spmd(O_A_QUANT_WORKERS, name_hint="tp_o_a_quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
                 qz_worker = pl.tile.get_block_idx()
                 for qz_blk in pl.range(qz_worker, own_quant_blocks, O_A_QUANT_WORKERS):
                     qz_t = qz_blk * QUANT_T_TILE
@@ -586,7 +586,7 @@ def o_proj_reduce_scatter(
                         qz_zero_i8, qz_prows, O_LORA
                     )
 
-            with pl.spmd(own_b_rows * (D // O_B_D_TILE), name_hint="tp_o_b", deps=[q_tid]):
+            with pl.spmd(own_b_rows * (D // O_B_D_TILE), name_hint="tp_o_b", deps=[q_tid], allow_early_resolve=True):
                 pb_unit = pl.tile.get_block_idx()
                 pb_tb = pb_unit // (D // O_B_D_TILE)
                 pb_db = pb_unit - pb_tb * (D // O_B_D_TILE)
@@ -607,6 +607,7 @@ def o_proj_reduce_scatter(
         with pl.spmd(
             O_RS_DEQUANT_WORKERS,
             name_hint="tp_o_b_dequant",
+            allow_early_resolve=True,
             optimizations=[pl.cross_core_slot(slot_num=2)],
         ):
             dq_worker = pl.tile.get_block_idx()
