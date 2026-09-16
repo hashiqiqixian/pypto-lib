@@ -17,6 +17,8 @@ from rmsnorm import rms_norm_apply, rms_norm_inverse
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+T_LINEAR_DYN = pl.dynamic("HC_PRE_T_LINEAR_DYN")
+T_PARTIAL_DYN = pl.dynamic("HC_PRE_T_PARTIAL_DYN")
 
 # model config
 D = M.hidden_size
@@ -51,17 +53,15 @@ def hc_pre_gates(
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    pre_val_store: pl.Tensor[[T_DYN, HC_PAD], pl.FP32],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
     row_recip: pl.Scalar[pl.BOOL],
 ):
-    """Compute pre/post gates and Sinkhorn combinations with padded linear intermediates."""
+    """Compute post/comb and return the shared linear partials and inverse RMS for pre-mixing."""
     t_dim = pl.tensor.dim(x, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
-    scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
     hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
@@ -106,30 +106,19 @@ def hc_pre_gates(
         partial_row0 = linear_split * t_linear + t0
         mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
-    # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
-    # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
-    # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
-    # lives in comb_sinkhorn.
+    # Post and comb share one consumer; pre is computed in the actual mixing consumer.
     # Only the final partial token tile uses these fixed-size staging buffers.
     post_tail_store = pl.create_tensor([T_TILE, HC_PAD], dtype=pl.FP32)
-    for ob in pl.spmd(token_tiles, name_hint="split_pre_post", allow_early_resolve=True):
-        t0 = ob * T_TILE
-        valid_rows = pl.min(T_TILE, t_dim - t0)
+    comb_tail_store = pl.create_tensor([COMB_T_TILE, HC_PAD * HC_MULT], dtype=pl.FP32)
+    for ob in pl.spmd(token_tiles, name_hint="comb_sinkhorn", allow_early_resolve=True):
+        t0 = ob * COMB_T_TILE
+        valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
         # Each consumer reduces its partials in ascending K order.
-        pre_mixes = mixes_partials[t0:t0 + T_TILE, 0:HC_PAD]
         post_mixes = mixes_partials[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD]
         for linear_split in pl.range(1, LINEAR_OK):
             partial_t0 = linear_split * t_linear + t0
-            pre_mixes = pl.add(pre_mixes, mixes_partials[partial_t0:partial_t0 + T_TILE, 0:HC_PAD])
             post_mixes = pl.add(post_mixes, mixes_partials[partial_t0:partial_t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD])
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
-
-        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
-        pre_scaled = pl.mul(pl.row_expand_mul(pre_mixes, inv_col), scale0)
-        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
-        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
-        pre_val = pl.add(pre_sig, HC_EPS)
-        pre_val_store[t0:t0 + T_TILE, 0:HC_PAD] = pre_val
 
         post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
         post_scaled = pl.mul(pl.row_expand_mul(post_mixes, inv_col), scale1)
@@ -143,12 +132,7 @@ def hc_pre_gates(
             post_tile = pl.load(post_tail_store, [0, 0], [T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
             pl.store(post_tile, [t0, 0], post)
 
-    # comb_sinkhorn: reduce comb partials at cols 8/12/16/20, softmax, then a
-    # column-first 20-iteration Sinkhorn -> comb.
-    comb_tail_store = pl.create_tensor([COMB_T_TILE, HC_PAD * HC_MULT], dtype=pl.FP32)
-    for ob in pl.spmd(token_tiles, name_hint="comb_sinkhorn", allow_early_resolve=True):
-        t0 = ob * COMB_T_TILE
-        valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
+        # Reduce comb partials at cols 8/12/16/20, softmax, then column-first Sinkhorn.
         inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], valid_shape=[valid_rows, 1], target_memory=pl.MemorySpace.Vec)
         comb_off = HC_MULT * 2
         mix_g0 = pl.load(mixes_partials, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
@@ -277,7 +261,30 @@ def hc_pre_gates(
             pl.store(row2_tail, [t0, 2 * HC_MULT], comb)
             pl.store(row3_tail, [t0, 3 * HC_MULT], comb)
 
-    return pre_val_store
+    return mixes_partials, inv_rms
+
+
+@pl.jit.inline
+def _hc_pre_mix_gate(
+    mixes_partials: pl.Tensor[[T_PARTIAL_DYN, MIX_PAD], pl.FP32],
+    inv_rms: pl.Tensor[[T_LINEAR_DYN, 1], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    scale0: pl.Scalar[pl.FP32],
+    t0: pl.Scalar[pl.INDEX],
+):
+    """Compute one pre-gate tile inside either existing mixing consumer."""
+    t_linear = pl.tensor.dim(inv_rms, 0)
+    pre_mixes = mixes_partials[t0:t0 + T_TILE, 0:HC_PAD]
+    for linear_split in pl.range(1, LINEAR_OK):
+        partial_t0 = linear_split * t_linear + t0
+        pre_mixes = pl.add(pre_mixes, mixes_partials[partial_t0:partial_t0 + T_TILE, 0:HC_PAD])
+    inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
+    pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
+    pre_scaled = pl.mul(pl.row_expand_mul(pre_mixes, inv_col), scale0)
+    pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+    pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
+    pre_val = pl.add(pre_sig, HC_EPS)
+    return pre_val
 
 
 @pl.jit.inline
@@ -293,9 +300,8 @@ def hc_pre(
     """Compute HC gates and BF16 pre-mixed activations."""
     t_dim = pl.tensor.dim(x, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
-    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
-    pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, False)
+    mixes_partials, inv_rms = hc_pre_gates(x, hc_fn, hc_scale, hc_base, post, comb, False)
+    scale0 = pl.read(hc_scale, [0])
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
 
     # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D/D_SPMD blocks per token tile.
@@ -304,7 +310,8 @@ def hc_pre(
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
         valid_rows = pl.min(T_TILE, t_dim - t0)
-        pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
+        pre_tile = _hc_pre_mix_gate(mixes_partials, inv_rms, hc_base, scale0, t0)
+        pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
         pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
         pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
         pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
@@ -346,16 +353,15 @@ def hc_pre_norm(
 ):
     """Normalize pre-mixed activations for complete eight-token decode tiles."""
     t_dim = pl.tensor.dim(x, 0)
-    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
-    pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, row_recip)
+    mixes_partials, inv_rms = hc_pre_gates(x, hc_fn, hc_scale, hc_base, post, comb, row_recip)
+    scale0 = pl.read(hc_scale, [0])
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
 
     # The RMS statistic includes the intermediate BF16 rounding.
     with pl.spmd(t_dim // T_TILE, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
         t0 = pl.tile.get_block_idx() * T_TILE
-        pre_tile = pre_val_store[t0:t0 + T_TILE, 0:HC_PAD]
+        pre_tile = _hc_pre_mix_gate(mixes_partials, inv_rms, hc_base, scale0, t0)
         pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
         pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
         pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
