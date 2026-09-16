@@ -554,7 +554,7 @@ def o_proj_reduce_scatter(
                 pa_valid = pl.set_validshape(pa_acc, pa_rows, O_A_N_TILE)
                 own_a_fp32[pa_t0 : pa_t0 + O_A_T_TILE, pa_wrow : pa_wrow + O_A_N_TILE] = pa_valid
 
-            with pl.spmd(O_A_QUANT_WORKERS, name_hint="tp_o_a_quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
+            with pl.spmd(O_A_QUANT_WORKERS, name_hint="tp_o_a_quant", deps=[pa_tid]) as q_tid:
                 qz_worker = pl.tile.get_block_idx()
                 for qz_blk in pl.range(qz_worker, own_quant_blocks, O_A_QUANT_WORKERS):
                     qz_t = qz_blk * QUANT_T_TILE
