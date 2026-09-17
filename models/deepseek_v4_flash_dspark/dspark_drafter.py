@@ -90,6 +90,7 @@ del sys.argv[_caller_argv_length:]
 
 T_MAIN_DYN = pl.dynamic("DSPARK_BACKBONE_T_MAIN_DYN")
 CP_CONTEXT_T_DYN = pl.dynamic("DSPARK_BACKBONE_CP_CONTEXT_T_DYN")
+CP_QUERY_T_DYN = pl.dynamic("DSPARK_BACKBONE_CP_QUERY_T_DYN")
 B_DYN = pl.dynamic("DSPARK_BACKBONE_B_DYN")
 PREPARE_T_MAIN_DYN = pl.dynamic("DSPARK_PREPARE_T_MAIN_DYN")
 PREPARE_B_DYN = pl.dynamic("DSPARK_PREPARE_B_DYN")
@@ -263,6 +264,49 @@ def build_dspark_metadata(
     )
 
 
+@pl.jit.inline
+def compact_dspark_query_metadata(
+    query_group_positions: pl.Tensor[[DSPARK_CP_SIZE * T_QUERY], pl.INT32],
+    query_group_freqs_cos: pl.Tensor[[DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16],
+    query_group_freqs_sin: pl.Tensor[[DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16],
+    query_group_slot_mapping: pl.Tensor[[DSPARK_DRAFT_LAYERS, DSPARK_CP_SIZE * T_QUERY], pl.INT64],
+    compact_positions: pl.Tensor[[CP_QUERY_T_DYN], pl.INT32],
+    compact_freqs_cos: pl.Tensor[[CP_QUERY_T_DYN, ROPE_DIM], pl.BF16],
+    compact_freqs_sin: pl.Tensor[[CP_QUERY_T_DYN, ROPE_DIM], pl.BF16],
+    compact_slot_mapping: pl.Tensor[[DSPARK_DRAFT_LAYERS, CP_QUERY_T_DYN], pl.INT64],
+):
+    """Pack each rank's active query prefix for all three drafter layers."""
+    active_rows = pl.tensor.dim(compact_positions, 0) // DSPARK_CP_SIZE
+    full_rows = (active_rows // COMM_ROW_TILE) * COMM_ROW_TILE
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_compact_query_metadata"):
+        for rank in pl.range(DSPARK_CP_SIZE):
+            source_base = rank * T_QUERY
+            target_base = rank * active_rows
+            for row in pl.range(active_rows):
+                source_row = source_base + row
+                target_row = target_base + row
+                position = pl.read(query_group_positions, [source_row])
+                pl.write(compact_positions, [target_row], position)
+                for layer in pl.unroll(DSPARK_DRAFT_LAYERS):
+                    slot = pl.read(query_group_slot_mapping, [layer, source_row])
+                    pl.write(compact_slot_mapping, [layer, target_row], slot)
+            for tile_row in pl.range(0, full_rows, COMM_ROW_TILE):
+                source_tile = source_base + tile_row
+                target_tile = target_base + tile_row
+                cos_tile = query_group_freqs_cos[source_tile : source_tile + COMM_ROW_TILE, :]
+                sin_tile = query_group_freqs_sin[source_tile : source_tile + COMM_ROW_TILE, :]
+                compact_freqs_cos[target_tile : target_tile + COMM_ROW_TILE, :] = cos_tile
+                compact_freqs_sin[target_tile : target_tile + COMM_ROW_TILE, :] = sin_tile
+            for tail_row in pl.range(full_rows, active_rows):
+                source_tail = source_base + tail_row
+                target_tail = target_base + tail_row
+                cos_row = query_group_freqs_cos[source_tail : source_tail + 1, :]
+                sin_row = query_group_freqs_sin[source_tail : source_tail + 1, :]
+                compact_freqs_cos[target_tail : target_tail + 1, :] = cos_row
+                compact_freqs_sin[target_tail : target_tail + 1, :] = sin_row
+    return compact_positions, compact_freqs_cos, compact_freqs_sin, compact_slot_mapping
+
+
 @pl.jit.inline(auto_scope=False)
 def draft_layer(
     query_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -280,15 +324,15 @@ def draft_layer(
     query_freqs_cos: pl.Tensor[[T_QUERY, ROPE_DIM], pl.BF16],
     query_freqs_sin: pl.Tensor[[T_QUERY, ROPE_DIM], pl.BF16],
     query_group_freqs_cos: pl.Tensor[
-        [DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16
+        [CP_QUERY_T_DYN, ROPE_DIM], pl.BF16
     ],
     query_group_freqs_sin: pl.Tensor[
-        [DSPARK_CP_SIZE * T_QUERY, ROPE_DIM], pl.BF16
+        [CP_QUERY_T_DYN, ROPE_DIM], pl.BF16
     ],
     query_positions: pl.Tensor[[T_QUERY], pl.INT32],
-    query_group_positions: pl.Tensor[[DSPARK_CP_SIZE * T_QUERY], pl.INT32],
+    query_group_positions: pl.Tensor[[CP_QUERY_T_DYN], pl.INT32],
     kv_cache: pl.Tensor[[KV_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    query_group_slot_mapping: pl.Tensor[[DSPARK_CP_SIZE * T_QUERY], pl.INT64],
+    query_group_slot_mapping: pl.Tensor[[CP_QUERY_T_DYN], pl.INT64],
     swa_indices: pl.Tensor[[DSPARK_MAX_BATCH, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     swa_lens: pl.Tensor[[DSPARK_MAX_BATCH], pl.INT32],
     attn_sink: pl.Tensor[[DSPARK_DRAFT_LAYERS * H], pl.FP32],
@@ -391,12 +435,13 @@ def draft_layer(
         [0, 0],
     )
     rms_norm(query_mixed_active, layer_attn_norm_w, query_normed)
-    query_group = pl.create_tensor(
-        [DSPARK_CP_SIZE * T_QUERY, D], dtype=pl.BF16
-    )
+    query_active_rows = pl.cast(active_tokens, pl.INDEX)
+    query_group_rows = DSPARK_CP_SIZE * query_active_rows
+    query_active = pl.slice(query_normed, [query_active_rows, D], [0, 0])
+    query_group = pl.create_tensor([query_group_rows, D], dtype=pl.BF16)
     with pl.scope():
         _gathered_query, hidden_gather_signal = prefill_cp_token_allgather_step(
-            query_normed,
+            query_active,
             query_group,
             hidden_gather_window,
             hidden_gather_signal,
@@ -618,6 +663,9 @@ def dspark_drafter(
     four times that row count in rank-major order; padded rows use slot ``-1``.
     The context and group-query RoPE rows use the same rank-major order as their
     position metadata; local-query RoPE rows follow the local query order.
+    All ranks in a CP group use the same local batch. Each query metadata segment
+    keeps its fixed capacity, with the first ``batch * DSPARK_QUERY_WIDTH`` rows
+    active and all remaining query slots set to ``-1`` in every draft layer.
     Physical slots use one group-global block namespace replicated on all ranks.
     The group row count must not exceed ``PREFILL_GROUP_CAP`` (8192). The runtime
     does not validate relationships between dynamic tensor axes, so the
@@ -637,6 +685,15 @@ def dspark_drafter(
     batch = pl.tensor.dim(num_sampled, 0)
     target_tokens = pl.tensor.dim(target_hidden, 0)
     active_tokens = pl.cast(batch * DSPARK_QUERY_WIDTH, pl.INT32)
+    group_query_tokens = DSPARK_CP_SIZE * batch * DSPARK_QUERY_WIDTH
+    compact_query_positions = pl.create_tensor([group_query_tokens], dtype=pl.INT32)
+    compact_query_freqs_cos = pl.create_tensor([group_query_tokens, ROPE_DIM], dtype=pl.BF16)
+    compact_query_freqs_sin = pl.create_tensor([group_query_tokens, ROPE_DIM], dtype=pl.BF16)
+    compact_query_slots = pl.create_tensor([DSPARK_DRAFT_LAYERS, group_query_tokens], dtype=pl.INT64)
+    compact_dspark_query_metadata(
+        query_group_position_ids, query_group_freqs_cos, query_group_freqs_sin, query_group_slot_mapping,
+        compact_query_positions, compact_query_freqs_cos, compact_query_freqs_sin, compact_query_slots,
+    )
 
     kv_cache_0 = kv_caches[0]
     kv_cache_1 = kv_caches[1]
@@ -711,15 +768,18 @@ def dspark_drafter(
     swa_lens_0 = swa_lens[0]
     swa_lens_1 = swa_lens[1]
     swa_lens_2 = swa_lens[2]
+    compact_query_slots_0 = compact_query_slots[0]
+    compact_query_slots_1 = compact_query_slots[1]
+    compact_query_slots_2 = compact_query_slots[2]
     hidden_1 = intermediate_hidden[0]
     hidden_1, hidden_gather_signal = draft_layer(
         initial_hidden, pl.const(0, pl.INT32),
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         query_freqs_cos, query_freqs_sin,
-        query_group_freqs_cos, query_group_freqs_sin,
-        query_positions, query_group_position_ids,
-        kv_cache_0, query_group_slot_mapping[0], swa_indices_0, swa_lens_0,
+        compact_query_freqs_cos, compact_query_freqs_sin,
+        query_positions, compact_query_positions,
+        kv_cache_0, compact_query_slots_0, swa_indices_0, swa_lens_0,
         attn_sink, wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_w,
         gate_w, gate_bias, tid2eid, query_token_ids,
@@ -739,9 +799,9 @@ def dspark_drafter(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         query_freqs_cos, query_freqs_sin,
-        query_group_freqs_cos, query_group_freqs_sin,
-        query_positions, query_group_position_ids,
-        kv_cache_1, query_group_slot_mapping[1], swa_indices_1, swa_lens_1,
+        compact_query_freqs_cos, compact_query_freqs_sin,
+        query_positions, compact_query_positions,
+        kv_cache_1, compact_query_slots_1, swa_indices_1, swa_lens_1,
         attn_sink, wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_w,
         gate_w, gate_bias, tid2eid, query_token_ids,
@@ -761,9 +821,9 @@ def dspark_drafter(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         query_freqs_cos, query_freqs_sin,
-        query_group_freqs_cos, query_group_freqs_sin,
-        query_positions, query_group_position_ids,
-        kv_cache_2, query_group_slot_mapping[2], swa_indices_2, swa_lens_2,
+        compact_query_freqs_cos, compact_query_freqs_sin,
+        query_positions, compact_query_positions,
+        kv_cache_2, compact_query_slots_2, swa_indices_2, swa_lens_2,
         attn_sink, wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_w,
         gate_w, gate_bias, tid2eid, query_token_ids,
