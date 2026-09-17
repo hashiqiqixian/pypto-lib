@@ -1,10 +1,10 @@
 # DeepSeek V4.1 Flash
 
 `models/deepseek_v4_1_flash/` is the implementation staging area for the
-DeepSeek-V4.1-Flash checkpoint. The first milestone establishes the text-model
-configuration, layer schedule, cache ownership, inference metadata, Torch
-goldens, and prefill/decode kernel contracts. Checkpoint loading and optimized
-PyPTO leaf kernels remain follow-up work.
+DeepSeek-V4.1-Flash checkpoint. It contains the text-model configuration, layer
+schedule, cache ownership, inference metadata, Torch goldens, and native
+attention and hyper-connection kernels. Checkpoint loading and complete native
+model composition remain follow-up work.
 
 ## Checkpoint shape
 
@@ -35,20 +35,35 @@ The attention schedule is:
 
 ## Parallel-development structure
 
-Each attention mode and execution phase has one ownership file. Every file
-contains a Torch golden and an explicit `@pl.jit.inline` ABI; kernel bodies are
-the remaining parallel work.
+Each attention mode and execution phase has one ownership file. SWA, C2A
+Full/Reuse, C1A Full/Reindex/Reuse, the hierarchical indexer, mHC, and TP output
+reduction have native kernel bodies. C1A prefill and decode share the same
+ratio-1 computation through factories, with separate stage window capacities
+and TP reducers. The EP-MoE body and complete model integration remain separate
+workstreams.
 
-Run an operator file directly to execute its deterministic CPU golden:
+The C1A decode scripts compile and execute native A5 kernels against Torch
+goldens. They do not default to CPU-only reference execution. Select the
+devices explicitly:
 
 ```bash
 source .venv/bin/activate-pypto
-python models/deepseek_v4_1_flash/decode_c1a_reindex.py
+python models/deepseek_v4_1_flash/decode_c1a_reindex.py -p a5 --tp 2 -d 0,1 --case single
+# Compile the same native entry without launching it on the device:
+python models/deepseek_v4_1_flash/decode_c1a_reindex.py -p a5 --tp 2 -d 0,1 --case single --compile-only
 ```
 
-The command prints `[GOLDEN] PASS` and exits nonzero when the reference fails.
-Once a kernel body lands, its owner can extend the same file with the thin
-`@pl.jit` entry, `build_tensor_specs()`, and device `run(...)` block.
+Use `decode_c1a_full.py` or `decode_c1a_reuse.py` with the same arguments for
+the other modes. `single` tests one request's first token; `multi_1k` tests
+three independent requests with 1,024 cached positions each; `long` tests
+three requests with 1,024/4,096/8,192 positions. Each decode case supplies one
+query token per request. The commands exit nonzero on validation failure.
+`--compile-only` establishes compilation, not numerical correctness.
+
+The shared native C1A kernels currently support A5 with TP1, TP2, or TP4.
+TP8 requires head-tile padding; A3 support for this native MX path has not been
+established. The broader configuration's accepted TP sizes do not imply that
+every individual kernel supports them.
 
 | Workstream | Files |
 | --- | --- |
@@ -109,8 +124,9 @@ remainders, ragged compressor output starts, source-token rows, and compressed
 RoPE positions. The same lowering serves prefill and continuous-batch decode.
 
 The target deployment is one eight-card A5 node with TP4 attention, two DP
-groups, and EP8 routed experts. TP1/2/4/8 and compatible EP2/4/8 shapes remain
-available for bring-up. The EP world is reinterpreted as `DP = EP / TP`
+groups, and EP8 routed experts. The configuration accepts TP1/2/4/8 and
+compatible EP2/4/8 shapes; native C1A currently has the narrower TP1/2/4
+support described above. The EP world is reinterpreted as `DP = EP / TP`
 contiguous attention groups; `tp_rank = rank % TP` and
 `group_base = rank - tp_rank`.
 
@@ -154,11 +170,12 @@ reference-matching text.
 
 The implementation milestones are ordered by dependency:
 
-1. Implement and compile the attention TP all-reduce, mHC, and SWA.
-2. Implement C2A Full, then validate Full-to-Reuse cache and Top-K replay.
-3. Implement C1A Full and the level-one candidate selector, then Reindex and Reuse.
+1. Validate the implemented attention TP all-reduce, mHC, and SWA at deployment shapes.
+2. Validate C2A Full-to-Reuse cache and Top-K replay.
+3. Validate C1A prefill/decode Full, candidate selection, Reindex, and Reuse with shared cache state.
 4. Implement the three-phase EP-MoE dispatch/local-expert/combine body.
 5. Compose the operators into the 40-layer prefill/decode token loop.
 
-Until the leaf kernels and weight loader land, this directory is not a runnable
-model and is not exposed to `pypto-serving`.
+The available attention kernels do not constitute a runnable model. A native
+checkpoint adapter, EP-MoE body, and complete token loop are still required;
+this directory is not yet connected to the `pypto-serving` V4.1 backend.

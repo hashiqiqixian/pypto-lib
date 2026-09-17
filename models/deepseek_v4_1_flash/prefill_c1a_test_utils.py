@@ -414,3 +414,77 @@ def attention_output_compare() -> Callable:
         rtol=OUTPUT_RTOL,
         max_error_ratio=OUTPUT_MAX_ERROR_RATIO,
     )
+
+
+def run_decode_c1a(mode: str, operator: Callable, build_specs: Callable, golden_fn: Callable) -> None:
+    """Validate decode with one active token per independently addressed request."""
+    import argparse
+
+    from pypto.ir import DistributedConfig
+
+    from golden import run
+    from models.deepseek_v4_1_flash.attention_common import quantized_cache_compare
+
+    parser = argparse.ArgumentParser(description=f"DeepSeek V4.1 decode C1A {mode} validation")
+    parser.add_argument("-p", "--platform", default="a5", choices=("a5",))
+    parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(C.TP_SIZE)))
+    # The shared native head tiles currently support TP1/2/4, not TP8.
+    parser.add_argument("--tp", type=int, default=2, choices=(1, 2, 4))
+    parser.add_argument("--dp", type=int, default=1, choices=(1,))
+    parser.add_argument("--case", default="multi_1k", choices=("single", "multi_1k", "long"))
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data")
+    parser.add_argument("--dump-passes", action="store_true")
+    parser.add_argument("--runtime-dir")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    args = parser.parse_args()
+    if args.tp != C.TP_SIZE:
+        parser.error(f"--tp was parsed as TP{C.TP_SIZE}, got --tp {args.tp}")
+    device_ids = [int(device) for device in args.device.split(",")]
+    if len(device_ids) != C.TP_SIZE:
+        parser.error(f"need exactly {C.TP_SIZE} devices, got {device_ids}")
+
+    case = "causal" if args.case == "single" else args.case
+    specs = build_specs(1, case)
+    window_compare = quantized_cache_compare(
+        "window_cache", "window_cache_scale", "window_slots", CACHE_MAX_RELATIVE_L2,
+    )
+    comparisons = {
+        "output": attention_output_compare(),
+        "window_cache": window_compare,
+        "window_cache_scale": window_compare,
+    }
+    if mode in ("full", "reindex"):
+        comparisons["topk_indices"] = topk_indices_compare(mode)
+    if mode == "full":
+        for cache, group, scale_format in (
+            ("compressed_cache", C.COMPRESSED_CACHE_GROUP, "e4m3"),
+            ("index_cache", C.INDEX_CACHE_GROUP, "e8m0"),
+        ):
+            compare = quantized_cache_compare(
+                cache, f"{cache}_scale", "compressed_slots", MXFP4_CACHE_MAX_RELATIVE_L2,
+                group_size=group, scale_format=scale_format,
+            )
+            comparisons[cache] = compare
+            comparisons[f"{cache}_scale"] = compare
+    result = run(
+        fn=operator,
+        specs=specs,
+        golden_fn=golden_fn,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        config={
+            "platform": args.platform,
+            "distributed_config": DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            "dump_passes": args.dump_passes,
+            "enable_chip_swimlane": args.enable_chip_swimlane,
+        },
+        compare_fn=comparisons,
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)

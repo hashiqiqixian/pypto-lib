@@ -8,13 +8,35 @@
 # -----------------------------------------------------------------------------------------------------------
 """Continuous-batch decode C1A full attention."""
 
-import pypto.language as pl
-import pypto.language.distributed as pld
+import sys
+from pathlib import Path
+
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+# A5-only; intentionally excluded from the A2/A3 device sweep.
+# ci: no-sim
+# ci: a5
+
+_SCRIPT_ENTRY_POINT = "__" + "main__"
+if __name__ == _SCRIPT_ENTRY_POINT:
+    if not any(arg == "--tp" or arg.startswith("--tp=") for arg in sys.argv):
+        sys.argv.extend(["--tp", "2"])
+
 import torch
 
 from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, golden_compressed_attention
 from models.deepseek_v4_1_flash.config import AttentionMode
+from models.deepseek_v4_1_flash.attention_tp import decode_tp_output_all_reduce
+from models.deepseek_v4_1_flash.prefill_c1a_full import (
+    build_tensor_specs,
+    make_c1a_full_test,
+    make_prefill_c1a_full,
+    paged_indexer,
+)
+from models.deepseek_v4_1_flash.prefill_c1a_test_utils import apply_distributed_golden, run_decode_c1a
 
 
 def golden_decode_c1a_full(
@@ -103,65 +125,26 @@ def golden_decode_c1a_full(
     )
 
 
-@pl.jit.inline
-def decode_c1a_full(
-    x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
-    wq_a: pl.Tensor[[C.D, C.Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[C.D // 32, C.Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[C.Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[C.Q_LORA, C.LOCAL_H * C.HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.LOCAL_H * C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[C.D // 32, C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[C.LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
-    compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP4],
-    compressed_cache_scale: pl.Tensor[
-        [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
-    ],
-    request_ids: pl.Tensor[[C.T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[C.T_DYN], pl.INT32],
-    index_cache: pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM], pl.FP4],
-    index_cache_scale: pl.Tensor[
-        [C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // C.INDEX_CACHE_GROUP], pl.FP8E8M0
-    ],
-    index_block_table: pl.Tensor[[C.B_DYN, C.TABLE_DYN], pl.INT32],
-    compressed_rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-    compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.BF16],
-    compressor_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
-    compressed_slots: pl.Tensor[[C.T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[C.HEAD_DIM, C.INDEX_DIM], pl.BF16],
-    index_norm_weight: pl.Tensor[[C.INDEX_DIM], pl.BF16],
-    index_wq_b: pl.Tensor[[C.Q_LORA, C.INDEX_H * C.INDEX_DIM], pl.FP8E4M3FN],
-    index_wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.INDEX_H * C.INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[C.D, C.INDEX_H], pl.BF16],
-    topk_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
-    candidate_mask: pl.Tensor[[C.T_DYN, C.CMP_POSITIONS_DYN], pl.BOOL],
-    output_window: pld.DistributedTensor[[C.DECODE_MAX_TOKENS, C.D], pl.FP32],
-    output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    raise NotImplementedError("decode_c1a_full kernel body is assigned independently")
+# Ratio-1 prefill and decode share row-wise mathematics and packed UINT8 caches.
+# The stage-specific reducer retains the bounded decode window and epoch protocol.
+decode_c1a_full = make_prefill_c1a_full(
+    paged_indexer,
+    output_reduce=decode_tp_output_all_reduce,
+    output_window_tokens=C.DECODE_MAX_TOKENS,
+)
+decode_c1a_full_test, l3_decode_c1a_full_test = make_c1a_full_test(
+    decode_c1a_full, C.DECODE_MAX_TOKENS,
+)
+
+
+def golden_decode_c1a_full_case(tensors):
+    apply_distributed_golden("full", golden_decode_c1a_full, tensors)
 
 
 __all__ = ["golden_decode_c1a_full", "decode_c1a_full"]
 
 
-if __name__ == "__main__":
-    from models.deepseek_v4_1_flash._golden_smoke import run_attention_golden
-
-    run_attention_golden(golden_decode_c1a_full, ratio=1, mode="full")
+if __name__ == _SCRIPT_ENTRY_POINT:
+    run_decode_c1a(
+        "full", l3_decode_c1a_full_test, build_tensor_specs, golden_decode_c1a_full_case,
+    )
