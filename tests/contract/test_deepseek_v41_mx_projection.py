@@ -20,8 +20,8 @@ import torch
 import pypto
 
 
-def _case(output_dtype):
-    rows, inner, columns = 17, 512, 256
+def _case(output_dtype, rows=17):
+    inner, columns = 512, 256
     groups = inner // 32
     x = torch.empty(rows, inner, dtype=torch.bfloat16)
     weight = torch.zeros(inner, columns)
@@ -50,7 +50,7 @@ def _case(output_dtype):
     return x, weight.to(torch.float8_e4m3fn), packed.view(torch.float8_e8m0fnu), expected.to(output_dtype)
 
 
-def _entry(family, output_dtype):
+def _entry(family, output_dtype, rows):
     import pypto.language as pl
 
     module_name = "prefill_c1a_common" if family == "c1a" else "decode_swa"
@@ -60,27 +60,27 @@ def _entry(family, output_dtype):
 
     @pl.jit
     def entry(
-        x: pl.Tensor[[17, 512], pl.BF16],
+        x: pl.Tensor[[rows, 512], pl.BF16],
         weight: pl.Tensor[[512, 256], pl.FP8E4M3FN],
         scale: pl.Tensor[[16, 256], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Out[pl.Tensor[[17, 256], dtype]],
+        output: pl.Out[pl.Tensor[[rows, 256], dtype]],
     ):
-        output = project(x, weight, scale, output, 17)
+        output = project(x, weight, scale, output, rows)
         return output
 
     return entry
 
 
-def _run(family, output_dtype, *, compile_only):
+def _run(family, output_dtype, *, compile_only, rows=17):
     from golden import TensorSpec, run
 
-    x, weight, scale, expected = _case(output_dtype)
+    x, weight, scale, expected = _case(output_dtype, rows)
 
     def reference(values):
         values["output"].copy_(expected)
 
     result = run(
-        fn=_entry(family, output_dtype),
+        fn=_entry(family, output_dtype, rows),
         specs=[
             TensorSpec("x", list(x.shape), x.dtype, init_value=x),
             TensorSpec("weight", list(weight.shape), weight.dtype, init_value=weight),
@@ -111,3 +111,9 @@ def test_mx_projection_compiles_real_packed_panels(family, output_dtype):
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.bfloat16])
 def test_mx_projection_npu_keeps_both_n_panels_and_k_groups(family, output_dtype):
     _run(family, output_dtype, compile_only=False)
+
+
+@pytest.mark.skipif(not os.getenv("PYPTO_TEST_PLATFORM"), reason="requires an explicitly selected A5 device")
+@pytest.mark.parametrize("family", ["c1a", "swa"])
+def test_mx_projection_npu_keeps_staging_scopes_separate(family):
+    _run(family, torch.float32, compile_only=False, rows=49)
