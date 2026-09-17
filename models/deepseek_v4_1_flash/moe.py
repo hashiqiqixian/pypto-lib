@@ -150,13 +150,16 @@ def make_routed_projection(width, output_width):
         logical_weight = pl.reinterpret_view(weight, pl.FP4, shape=[output_width, width])
         for block in pl.spmd(output_width // PROJECTION_TILE, name_hint="moe_routed_projection"):
             n0 = block * PROJECTION_TILE
-            accumulator = pl.create_tensor([EXPERT_TILE, PROJECTION_TILE], dtype=pl.FP32)
+            accumulator = pl.create_tile(
+                [EXPERT_TILE, PROJECTION_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
+            )
             for kb in pl.range(width // K_TILE):
                 k0 = kb * K_TILE
                 source = pl.load(x, [0, k0], [EXPERT_TILE, K_TILE], valid_shape=[num_tokens, K_TILE])
                 source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), EXPERT_TILE, K_TILE)
                 grouped = pl.reshape(pl.cast(source, pl.FP32), [EXPERT_TILE * (K_TILE // 32), 32])
-                maximum = pl.maximum(pl.row_max(pl.abs(grouped)), 1e-4)
+                reduce_tmp = pl.create_tile([EXPERT_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
+                maximum = pl.maximum(pl.row_max(pl.abs(grouped), tmp_tile=reduce_tmp), 1e-4)
                 bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
                 exponent = pl.shrs(pl.add(bits, 8388607), 23)
                 factor = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
@@ -175,8 +178,10 @@ def make_routed_projection(width, output_width):
                     pl.row_expand_mul(values, pl.reshape(scale_value, [PROJECTION_TILE * (K_TILE // 32), 1])),
                     [PROJECTION_TILE, K_TILE],
                 )
+                source_mat = pl.move(source_fp32, target_memory=pl.MemorySpace.Mat)
+                weight_mat = pl.move(weights, target_memory=pl.MemorySpace.Mat)
                 accumulator = pl.matmul_acc(
-                    accumulator, source_fp32, weights, b_trans=True, init_cond=(kb == 0)
+                    accumulator, source_mat, pl.tile.transpose_view(weight_mat), init_cond=(kb == 0)
                 )
             output = pl.store(
                 pl.set_validshape(pl.cast(accumulator, pl.BF16, mode="rint"), num_tokens, PROJECTION_TILE),
@@ -224,12 +229,15 @@ def route(
         token = block // (N_EXPERTS // 32) * 16
         column = block % (N_EXPERTS // 32) * 32
         rows = pl.min(16, num_tokens - token)
-        logits = pl.create_tensor([16, 32], dtype=pl.FP32)
+        logits = pl.create_tile([16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
         for kb in pl.range(D // K_TILE):
             source = pl.load(x, [token, kb * K_TILE], [16, K_TILE], valid_shape=[rows, K_TILE])
             source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 16, K_TILE)
-            matrix = pl.load(gate_weight, [column, kb * K_TILE], [32, K_TILE])
-            logits = pl.matmul_acc(logits, pl.cast(source, pl.FP32), matrix, b_trans=True, init_cond=(kb == 0))
+            source_mat = pl.move(pl.cast(source, pl.FP32), target_memory=pl.MemorySpace.Mat)
+            matrix = pl.load(
+                gate_weight, [column, kb * K_TILE], [32, K_TILE], target_memory=pl.MemorySpace.Mat
+            )
+            logits = pl.matmul_acc(logits, source_mat, pl.tile.transpose_view(matrix), init_cond=(kb == 0))
         logits = pl.mul(logits, 1.0 / GATE_TEMPERATURE)
         softplus = pl.add(pl.maximum(logits, 0.0), pl.log(pl.add(pl.exp(pl.neg(pl.abs(logits))), 1.0)))
         softplus = pl.maximum(softplus, pl.exp(pl.minimum(logits, -20.0)))
@@ -244,15 +252,15 @@ def route(
             sorted128 = pl.mrgsort(sorted32, block_len=64)
             sorted_all = pl.mrgsort(sorted128[:, 0:256], sorted128[:, 256:512], sorted128[:, 512:768])
             selected = pl.gather(sorted_all[:, :16], mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            selected_scores = pl.gather(row, index=selected)
+            selected_scores = pl.gather(row, dim=-1, index=selected)
             valid_scores = pl.fillpad(pl.set_validshape(selected_scores, 1, TOPK), pad_value=pl.PadValue.zero)
             denominator = pl.add(pl.row_sum(valid_scores), 1e-20)
             normalized = pl.mul(pl.row_expand_div(valid_scores, denominator), ROUTED_SCALING_FACTOR)
             for k in pl.range(TOPK):
                 pl.write(indices, [token, k], pl.read(selected, [0, k]))
                 route_id = token * TOPK + k
-                weight_row = pl.full([1, AUX_WIDTH], dtype=pl.FP32, value=0.0)
-                route_row = pl.full([1, ROUTE_WIDTH], dtype=pl.INT32, value=0)
+                weight_row = pl.tile.full([1, AUX_WIDTH], dtype=pl.FP32, value=0.0)
+                route_row = pl.tile.full([1, ROUTE_WIDTH], dtype=pl.INT32, value=0)
                 pl.write(weight_row, [0, 0], pl.read(normalized, [0, k]))
                 pl.write(route_row, [0, 0], pl.cast(route_id, pl.INT32))
                 weights = pl.store(weight_row, [route_id, 0], weights)
@@ -373,7 +381,7 @@ def moe(
                                        dst_offsets=[row, 0], src_offsets=[route_id, 0], shape=[1, AUX_WIDTH])
                         pld.tensor.put(dst=recv_routes, peer=peer, src=routes,
                                        dst_offsets=[row, 0], src_offsets=[route_id, 0], shape=[1, ROUTE_WIDTH])
-        count_row = pl.full([1, N_LOCAL_EXPERTS], dtype=pl.INT32, value=0)
+        count_row = pl.tile.full([1, N_LOCAL_EXPERTS], dtype=pl.INT32, value=0)
         for expert in pl.range(N_LOCAL_EXPERTS):
             pl.write(count_row, [0, expert], cursor[expert])
         counts = pl.store(count_row, [destination, 0], counts)
