@@ -442,7 +442,9 @@ def moe(
 
     recv_counts = pl.create_tensor([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_received_counts", deps=[wait_tid]):
-        recv_counts[:, :] = recv_meta[:, :]
+        for source in pl.range(EP_SIZE):
+            count_row = pl.load(recv_meta, [source, 0], [1, N_LOCAL_EXPERTS])
+            recv_counts = pl.store(count_row, [source, 0], recv_counts)
 
     # Only a 32-row expert workspace is materialized at a time. The checkpoint
     # stays FP4; the projection decodes one matrix tile on device.
@@ -465,11 +467,16 @@ def moe(
                     send_result = pl.create_tensor([EXPERT_TILE, D], dtype=pl.FP32)
                     with pl.spmd(rows, name_hint="moe_received_input", deps=[wait_tid]) as _received_tid:
                         row = pl.tile.get_block_idx()
-                        value = pl.reshape(pl.cast(recv_x[row_base + row:row_base + row + 1, :], pl.FP32), [D // 32, 32])
-                        codes = pl.ands(pl.cast(pl.reinterpret_view(recv_scale[row_base + row:row_base + row + 1, :], pl.INT8), pl.INT32), 255)
+                        payload = pl.load(recv_x, [row_base + row, 0], [1, D])
+                        value = pl.reshape(pl.cast(payload, pl.FP32), [D // 32, 32])
+                        # The EP scale window already carries raw UINT8 exponent bytes.
+                        scale_bytes = pl.load(recv_scale, [row_base + row, 0], [1, D // 32])
+                        codes = pl.ands(pl.cast(pl.reinterpret_view(scale_bytes, pl.INT8), pl.INT32), 255)
                         factor = pl.reshape(pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32), [D // 32, 1])
-                        expert_x[row:row + 1, :] = pl.reshape(pl.cast(pl.row_expand_mul(value, factor), pl.BF16, mode="rint"), [1, D])
-                        expert_weights[row:row + 1, :] = recv_weights[row_base + row:row_base + row + 1, :]
+                        decoded = pl.reshape(pl.cast(pl.row_expand_mul(value, factor), pl.BF16, mode="rint"), [1, D])
+                        expert_x = pl.store(decoded, [row, 0], expert_x)
+                        route_weight = pl.load(recv_weights, [row_base + row, 0], [1, AUX_WIDTH])
+                        expert_weights = pl.store(route_weight, [row, 0], expert_weights)
                     gate_value = routed_up(expert_x, routed_w1[expert, :, :], routed_w1_scale[expert, :, :], gate_value, rows)
                     up_value = routed_up(expert_x, routed_w3[expert, :, :], routed_w3_scale[expert, :, :], up_value, rows)
                     hidden = swiglu(gate_value, up_value, expert_weights, hidden, rows)
@@ -518,12 +525,13 @@ def moe(
             shared_result = shared_down(hidden, shared_w2, shared_w2_scale, shared_result, rows)
             with pl.spmd(rows, name_hint="moe_combine", deps=[combine_tid]) as combined_tid:
                 row = pl.tile.get_block_idx()
-                value = pl.full([1, D], dtype=pl.FP32, value=0.0)
+                value = pl.tile.full([1, D], dtype=pl.FP32, value=0.0)
                 for k in pl.range(TOPK):
                     route_id = (start + row) * TOPK + k
-                    value = pl.add(value, routed_output[route_id:route_id + 1, :])
-                value = pl.add(value, pl.cast(shared_result[row:row + 1, :], pl.FP32))
-                output[start + row:start + row + 1, :] = pl.cast(value, pl.BF16, mode="rint")
+                    value = pl.add(value, pl.load(routed_output, [route_id, 0], [1, D]))
+                shared_value = pl.load(shared_result, [row, 0], [1, D])
+                value = pl.add(value, pl.cast(shared_value, pl.FP32))
+                output = pl.store(pl.cast(value, pl.BF16, mode="rint"), [start + row, 0], output)
             combined_tids[chunk] = combined_tid
     combined_done = pl.system.task_dummy(deps=[combined_tids])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_consumed", deps=[combined_done, combine_tid]):
