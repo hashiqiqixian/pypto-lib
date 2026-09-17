@@ -98,7 +98,7 @@ def make_projection(width, output_width, output_dtype=pl.BF16):
                 a0 = firstq_payload
                 sa0 = pl.reinterpret_view(firstq_packed, pl.FP8E8M0)
                 b0 = pl.load(weight, [0, n0], [K_TILE, N_TILE])
-                sb0 = pl.load(scale, [0, n0], [K_TILE // 32, N_TILE])
+                sb0 = pl.load(scale, [0, n0], [K_TILE // 32, N_TILE], target_memory=pl.MemorySpace.Mat)
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
                 for kb in pl.range(1, width // K_TILE):
                     k0 = kb * K_TILE
@@ -120,7 +120,7 @@ def make_projection(width, output_width, output_dtype=pl.BF16):
                     a = nextq_payload
                     sa = pl.reinterpret_view(nextq_packed, pl.FP8E8M0)
                     b = pl.load(weight, [k0, n0], [K_TILE, N_TILE])
-                    sb = pl.load(scale, [k0 // 32, n0], [K_TILE // 32, N_TILE])
+                    sb = pl.load(scale, [k0 // 32, n0], [K_TILE // 32, N_TILE], target_memory=pl.MemorySpace.Mat)
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                 if fp32_output:
                     output = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE), [t0, n0], output)
