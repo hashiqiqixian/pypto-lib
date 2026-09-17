@@ -85,11 +85,13 @@ IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/
 # tiling
 PREFILL_INPUT_ID_TILE = 4
 COMBINE_TOKEN_TILE = 4
+PUSH_EXPERT_TILE = 2
 
 # Scalar stores into recv_* land a whole 64-byte line at a time, so an expert
 # row and a token block must each own whole lines.
 assert RECV_MAX % FP32_PER_CACHE_LINE == 0
 assert T % INT64_PER_CACHE_LINE == 0
+assert N_LOCAL % PUSH_EXPERT_TILE == 0
 
 
 @pl.jit.inline
@@ -230,41 +232,39 @@ def dispatch(
                 acc = acc + count
             pl.write(recv_count_out, [e, 0], acc)
 
-    # Move the bulk payload (x / aux / route) to each destination lane. One block
-    # per (dst, local expert), each with its own slot counter; token-major order
-    # matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(N_RANKS * N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True) as push_tid:
+    # One block scans routes for two local experts on one destination rank.
+    # Each expert keeps its own slot counter and token-major lane order.
+    with pl.spmd(N_RANKS * (N_LOCAL // PUSH_EXPERT_TILE), name_hint="dispatch_push", allow_early_resolve=True) as push_tid:
         push_block = pl.tile.get_block_idx()
-        dst = push_block // N_LOCAL
-        loc_e = push_block - dst * N_LOCAL
+        dst = push_block // (N_LOCAL // PUSH_EXPERT_TILE)
+        push_group = push_block - dst * (N_LOCAL // PUSH_EXPERT_TILE)
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
 
-        e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
-
         indices_tile = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
         weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
-        # This block's rows fill the contiguous lane (loc_e, my_rank, 0..n), so aux
-        # and route ship as one remote_store. The lane tile always stores
-        # MAX_PER_SRC rows; slots >= n are never read back.
-        aux_lane = pl.tile.full([MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
-        route_lane = pl.tile.full([MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
-        slot_ctr = pl.array.create(1, pl.INT32)
-        slot_ctr[0] = 0
+        # Pack each expert's complete aux/route lane into a separate tile region.
+        # Slots past the lane count are sent but never read by the gather.
+        aux_group = pl.tile.full([PUSH_EXPERT_TILE * MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
+        route_group = pl.tile.full([PUSH_EXPERT_TILE * MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
+        slot_ctr = pl.array.create(PUSH_EXPERT_TILE, pl.INT32)
+        for counter_e in pl.unroll(PUSH_EXPERT_TILE):
+            slot_ctr[counter_e] = 0
         for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
                 eid = pl.tile.read(indices_tile, [t, k])
                 d = eid // N_LOCAL
                 le = eid - d * N_LOCAL
-                if le == loc_e:
-                    if d == dst:
-                        slot = slot_ctr[0]
-                        slot_ctr[0] = slot + 1
-                        # lane (loc_e, my_rank, slot) on peer=dst
-                        row = e_lane_base + slot
+                if d == dst:
+                    if le // PUSH_EXPERT_TILE == push_group:
+                        group_e = pl.cast(le - push_group * PUSH_EXPERT_TILE, pl.INDEX)
+                        slot = slot_ctr[group_e]
+                        slot_ctr[group_e] = slot + 1
+                        # Lane (le, my_rank, slot) retains its original remote row.
+                        row = pl.cast(le, pl.INDEX) * RECV_MAX + my_rank * MAX_PER_SRC + pl.cast(slot, pl.INDEX)
                         pld.tensor.put(
                             dst=recv_x,
                             peer=dst,
@@ -273,20 +273,24 @@ def dispatch(
                             src_offsets=[t, 0],
                             shape=[1, D],
                         )
-                        pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
-                        pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [t, k]))
-                        pl.tile.write(route_lane, [slot, 0], pl.cast(t * TOPK + k, pl.INT32))
-        pld.tile.remote_store(aux_lane, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
-        pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
+                        group_row = group_e * MAX_PER_SRC + pl.cast(slot, pl.INDEX)
+                        pl.tile.write(aux_group, [group_row, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
+                        pl.tile.write(aux_group, [group_row, AUX_W], pl.tile.read(weights_tile, [t, k]))
+                        pl.tile.write(route_group, [group_row, 0], pl.cast(t * TOPK + k, pl.INT32))
+        for lane_e in pl.unroll(PUSH_EXPERT_TILE):
+            loc_e = push_group * PUSH_EXPERT_TILE + lane_e
+            e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
+            aux_lane = pl.tile.slice(aux_group, [MAX_PER_SRC, AUX_PAD], [lane_e * MAX_PER_SRC, 0])
+            route_lane = pl.tile.slice(route_group, [MAX_PER_SRC, IDX_PAD], [lane_e * MAX_PER_SRC, 0])
+            pld.tile.remote_store(aux_lane, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
+            pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
 
-        # Payload-arrival notify folded into the push: a block signals its own
-        # destination after its own puts, so a peer sees N_LOCAL notifies per
-        # source per epoch and the wait below expects N_LOCAL * moe_epoch. The
-        # count must bump only after this block's puts issue in program order:
-        # recv_aux / recv_route ride a non-draining remote_store and a PIPE_ALL
-        # barrier is not a cross-rank DDR fence (PTOAS#872).
-        if dst != my_rank:
-            pld.system.notify(target=data_arrived, peer=dst, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+            # Keep one credit per expert after its lane stores: each peer still
+            # expects N_LOCAL * moe_epoch. The stores and notify stay on their
+            # producer block; remote_store is non-draining and PIPE_ALL is not
+            # a cross-rank DDR fence (PTOAS#872).
+            if dst != my_rank:
+                pld.system.notify(target=data_arrived, peer=dst, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[push_tid]) as _wait_tid:
         for src in pl.range(N_RANKS):
