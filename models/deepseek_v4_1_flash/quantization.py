@@ -67,9 +67,12 @@ def dequantize_mxfp4(packed_weight: torch.Tensor, scale_e8m0: torch.Tensor) -> t
 
 
 def _nearest_fp4_indices(values: torch.Tensor) -> torch.Tensor:
-    table = FP4_VALUES[:8].to(values.device)
-    magnitude = values.abs().unsqueeze(-1)
-    index = (magnitude - table).abs().argmin(dim=-1).to(torch.uint8)
+    magnitude = values.abs()
+    index = torch.zeros_like(magnitude, dtype=torch.uint8)
+    # At a midpoint, select the E2M1 code with an even low significand bit.
+    for lower, midpoint in enumerate((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)):
+        cross = (magnitude > midpoint) | ((magnitude == midpoint) & bool(lower % 2))
+        index += cross.to(torch.uint8)
     return index | (torch.signbit(values).to(torch.uint8) << 3)
 
 
@@ -125,12 +128,15 @@ def quantize_mxfp4_cache(
         raise ValueError(f"MXFP4 cache width must be divisible by {group_size}")
     grouped = value.float().unflatten(-1, (-1, group_size))
     amax = grouped.abs().amax(dim=-1)
-    raw_scale = (amax / 6.0).clamp_min(2.0**-9)
     if scale_format == "e8m0":
-        exponent = torch.ceil(torch.log2(raw_scale)).clamp(-127, 128)
-        scale_value = torch.exp2(exponent)
-        stored_scale = encode_e8m0(scale_value)
+        # Match the reference's FP32 reciprocal multiply before exact IEEE ceil-log2.
+        # log2 can round a value just above a power of two back to that power's exponent.
+        raw_scale = amax.clamp_min(6 * 2.0**-126) * (1.0 / 6.0)
+        exponent = (raw_scale.contiguous().view(torch.int32) + 0x7FFFFF) >> 23
+        scale_value = (exponent << 23).view(torch.float32)
+        stored_scale = exponent.to(torch.uint8)
     elif scale_format == "e4m3":
+        raw_scale = (amax / 6.0).clamp_min(2.0**-9)
         stored_scale = raw_scale.clamp(max=448.0).to(torch.float8_e4m3fn)
         scale_value = stored_scale.float()
     else:

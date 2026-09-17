@@ -311,20 +311,21 @@ def publish_compressed_cache(
             normalized = pl.row_expand_div(grouped, scale)
             normalized = pl.reshape(normalized, [1, HEAD_DIM])
             magnitude = pl.minimum(pl.abs(normalized), 6.0)
+            # Each interval starts at an even code, so rint preserves E2M1 ties-to-even.
             lower = pl.cast(
-                pl.add(pl.mul(pl.minimum(magnitude, 2.0), 2.0), 0.4999),
+                pl.mul(pl.minimum(magnitude, 2.0), 2.0),
                 pl.INT32,
-                mode="trunc",
+                mode="rint",
             )
             middle = pl.cast(
-                pl.add(pl.minimum(pl.maximum(pl.sub(magnitude, 2.0), 0.0), 2.0), 0.4999),
+                pl.minimum(pl.maximum(pl.sub(magnitude, 2.0), 0.0), 2.0),
                 pl.INT32,
-                mode="trunc",
+                mode="rint",
             )
             upper = pl.cast(
-                pl.add(pl.mul(pl.maximum(pl.sub(magnitude, 4.0), 0.0), 0.5), 0.4999),
+                pl.mul(pl.maximum(pl.sub(magnitude, 4.0), 0.0), 0.5),
                 pl.INT32,
-                mode="trunc",
+                mode="rint",
             )
             payload_codes = pl.add(pl.add(lower, middle), upper)
             bits = pl.reinterpret_view(normalized, pl.INT32)
@@ -376,28 +377,31 @@ def publish_index_cache(
             grouped[:INDEX_DIM // INDEX_CACHE_GROUP, :] = source_groups
             maximum_tmp = pl.create_tile([8, 128], dtype=pl.FP32)
             maximum = pl.row_max(pl.abs(grouped), tmp_tile=maximum_tmp)
-            raw_scale = pl.maximum(pl.mul(maximum, 1.0 / 6.0), 2.0**-127)
+            raw_scale = pl.maximum(pl.mul(maximum, 1.0 / 6.0), 2.0**-126)
             bits = pl.reinterpret_view(raw_scale, pl.INT32)
             exponent = pl.shrs(pl.add(bits, 8388607), 23)
-            scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-            normalized = pl.reshape(pl.row_expand_div(grouped, scale), [1, 8 * INDEX_CACHE_GROUP])
+            inverse_exponent = pl.add(pl.mul(exponent, -1), 254)
+            inverse_scale = pl.reinterpret_view(pl.shls(inverse_exponent, 23), pl.FP32)
+            # Ascend division flushes subnormal inputs; exact power-of-two multiplication preserves them.
+            normalized = pl.reshape(pl.row_expand_mul(grouped, inverse_scale), [1, 8 * INDEX_CACHE_GROUP])
             padded = pl.tile.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
             padded[:, :8 * INDEX_CACHE_GROUP] = normalized
             magnitude = pl.minimum(pl.abs(padded), 6.0)
+            # Each interval starts at an even code, so rint preserves E2M1 ties-to-even.
             lower = pl.cast(
-                pl.add(pl.mul(pl.minimum(magnitude, 2.0), 2.0), 0.4999),
+                pl.mul(pl.minimum(magnitude, 2.0), 2.0),
                 pl.INT32,
-                mode="trunc",
+                mode="rint",
             )
             middle = pl.cast(
-                pl.add(pl.minimum(pl.maximum(pl.sub(magnitude, 2.0), 0.0), 2.0), 0.4999),
+                pl.minimum(pl.maximum(pl.sub(magnitude, 2.0), 0.0), 2.0),
                 pl.INT32,
-                mode="trunc",
+                mode="rint",
             )
             upper = pl.cast(
-                pl.add(pl.mul(pl.maximum(pl.sub(magnitude, 4.0), 0.0), 0.5), 0.4999),
+                pl.mul(pl.maximum(pl.sub(magnitude, 4.0), 0.0), 0.5),
                 pl.INT32,
-                mode="trunc",
+                mode="rint",
             )
             payload_codes = pl.add(pl.add(lower, middle), upper)
             bits = pl.reinterpret_view(padded, pl.INT32)

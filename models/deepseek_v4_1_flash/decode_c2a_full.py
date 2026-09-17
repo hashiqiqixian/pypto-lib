@@ -427,14 +427,13 @@ def publish_compressed(
                 pl.maximum(pl.row_expand_div(groups, pl.cast(stored, pl.FP32)), -6.0), 6.0
             )
             magnitude = pl.abs(normalized)
-            # Nearest E2M1 magnitude index: seven minus the number of table midpoints
-            # at or above |v|, which resolves an exact midpoint toward zero.
+            # Count crossed E2M1 midpoints, including ties only when the upper code is even.
             step0 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 0.25), pl.INT32), 1), 31)
-            step1 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32), 1), 31)
+            step1 = pl.shrs(pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32), 31)
             step2 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 1.25), pl.INT32), 1), 31)
-            step3 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32), 1), 31)
+            step3 = pl.shrs(pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32), 31)
             step4 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 2.5), pl.INT32), 1), 31)
-            step5 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32), 1), 31)
+            step5 = pl.shrs(pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32), 31)
             step6 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 5.0), pl.INT32), 1), 31)
             index = pl.add(
                 pl.add(pl.add(step0, step1), pl.add(step2, step3)),
@@ -478,17 +477,20 @@ def publish_index_key(
             source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, INDEX_DIM * 8)
             groups = pl.reshape(pl.cast(source, pl.FP32), [INDEX_DIM * 8 // 32, 32])
             amax = pl.row_max(pl.abs(groups))
-            raw = pl.maximum(pl.mul(amax, FP4_MAX_INV), FP4_SCALE_FLOOR)
+            raw = pl.maximum(pl.mul(amax, FP4_MAX_INV), 2.0**-126)
             exponent = pl.shrs(pl.add(pl.reinterpret_view(raw, pl.INT32), 8388607), 23)
-            factor = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-            normalized = pl.minimum(pl.maximum(pl.row_expand_div(groups, factor), -6.0), 6.0)
+            inverse_exponent = pl.add(pl.mul(exponent, -1), 254)
+            inverse_scale = pl.reinterpret_view(pl.shls(inverse_exponent, 23), pl.FP32)
+            # Ascend division flushes subnormal inputs; exact power-of-two multiplication preserves them.
+            normalized = pl.minimum(pl.maximum(pl.row_expand_mul(groups, inverse_scale), -6.0), 6.0)
             magnitude = pl.abs(normalized)
+            # Count crossed E2M1 midpoints, including ties only when the upper code is even.
             step0 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 0.25), pl.INT32), 1), 31)
-            step1 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32), 1), 31)
+            step1 = pl.shrs(pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32), 31)
             step2 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 1.25), pl.INT32), 1), 31)
-            step3 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32), 1), 31)
+            step3 = pl.shrs(pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32), 31)
             step4 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 2.5), pl.INT32), 1), 31)
-            step5 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32), 1), 31)
+            step5 = pl.shrs(pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32), 31)
             step6 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 5.0), pl.INT32), 1), 31)
             index = pl.add(
                 pl.add(pl.add(step0, step1), pl.add(step2, step3)),
