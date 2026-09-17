@@ -188,6 +188,13 @@ class DeepSeekV41Config:
         if set(self.compress_ratios) - {0, 1, 2}:
             raise ValueError("DeepSeek-V4.1-Flash supports compression ratios 0, 1, and 2")
 
+        for name in ("kv_source_layer_ids", "index_source_layer_ids"):
+            sources = getattr(self, name)
+            if any(type(source) is not int for source in sources) or tuple(sorted(set(sources))) != sources:
+                raise ValueError(f"{name} must contain strictly increasing integer layer ids")
+        if not set(self.kv_source_layer_ids) <= set(self.index_source_layer_ids):
+            raise ValueError("KV sources must also be index sources")
+
         for source in self.kv_source_layer_ids + self.index_source_layer_ids:
             if not 0 <= source < self.num_hidden_layers:
                 raise ValueError(f"cache source layer {source} is outside the backbone")

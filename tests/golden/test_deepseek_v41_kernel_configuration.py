@@ -11,10 +11,35 @@
 import importlib.util
 import importlib
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+
+@pytest.mark.parametrize("field", ["kv_source_layer_ids", "index_source_layer_ids"])
+@pytest.mark.parametrize("sources", [(8, 2, 14, 20), (2, 8, 8, 14, 20), (2.0, 8, 14, 20)])
+def test_cache_owner_lists_reject_ambiguous_order_and_types(config, field, sources):
+    with pytest.raises(ValueError, match="strictly increasing integer"):
+        replace(config.FLASH, **{field: sources})
+
+
+def test_kv_owner_must_publish_its_own_index_cache(config):
+    with pytest.raises(ValueError, match="KV sources must also be index sources"):
+        replace(config.FLASH, index_source_layer_ids=(2, 14, 20, 24, 28, 32, 36))
+
+
+def test_flash_layers_resolve_latest_matching_cache_owners(config):
+    model = config.FLASH
+    for layer in model.backbone_layers():
+        for field, actual in (
+            ("kv_source_layer_ids", layer.kv_source_layer_id),
+            ("index_source_layer_ids", layer.index_source_layer_id),
+        ):
+            owners = [owner for owner in getattr(model, field)
+                      if owner <= layer.layer_id and model.compress_ratios[owner] == layer.compression_ratio]
+            assert actual == (max(owners) if owners else None)
 
 
 @pytest.fixture
