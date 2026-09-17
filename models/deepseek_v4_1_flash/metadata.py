@@ -13,7 +13,7 @@ from typing import Mapping
 
 import torch
 
-from models.deepseek_v4_1_flash.config import BLOCK_SIZE, FLASH, TP_SIZE
+from models.deepseek_v4_1_flash.config import BLOCK_SIZE, FLASH, MAX_BATCH_PER_DP, TP_SIZE
 
 
 @dataclass(frozen=True)
@@ -138,8 +138,17 @@ def build_forward_metadata(
     kv_seq_lens: torch.Tensor,
     window_block_table: torch.Tensor,
     compressed_block_tables: Mapping[int, torch.Tensor],
+    *,
+    compressor_state_slots: Mapping[int, torch.Tensor] | None = None,
 ) -> ForwardMetadata:
-    """Lower engine inputs for packed prefill or one-token-per-request decode."""
+    """Lower packed queries using engine-owned persistent compressor slots.
+
+    ``compressor_state_slots[source]`` is an integer vector with one stable
+    state-pool row per current request. Reorder this vector with the batch;
+    never relocate the state implicitly. The caller must reset a released slot
+    before assigning it to a fresh request, or restore its pending pair when
+    resuming. Inactive requests may use -1 and do not access state.
+    """
     if query_start_loc.ndim != 1 or kv_seq_lens.ndim != 1:
         raise ValueError("query_start_loc and kv_seq_lens must be one-dimensional")
     if query_start_loc.numel() != kv_seq_lens.numel() + 1:
@@ -206,7 +215,25 @@ def build_forward_metadata(
         complete = (positions + 1).remainder(ratio) == 0
         compressed_rope_positions[source] = torch.where(complete, positions + 1 - ratio, -1).to(torch.int32)
         if ratio > 1:
-            state_rows[source] = request_ids.to(torch.int64)
+            if request_ids.numel() == 0:
+                state_rows[source] = request_ids.to(torch.int64)
+                continue
+            if compressor_state_slots is None or source not in compressor_state_slots:
+                raise ValueError(f"source layer {source} requires engine-owned compressor state slots")
+            slots = compressor_state_slots[source]
+            if slots.shape != query_lens.shape or slots.dtype not in (torch.int32, torch.int64):
+                raise ValueError("compressor state slots must be an integer vector with one row per request")
+            if slots.device != request_ids.device:
+                raise ValueError("compressor state slots must be on the metadata device")
+            if bool(((slots < -1) | (slots >= MAX_BATCH_PER_DP)).any()):
+                raise ValueError("compressor state slots must be -1 or a row inside the kernel state pool")
+            if bool((slots[query_lens > 0] < 0).any()):
+                raise ValueError("active requests must own a compressor state slot")
+            # Paused requests can retain pending pairs that active writes must not overwrite.
+            owned_slots = slots[slots >= 0]
+            if owned_slots.unique().numel() != owned_slots.numel():
+                raise ValueError("requests, including paused requests, must own distinct compressor state slots")
+            state_rows[source] = slots[request_ids.to(torch.long)].to(torch.int64)
     return ForwardMetadata(
         query_start_loc=query_start_loc.to(torch.int32),
         query_lens=query_lens.to(torch.int32),

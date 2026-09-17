@@ -108,6 +108,58 @@ per-token causal compressed lengths, per-request compressed lengths and
 remainders, ragged compressor output starts, source-token rows, and compressed
 RoPE positions. The same lowering serves prefill and continuous-batch decode.
 
+For active ratio-2 requests, `build_forward_metadata` requires the keyword
+`compressor_state_slots`: a mapping from each KV source layer to an INT32/INT64
+`[B]` vector of engine-owned stable state rows. Allocated rows must be distinct
+across active and paused requests and lie in `[0, MAX_BATCH_PER_DP)`. Reorder these vectors with
+the batch while leaving persistent state in its original slots. Inactive
+requests without a retained slot may use `-1`; an empty batch needs no state mapping. The caller owns
+reset before slot reassignment and pending-pair restoration on resume. This
+preserves the existing bounded state-pool ABI; it is not a ring-cache or
+speculative rollback implementation.
+
+`compressor_state.CompressorStateCache` supplies this lifecycle for engines
+using Torch buffers. Create one pool per TP rank and use request keys containing
+their generation. `allocate` initializes all source buffers, `slots` resolves
+the current batch order without moving state, and `release` clears the slot
+before reuse. Paused requests keep their slots until explicitly released.
+Each `buffers[source]` has the existing FP32 `[32, 2, 512]` kernel layout;
+the two rows hold the pending KV projection and gate score, respectively.
+
+```python
+from models.deepseek_v4_1_flash.compressor_state import CompressorStateCache
+from models.deepseek_v4_1_flash.metadata import build_forward_metadata
+
+state = CompressorStateCache(device=query_start_loc.device)
+request_keys = [("request-a", 0), ("request-b", 0)]
+for key in request_keys:
+    state.allocate(key)
+metadata = build_forward_metadata(
+    query_start_loc, kv_seq_lens, window_block_table, compressed_block_tables,
+    compressor_state_slots=state.slots(request_keys),
+)
+# For each source, pass metadata.compressor_state_rows[source] and
+# state.buffers[source] to its C2A kernel. Keep this pool across dispatches.
+# After all source kernels finish at the committed prefix boundary:
+saved = state.snapshot(request_keys[0], prefix_length=committed_length)
+state.release(request_keys[0])
+# Restore the matching KV prefix separately, then restore pending state:
+resumed_key = ("request-a", 1)
+state.allocate(resumed_key, prefix_length=saved.prefix_length, snapshot=saved)
+```
+
+An odd prefix cannot resume without a matching pending-state snapshot; the
+allocator rejects it instead of silently consuming zeros. An even prefix may
+start with cleared state because its next token begins a new compression pair.
+Snapshots clone only one pending pair per source, remain on the pool device,
+and do not alias live storage. The engine supplies the committed prefix length
+and must save the corresponding KV prefix and model/rank identity with it.
+Lifecycle operations must run after kernel completion on the same stream, or
+after an explicit wait across streams. Release must also wait for commands
+already holding old slot mappings; generation keys do not revoke device work.
+This helper does not replace an engine's existing allocator or transaction
+manager, and does not implement ring history or speculative rollback.
+
 The target deployment is one eight-card A5 node with TP4 attention, two DP
 groups, and EP8 routed experts. TP1/2/4/8 and compatible EP2/4/8 shapes remain
 available for bring-up. The EP world is reinterpreted as `DP = EP / TP`
