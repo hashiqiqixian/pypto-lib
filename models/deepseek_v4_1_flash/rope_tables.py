@@ -11,8 +11,9 @@
 import math
 
 import torch
+import pypto.language as pl
 
-from models.deepseek_v4_1_flash.config import FLASH, DeepSeekV41Config
+from models.deepseek_v4_1_flash.config import FLASH, ROPE_DIM, T_DYN, DeepSeekV41Config
 
 
 def precompute_rope_tables(
@@ -40,6 +41,42 @@ def precompute_rope_tables(
         frequencies = frequencies / config.rope_factor * (1 - smooth) + frequencies * smooth
     angles = torch.outer(torch.arange(sequence_length, dtype=torch.float32), frequencies)
     return angles.cos(), angles.sin()
+
+
+ROPE_ROWS_DYN = pl.dynamic("V41_ROPE_ROWS_DYN")
+
+
+@pl.jit.inline
+def materialize_rope_rows(
+    freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    rope_cos: pl.Out[pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32]],
+    rope_sin: pl.Out[pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32]],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Gather active token rows from serving-owned full tables inside the graph.
+
+    Tables are read-only FP32 half-width arrays for one RoPE profile. The caller
+    provides 0 <= num_tokens <= T and positions below table capacity. Negative
+    positions produce identity rotation for unpublished compressed tokens.
+    Padding rows are untouched. Return the producer TaskId for consumers that
+    use explicit dependencies, as the attention entries do with cache_ready.
+    """
+    with pl.spmd(num_tokens, name_hint="v41_rope_rows") as rope_ready:
+        token = pl.tile.get_block_idx()
+        position = pl.cast(pl.read(position_ids, [token]), pl.INDEX)
+        if position >= 0:
+            rope_cos[token : token + 1, :] = freqs_cos[position : position + 1, :]
+            rope_sin[token : token + 1, :] = freqs_sin[position : position + 1, :]
+        else:
+            rope_cos[token : token + 1, :] = pl.full(
+                [1, ROPE_DIM // 2], dtype=pl.FP32, value=1.0
+            )
+            rope_sin[token : token + 1, :] = pl.full(
+                [1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0
+            )
+    return rope_ready
 
 
 def select_rope_rows(
