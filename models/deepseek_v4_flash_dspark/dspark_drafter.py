@@ -407,13 +407,18 @@ def draft_layer(
         [O_GROUPS * LOCAL_T_PAD * (H // O_GROUPS), HEAD_DIM],
         dtype=pl.BF16,
     )
+    query_rows = pl.cast(active_tokens, pl.INDEX)
+    query_active = pl.slice(query_normed, [query_rows, D], [0, 0])
+    query_cos_active = pl.slice(query_freqs_cos, [query_rows, ROPE_DIM], [0, 0])
+    query_sin_active = pl.slice(query_freqs_sin, [query_rows, ROPE_DIM], [0, 0])
+    query_positions_active = pl.slice(query_positions, [query_rows], [0])
     dspark_attention(
-        query_normed,
+        query_active,
         query_group,
         layer_wq_a, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_gamma_cq, layer_gamma_ckv,
-        query_freqs_cos, query_freqs_sin,
+        query_cos_active, query_sin_active,
         query_group_freqs_cos, query_group_freqs_sin,
-        query_positions, query_group_positions,
+        query_positions_active, query_group_positions,
         kv_cache, query_group_slot_mapping, swa_indices, swa_lens,
         layer_attn_sink, o_packed_heads,
     )
