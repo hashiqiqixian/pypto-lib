@@ -33,6 +33,49 @@ The attention schedule is:
 - Layers 20-39 use ratio-1 compressed sparse attention. Layer 20 owns the KV
   cache, while layers 20, 24, 28, 32, and 36 refresh the index selection.
 
+## Serving-owned full RoPE tables
+
+Like V4 MTP/DSpark's `materialize_rope_rows`, V4.1 provides a PyPTO inline
+stage that reads the full cosine/sine tables supplied by serving and writes
+only the active token rows inside the compiled graph. It does not recompute
+frequencies, copy the full table per call, or invoke Torch during dispatch.
+
+`rope_tables.materialize_rope_rows` accepts:
+
+- `freqs_cos`, `freqs_sin`: read-only FP32 `[table_capacity, rope_dim // 2]`
+  tables for one profile, retained by serving across calls.
+- `position_ids`: INT32 `[T]` absolute positions.
+- `num_tokens`: the active prefix length, in `[0, T]`.
+- `rope_cos`, `rope_sin`: caller-provided FP32 `[T, rope_dim // 2]` outputs.
+
+Nonnegative positions must be below table capacity. Negative positions write
+identity rotation, used for unpublished compressed tokens. Padding output
+rows remain untouched; zero active tokens launch no row work. V4.1 retains
+FP32 half-width tables for adjacent-pair rotation, rather than adopting V4's
+BF16 full-width representation.
+
+Inside a `@pl.jit` serving wrapper, compose the stage before attention:
+
+```python
+rope_ready = materialize_rope_rows(
+    freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin,
+)
+```
+
+The returned producer TaskId can be passed through the attention entry's
+`cache_ready` dependency alongside other required producers. Attention's
+existing low-level arguments still consume token-major rows. For compressed
+publication, call the same stage with the compressed profile's full tables
+and `metadata.compressed_rope_positions[source]`, which already contains
+compression-group start positions or `-1`. Preserve dependencies on both
+query and compressed row producers when composing Full attention. Serving
+owns graph composition, profile choice, table capacity and lifetime.
+
+`precompute_rope_tables` remains a CPU initialization utility when the caller
+needs to generate a complete profile. `select_rope_rows` remains the Torch
+reference/fixture utility; neither is needed in the compiled dispatch path
+when serving already supplies full tables.
+
 ## Parallel-development structure
 
 Each attention mode and execution phase has one ownership file. Every file
