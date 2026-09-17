@@ -36,6 +36,7 @@ from qkv_proj_rope import (
 
 # Dynamic shape variables.
 ORI_BLOCK_NUM_DYN = pl.dynamic("DSPARK_ATTENTION_ORI_BLOCK_NUM_DYN")
+Q_T_DYN = pl.dynamic("DSPARK_ATTENTION_Q_T_DYN")
 KV_T_DYN = pl.dynamic("DSPARK_ATTENTION_KV_T_DYN")
 
 # model config
@@ -75,7 +76,7 @@ NEG_INF = -1.0e20
 
 @pl.jit.inline
 def dspark_attention(
-    x: pl.Tensor[[T, D], pl.BF16],
+    x: pl.Tensor[[Q_T_DYN, D], pl.BF16],
     kv_x: pl.Tensor[[KV_T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
@@ -83,11 +84,11 @@ def dspark_attention(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_cos_local: pl.Tensor[[Q_T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[Q_T_DYN, ROPE_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[KV_T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[KV_T_DYN, ROPE_DIM], pl.BF16],
-    position_ids: pl.Tensor[[T], pl.INT32],
+    position_ids: pl.Tensor[[Q_T_DYN], pl.INT32],
     kv_position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     kv_slot_mapping: pl.Tensor[[KV_T_DYN], pl.INT64],
@@ -98,10 +99,11 @@ def dspark_attention(
         [O_GROUPS * LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16
     ],
 ):
+    q_tokens = pl.tensor.dim(x, 0)
     kv_tokens = pl.tensor.dim(kv_position_ids, 0)
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_swap_idx = pl.create_tensor([T, ROPE_DIM], dtype=pl.INT32)
+    rope_cos_il = pl.create_tensor([q_tokens, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([q_tokens, ROPE_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([q_tokens, ROPE_DIM], dtype=pl.INT32)
     rope_prepare(
         freqs_cos_local,
         freqs_sin_local,
@@ -110,9 +112,9 @@ def dspark_attention(
         rope_swap_idx,
     )
 
-    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    q = pl.create_tensor([q_tokens, H, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([q_tokens, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([q_tokens, 1], dtype=pl.FP32)
     q_proj_rope(
         x, wq_a, wq_b, wq_b_scale, gamma_cq,
         rope_cos_il, rope_sin_signed, rope_swap_idx,
@@ -181,10 +183,11 @@ def dspark_attention(
                 else:
                     visible_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
-    q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    sparse_mi = pl.create_tensor([T * H, 1], dtype=pl.FP32)
-    sparse_li = pl.create_tensor([T * H, 1], dtype=pl.FP32)
-    sparse_oi = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
+    q_head_rows = q_tokens * H
+    q_flat = pl.reshape(q, [q_head_rows, HEAD_DIM])
+    sparse_mi = pl.create_tensor([q_head_rows, 1], dtype=pl.FP32)
+    sparse_li = pl.create_tensor([q_head_rows, 1], dtype=pl.FP32)
+    sparse_oi = pl.create_tensor([q_head_rows, HEAD_DIM], dtype=pl.FP32)
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
     transfer_heads = transfer_slots * H
@@ -197,7 +200,7 @@ def dspark_attention(
     with pl.spmd(NUM_QK_CORES, name_hint="dspark_qk_pv") as qk_tid:
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
-        for qk_t in pl.range(qk_core, T, NUM_QK_CORES):
+        for qk_t in pl.range(qk_core, q_tokens, NUM_QK_CORES):
             qk_b = qk_t // S
             qk_q = pl.load(
                 q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
@@ -319,7 +322,7 @@ def dspark_attention(
         o_packed_heads,
         [O_GROUPS * LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM],
     )
-    for merge_idx in pl.spmd(T * (H // H_TILE), name_hint="dspark_merge_norm"):
+    for merge_idx in pl.spmd(q_tokens * (H // H_TILE), name_hint="dspark_merge_norm"):
         merge_token_idx = merge_idx // (H // H_TILE)
         merge_head0 = (merge_idx % (H // H_TILE)) * H_TILE
         merge_partial_row0 = merge_token_idx * H + merge_head0
