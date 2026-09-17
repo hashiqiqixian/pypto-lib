@@ -190,13 +190,30 @@ def make_routed_projection(width, output_width):
                 magnitude = pl.add(magnitude, pl.mul(pl.cast(extra, pl.FP32), 1.5))
                 sign = pl.cast(pl.ands(pl.shrs(codes, 3), 1), pl.FP32)
                 values = pl.mul(magnitude, pl.add(pl.mul(sign, -2.0), 1.0))
-                scale_tile = pl.load(scale, [n0, k0 // 32], [PROJECTION_TILE, K_TILE // 32])
+                scale_tile = pl.load(
+                    scale, [n0, k0 // 32], [PROJECTION_TILE, 32],
+                    valid_shape=[PROJECTION_TILE, K_TILE // 32],
+                )
                 scale_bytes = pl.reinterpret_view(scale_tile, pl.UINT8)
+                scale_bytes = pl.set_validshape(
+                    pl.fillpad(scale_bytes, pad_value=pl.PadValue.zero), PROJECTION_TILE, 32
+                )
                 scale_bits = pl.ands(pl.cast(pl.reinterpret_view(scale_bytes, pl.INT8), pl.INT32), 255)
                 scale_value = pl.reinterpret_view(pl.maximum(pl.shls(scale_bits, 23), 4194304), pl.FP32)
+                # The byte tile has a physical 32-column pitch. Gather only the
+                # eight K256 group scales per row, as in C1A index decoding.
+                scale_flat = pl.reshape(scale_value, [1, PROJECTION_TILE * 32])
+                group_ids = pl.tile.arange(0, [1, PROJECTION_TILE * (K_TILE // 32)], dtype=pl.INT32)
+                group_rows = pl.cast(
+                    pl.div(pl.cast(group_ids, pl.FP32), K_TILE // 32), pl.INT32, mode="trunc"
+                )
+                group_columns = pl.sub(group_ids, pl.mul(group_rows, K_TILE // 32))
+                scale_indices = pl.add(pl.mul(group_rows, 32), group_columns)
+                scale_tmp = pl.create_tile([1, PROJECTION_TILE * (K_TILE // 32)], dtype=pl.INT32)
+                scale_vector = pl.tile.gather(scale_flat, scale_indices, scale_tmp)
                 values = pl.reshape(values, [PROJECTION_TILE * (K_TILE // 32), 32])
                 weights = pl.reshape(
-                    pl.row_expand_mul(values, pl.reshape(scale_value, [PROJECTION_TILE * (K_TILE // 32), 1])),
+                    pl.row_expand_mul(values, pl.reshape(scale_vector, [PROJECTION_TILE * (K_TILE // 32), 1])),
                     [PROJECTION_TILE, K_TILE],
                 )
                 source_mat = pl.move(source_fp32, target_memory=pl.MemorySpace.Mat)
