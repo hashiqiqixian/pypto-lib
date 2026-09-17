@@ -85,7 +85,9 @@ from models.deepseek_v4_1_flash.quantization import (
     quantize_mxfp4_cache,
     unpack_mx_b_scale,
 )
-from models.deepseek_v4_1_flash.rope_tables import select_rope_rows
+from models.deepseek_v4_1_flash.rope_tables import (
+    ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables,
+)
 
 
 # Cache codec. Payloads are packed E2M1, two logical values per byte.
@@ -1323,6 +1325,18 @@ INPUT_NAMES = (
     "index_wk", "index_norm_weight", "index_wq_b", "index_wq_b_scale", "index_weights_proj",
 )
 
+FULL_ROPE_NAMES = {
+    "rope_cos": "freqs_cos", "rope_sin": "freqs_sin",
+    "compressed_rope_cos": "compressed_freqs_cos",
+    "compressed_rope_sin": "compressed_freqs_sin",
+}
+PROGRAM_INPUT_NAMES = tuple(
+    entry
+    for name in INPUT_NAMES
+    for entry in (("compressed_rope_positions", name) if name == "compressor_wkv"
+                  else (FULL_ROPE_NAMES.get(name, name),))
+)
+
 # "long" drives compressed_lens above INDEX_TOPK for part of the batch so the indexer must
 # score and select; the short requests in the same batch keep the -1 padding path live.
 _PREFIXES = {
@@ -1347,7 +1361,7 @@ def _plan(tokens, requests, case, mode):
     prefixes = [pattern[index % len(pattern)] for index in range(requests)]
     return lengths, prefixes
 
-def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode"):
+def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode", full_rope_tables=False):
     """Deterministic inputs for ``golden_decode_c2a_full``.
 
     case: "mixed" keeps contexts short so every causal position is selected, "long" pushes
@@ -1411,10 +1425,15 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode")
     published_slots = compressed_slots[compressed_slots >= 0]
     assert published_slots.unique().numel() == published_slots.numel()
 
-    rope_cos, rope_sin = select_rope_rows(positions, compressed_attention=False)
+    # Fixture initialization only: production callers retain these full tables.
+    table_rows = int(positions.max()) + 1
+    freqs_cos, freqs_sin = precompute_rope_tables(table_rows, compressed_attention=False)
+    compressed_freqs_cos, compressed_freqs_sin = precompute_rope_tables(table_rows, compressed_attention=True)
+    rope_cos, rope_sin = freqs_cos[positions], freqs_sin[positions]
     complete = (positions + 1).remainder(RATIO) == 0
     pair_start = torch.where(complete, positions + 1 - RATIO, torch.full_like(positions, -1))
-    compressed_rope_cos, compressed_rope_sin = select_rope_rows(pair_start, compressed_attention=True)
+    compressed_rope_cos = compressed_freqs_cos[pair_start.clamp_min(0)].masked_fill(~complete[:, None], 1.0)
+    compressed_rope_sin = compressed_freqs_sin[pair_start.clamp_min(0)].masked_fill(~complete[:, None], 0.0)
 
     wq_a, wq_a_scale = _weight(gen, C.D, C.Q_LORA)
     wq_b, wq_b_scale = _weight(gen, C.Q_LORA, C.LOCAL_H * C.HEAD_DIM)
@@ -1515,6 +1534,13 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode")
         f"window_pages={window_pages} compressed_pages={compressed_pages} "
         f"index_block_table={tuple(index_block_table.shape)}"
     )
+    if full_rope_tables:
+        values.update(
+            freqs_cos=freqs_cos, freqs_sin=freqs_sin,
+            compressed_freqs_cos=compressed_freqs_cos, compressed_freqs_sin=compressed_freqs_sin,
+            compressed_rope_positions=pair_start.to(torch.int32),
+        )
+        return {name: values[name] for name in PROGRAM_INPUT_NAMES}
     return {name: values[name] for name in INPUT_NAMES}
 
 
@@ -1557,7 +1583,14 @@ def make_golden(epochs):
         for base in range(0, world_size, TP_SIZE):
             partials = []
             for rank in range(base, base + TP_SIZE):
-                inputs = {name: tensors[name][rank] for name in INPUT_NAMES}
+                inputs = {name: tensors[name][rank] for name in INPUT_NAMES if name not in FULL_ROPE_NAMES}
+                for row_name, table_name in FULL_ROPE_NAMES.items():
+                    positions_name = "compressed_rope_positions" if row_name.startswith("compressed_") else "position_ids"
+                    positions = tensors[positions_name][rank].to(torch.long)
+                    identity = 1.0 if row_name.endswith("cos") else 0.0
+                    inputs[row_name] = tensors[table_name][rank][positions.clamp_min(0)].masked_fill(
+                        positions[:, None] < 0, identity
+                    )
                 for _ in range(epochs):
                     result = official_reference_c2a(inputs)
                     for name in MUTABLE_NAMES:
@@ -1746,8 +1779,8 @@ def make_program(operator, capacity, world_size, epochs):
         wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
         wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
         window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
         window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
@@ -1760,8 +1793,9 @@ def make_program(operator, capacity, world_size, epochs):
         index_cache_scale: pl.InOut[pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0]],
         index_block_table: pl.Tensor[[C.B_DYN, C.TABLE_DYN], pl.INT32],
         position_ids: pl.Tensor[[C.T_DYN], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_rope_positions: pl.Tensor[[C.T_DYN], pl.INT32],
         compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
         compressor_wgate: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
         query_start_loc: pl.Tensor[[C.Q_START_DYN], pl.INT32],
@@ -1783,6 +1817,7 @@ def make_program(operator, capacity, world_size, epochs):
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         """Run one rank of C2A attention, skipping idle work."""
+        freqs_cos.bind_dynamic(0, ROPE_ROWS_DYN)
         x.bind_dynamic(0, T_DYN)
         window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
         compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
@@ -1793,6 +1828,16 @@ def make_program(operator, capacity, world_size, epochs):
         state_block_table.bind_dynamic(0, C.B_DYN)
         state_cache.bind_dynamic(0, C.STATE_BLOCKS_DYN)
         if num_tokens > 0:
+            tokens = pl.tensor.dim(x, 0)
+            rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+            rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+            compressed_rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+            compressed_rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+            materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin)
+            materialize_rope_rows(
+                compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, num_tokens,
+                compressed_rope_cos, compressed_rope_sin,
+            )
             for step in pl.range(epochs):
                 operator(
                     x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
@@ -1826,8 +1871,8 @@ def make_program(operator, capacity, world_size, epochs):
         wo_a: pl.Tensor[[world_size, C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
         wo_b: pl.Tensor[[world_size, C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[world_size, C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0],
-        rope_cos: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_cos: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_sin: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
         window_slots: pl.Tensor[[world_size, C.T_DYN], pl.INT64],
         window_indices: pl.Tensor[[world_size, C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
@@ -1840,8 +1885,9 @@ def make_program(operator, capacity, world_size, epochs):
         index_cache_scale: pl.InOut[pl.Tensor[[world_size, C.INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0]],
         index_block_table: pl.Tensor[[world_size, C.B_DYN, C.TABLE_DYN], pl.INT32],
         position_ids: pl.Tensor[[world_size, C.T_DYN], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_cos: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_sin: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_rope_positions: pl.Tensor[[world_size, C.T_DYN], pl.INT32],
         compressor_wkv: pl.Tensor[[world_size, C.D, C.HEAD_DIM], pl.FP32],
         compressor_wgate: pl.Tensor[[world_size, C.D, C.HEAD_DIM], pl.FP32],
         query_start_loc: pl.Tensor[[world_size, C.Q_START_DYN], pl.INT32],
@@ -1860,6 +1906,7 @@ def make_program(operator, capacity, world_size, epochs):
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         """Dispatch C2A attention across TP groups with shared output windows."""
+        freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
         x.bind_dynamic(1, T_DYN)
         window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
         compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
@@ -1887,12 +1934,12 @@ def make_program(operator, capacity, world_size, epochs):
             c2a_rank(
                 x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
                 wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank],
-                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank],
-                rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
+                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale_r, freqs_cos[rank],
+                freqs_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
                 window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
                 token_to_req_indices[rank], compressed_lens[rank], index_cache[rank],
                 index_cache_scale[rank], index_block_table[rank], position_ids[rank],
-                compressed_rope_cos[rank], compressed_rope_sin[rank], compressor_wkv[rank],
+                compressed_freqs_cos[rank], compressed_freqs_sin[rank], compressed_rope_positions[rank], compressor_wkv[rank],
                 compressor_wgate[rank], query_start_loc[rank], state_block_table[rank], state_cache[rank],
                 compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
                 index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r,
@@ -1917,12 +1964,12 @@ def build_specs(args, mode):
                     requests=args.requests,
                     seed=args.seed + rank,
                     case=args.case,
-                    mode=mode,
+                    mode=mode, full_rope_tables=True,
                 )
             # Every rank of a TP group sees the same tokens, metadata and caches.
             for rank in range(world_size):
                 leader = ranks[rank // TP_SIZE * TP_SIZE]
-                for key in INPUT_NAMES:
+                for key in PROGRAM_INPUT_NAMES:
                     if key not in SHARDED_NAMES:
                         ranks[rank][key] = leader[key]
         column = [ranks[rank][name] for rank in range(world_size)]
@@ -1932,7 +1979,7 @@ def build_specs(args, mode):
         return torch.stack(column)
 
     shapes = make_c2a_inputs(
-        tokens=args.tokens, requests=args.requests, seed=args.seed, case=args.case, mode=mode
+        tokens=args.tokens, requests=args.requests, seed=args.seed, case=args.case, mode=mode, full_rope_tables=True
     )
     specs = [
         TensorSpec(
@@ -1942,7 +1989,7 @@ def build_specs(args, mode):
             init_value=(lambda name=name: initialize(name)),
             resident="stacked",
         )
-        for name in INPUT_NAMES
+        for name in PROGRAM_INPUT_NAMES
     ]
     specs.append(
         TensorSpec("topk_indices", [world_size, args.tokens, INDEX_TOPK], torch.int32, resident="stacked")

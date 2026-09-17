@@ -11,8 +11,9 @@
 import math
 
 import torch
+import pypto.language as pl
 
-from models.deepseek_v4_1_flash.config import FLASH, DeepSeekV41Config
+from models.deepseek_v4_1_flash.config import FLASH, ROPE_DIM, T_DYN, DeepSeekV41Config
 
 
 def precompute_rope_tables(
@@ -42,22 +43,39 @@ def precompute_rope_tables(
     return angles.cos(), angles.sin()
 
 
-def select_rope_rows(
-    position_ids: torch.Tensor,
-    compressed_attention: bool,
-    config: DeepSeekV41Config = FLASH,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize the RoPE rows needed by one packed forward invocation."""
-    if position_ids.numel() == 0:
-        shape = (*position_ids.shape, config.qk_rope_head_dim // 2)
-        empty = torch.empty(shape, dtype=torch.float32, device=position_ids.device)
-        return empty, empty.clone()
-    valid = position_ids >= 0
-    maximum = max(int(position_ids.clamp_min(0).max()) + 1, 1)
-    cos, sin = precompute_rope_tables(maximum, compressed_attention, config)
-    cos = cos.to(position_ids.device)
-    sin = sin.to(position_ids.device)
-    rows = position_ids.clamp_min(0).to(torch.long)
-    selected_cos = cos[rows].masked_fill(~valid.unsqueeze(-1), 1.0)
-    selected_sin = sin[rows].masked_fill(~valid.unsqueeze(-1), 0.0)
-    return selected_cos, selected_sin
+ROPE_ROWS_DYN = pl.dynamic("V41_ROPE_ROWS_DYN")
+
+
+@pl.jit.inline
+def materialize_rope_rows(
+    freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    rope_cos: pl.Out[pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32]],
+    rope_sin: pl.Out[pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32]],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Gather active token rows from serving-owned full tables inside the graph.
+
+    Tables are read-only FP32 half-width arrays for one RoPE profile. The caller
+    provides 0 <= num_tokens <= T and positions below table capacity. Negative
+    positions produce identity rotation for unpublished compressed tokens.
+    Padding rows are untouched. Return the producer TaskId for consumers that
+    use explicit dependencies, as the attention entries do with cache_ready.
+    """
+    # A fixed worker grid also supports idle ranks: never submit core_num=0.
+    with pl.spmd(32, name_hint="v41_rope_rows") as rope_ready:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens, 32):
+            position = pl.cast(pl.read(position_ids, [token]), pl.INDEX)
+            if position >= 0:
+                rope_cos[token : token + 1, :] = freqs_cos[position : position + 1, :]
+                rope_sin[token : token + 1, :] = freqs_sin[position : position + 1, :]
+            else:
+                rope_cos[token : token + 1, :] = pl.full(
+                    [1, ROPE_DIM // 2], dtype=pl.FP32, value=1.0
+                )
+                rope_sin[token : token + 1, :] = pl.full(
+                    [1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0
+                )
+    return rope_ready
