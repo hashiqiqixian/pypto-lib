@@ -64,7 +64,7 @@ def _make_cache_kernels():
         for block in pl.parallel((size + tile_bytes - 1) // tile_bytes):
             start = block * tile_bytes
             with pl.at(level=pl.Level.CORE_GROUP):
-                zeros = pl.full([1, tile_bytes], dtype=pl.UINT8, value=0)
+                zeros = pl.tile.full([1, tile_bytes], dtype=pl.UINT8, value=0)
                 zeros = pl.set_validshape(zeros, 1, pl.min(tile_bytes, size - start))
                 pool = pl.store(zeros, [0, start], pool)
 
