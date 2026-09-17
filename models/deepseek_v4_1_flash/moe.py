@@ -144,6 +144,7 @@ def make_routed_projection(width, output_width):
         output: pl.Tensor[[T_DYN, output_width], pl.BF16],
         num_tokens: pl.Scalar[pl.INT32],
     ):
+        active_rows = pl.cast(num_tokens, pl.INDEX)
         for block in pl.spmd(output_width // PROJECTION_TILE, name_hint="moe_routed_projection"):
             n0 = block * PROJECTION_TILE
             accumulator = pl.create_tile(
@@ -151,7 +152,7 @@ def make_routed_projection(width, output_width):
             )
             for kb in pl.range(width // K_TILE):
                 k0 = kb * K_TILE
-                source = pl.load(x, [0, k0], [EXPERT_TILE, K_TILE], valid_shape=[num_tokens, K_TILE])
+                source = pl.load(x, [0, k0], [EXPERT_TILE, K_TILE], valid_shape=[active_rows, K_TILE])
                 source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), EXPERT_TILE, K_TILE)
                 grouped = pl.reshape(pl.cast(source, pl.FP32), [EXPERT_TILE * (K_TILE // 32), 32])
                 reduce_tmp = pl.create_tile([EXPERT_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
@@ -204,7 +205,7 @@ def make_routed_projection(width, output_width):
                     accumulator, source_mat, pl.tile.transpose_view(weight_mat), init_cond=(kb == 0)
                 )
             output = pl.store(
-                pl.set_validshape(pl.cast(accumulator, pl.BF16, mode="rint"), num_tokens, PROJECTION_TILE),
+                pl.set_validshape(pl.cast(accumulator, pl.BF16, mode="rint"), active_rows, PROJECTION_TILE),
                 [0, n0], output,
             )
         return output
@@ -244,11 +245,12 @@ def route(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x, 0)
+    active_rows = pl.cast(num_tokens, pl.INDEX)
     scores = pl.create_tensor([tokens, N_EXPERTS], dtype=pl.FP32)
-    for block in pl.spmd((num_tokens + 15) // 16 * (N_EXPERTS // 32), name_hint="moe_gate"):
+    for block in pl.spmd((active_rows + 15) // 16 * (N_EXPERTS // 32), name_hint="moe_gate"):
         token = block // (N_EXPERTS // 32) * 16
         column = block % (N_EXPERTS // 32) * 32
-        rows = pl.min(16, num_tokens - token)
+        rows = pl.min(16, active_rows - token)
         logits = pl.create_tile([16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
         for kb in pl.range(D // K_TILE):
             source = pl.load(x, [token, kb * K_TILE], [16, K_TILE], valid_shape=[rows, K_TILE])
@@ -263,8 +265,8 @@ def route(
         softplus = pl.maximum(softplus, pl.exp(pl.minimum(logits, -20.0)))
         scores = pl.store(pl.set_validshape(pl.sqrt(softplus), rows, 32), [token, column], scores)
     # Eight six-index rows occupy three complete 64-byte scalar-store lines.
-    for block in pl.spmd((num_tokens + 7) // 8, name_hint="moe_topk"):
-        for token in pl.range(block * 8, pl.min((block + 1) * 8, num_tokens)):
+    for block in pl.spmd((active_rows + 7) // 8, name_hint="moe_topk"):
+        for token in pl.range(block * 8, pl.min((block + 1) * 8, active_rows)):
             row = scores[token:token + 1, :]
             bias = pl.reshape(correction_bias[:], [1, N_EXPERTS])
             expert_ids = pl.arange(0, [1, N_EXPERTS], dtype=pl.UINT32)
@@ -356,7 +358,7 @@ def moe(
     of these windows, including calls with zero active rows.
     """
     tokens = pl.tensor.dim(x, 0)
-    active = pl.max(0, pl.min(num_tokens, tokens))
+    active = pl.max(0, pl.min(pl.cast(num_tokens, pl.INDEX), tokens))
     route_rows = tokens * TOPK
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     x_quant = pl.create_tensor([tokens, D], dtype=pl.FP8E4M3FN)

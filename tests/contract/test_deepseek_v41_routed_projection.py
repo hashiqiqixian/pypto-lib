@@ -45,7 +45,7 @@ def _case():
     return x, packed, scale, expected
 
 
-def _entry(active):
+def _entry():
     import pypto.language as pl
 
     from models.deepseek_v4_1_flash.moe import make_routed_projection
@@ -58,15 +58,16 @@ def _entry(active):
         weight: pl.Tensor[[64, 256], pl.UINT8],
         scale: pl.Tensor[[64, 16], pl.FP8E8M0],
         output: pl.InOut[pl.Tensor[[32, 64], pl.BF16]],
+        num_tokens: pl.Scalar[pl.INT32],
     ):
-        output = project(x, weight, scale, output, active)
+        output = project(x, weight, scale, output, num_tokens)
         return output
 
     return entry
 
 
 def _run(*, compile_only, active):
-    from golden import TensorSpec, run
+    from golden import ScalarSpec, TensorSpec, run
 
     x, packed, scale, expected = _case()
     expected[active:] = 13.0
@@ -75,12 +76,13 @@ def _run(*, compile_only, active):
         values["output"].copy_(expected)
 
     result = run(
-        fn=_entry(active),
+        fn=_entry(),
         specs=[
             TensorSpec("x", list(x.shape), x.dtype, init_value=x),
             TensorSpec("weight", list(packed.shape), packed.dtype, init_value=packed),
             TensorSpec("scale", list(scale.shape), scale.dtype, init_value=scale),
             TensorSpec("output", list(expected.shape), expected.dtype, init_value=13.0),
+            ScalarSpec("num_tokens", torch.int32, active),
         ],
         golden_fn=reference,
         compile_only=compile_only,
