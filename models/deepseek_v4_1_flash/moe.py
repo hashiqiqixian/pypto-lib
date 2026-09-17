@@ -126,6 +126,10 @@ def make_routed_projection(width, output_width):
         output: pl.Tensor[[C.T_DYN, output_width], pl.BF16],
         num_tokens: pl.Scalar[pl.INT32],
     ):
+        # Keep this view at the leaf: the JIT infers call-site metadata for
+        # packed carriers but does not propagate reinterpret_view aliases.
+        # An already-logical FP4 input has the same shape and byte extent.
+        logical_weight = pl.reinterpret_view(weight, pl.FP4, shape=[output_width, width])
         for block in pl.spmd(output_width // PROJECTION_TILE, name_hint="moe_routed_projection"):
             n0 = block * PROJECTION_TILE
             accumulator = pl.create_tensor([EXPERT_TILE, PROJECTION_TILE], dtype=pl.FP32)
@@ -142,7 +146,7 @@ def make_routed_projection(width, output_width):
                 source_fp32 = pl.reshape(
                     pl.row_expand_mul(pl.cast(quantized, pl.FP32), factor), [EXPERT_TILE, K_TILE]
                 )
-                payload = pl.load(weight, [n0, k0], [PROJECTION_TILE, K_TILE])
+                payload = pl.load(logical_weight, [n0, k0], [PROJECTION_TILE, K_TILE])
                 # A5 TCVT supports FP4 -> BF16 directly; all E2M1 values are exact.
                 values = pl.cast(pl.cast(payload, pl.BF16), pl.FP32)
                 scale_tile = pl.load(scale, [n0, k0 // 32], [PROJECTION_TILE, K_TILE // 32])
@@ -503,14 +507,11 @@ def make_program(epochs=2):
         rank: pl.Scalar[pl.INT32],
     ):
         x.bind_dynamic(0, C.T_DYN)
-        w1 = pl.reinterpret_view(routed_w1, pl.FP4, shape=[C.N_LOCAL_EXPERTS, C.MOE_INTER, C.D])
-        w2 = pl.reinterpret_view(routed_w2, pl.FP4, shape=[C.N_LOCAL_EXPERTS, C.D, C.MOE_INTER])
-        w3 = pl.reinterpret_view(routed_w3, pl.FP4, shape=[C.N_LOCAL_EXPERTS, C.MOE_INTER, C.D])
         current = x
         for epoch in pl.range(epochs):
             output = moe(
                 current, norm_weight, gate_weight, correction_bias,
-                w1, routed_w1_scale, w2, routed_w2_scale, w3, routed_w3_scale,
+                routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
                 shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
                 token_owners, recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
                 routed_output, combine_arrived, output, num_tokens, rank, 0, rank % C.TP_SIZE, epoch + 1,
