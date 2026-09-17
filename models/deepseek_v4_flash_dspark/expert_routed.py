@@ -27,7 +27,7 @@ SWIGLU_LIMIT = M.swiglu_limit
 N_LOCAL_EXPERTS = M.n_routed_experts // EP
 
 # tiling
-RECV_TILE = 64
+RECV_TILE = 128
 K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 256
