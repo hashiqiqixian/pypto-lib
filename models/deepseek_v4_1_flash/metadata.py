@@ -60,6 +60,12 @@ def paged_slots(
     publish_only_complete: bool = False,
 ) -> torch.Tensor:
     """Map logical token positions to flattened physical cache rows."""
+    if positions.ndim != 1 or request_ids.shape != positions.shape or block_table.ndim != 2:
+        raise ValueError("positions/request_ids must be matching vectors and block_table must be a matrix")
+    if storage_block_size <= 0 or logical_divisor <= 0:
+        raise ValueError("storage_block_size and logical_divisor must be positive")
+    if any(value.dtype not in (torch.int32, torch.int64) for value in (positions, request_ids, block_table)):
+        raise ValueError("positions, request_ids and block_table must contain integer indices")
     publish = torch.ones_like(positions, dtype=torch.bool)
     if publish_only_complete and logical_divisor > 1:
         publish = (positions + 1).remainder(logical_divisor) == 0
@@ -67,7 +73,14 @@ def paged_slots(
     logical = torch.div(positions[publish], logical_divisor, rounding_mode="floor")
     logical_block = torch.div(logical, storage_block_size, rounding_mode="floor")
     offset = logical.remainder(storage_block_size)
+    active_requests = request_ids[publish]
+    if bool(((active_requests < 0) | (active_requests >= block_table.shape[0])).any()):
+        raise ValueError("published request id is outside the block table")
+    if bool(((logical_block < 0) | (logical_block >= block_table.shape[1])).any()):
+        raise ValueError("block table does not cover a required logical page")
     physical = block_table[request_ids[publish].to(torch.long), logical_block.to(torch.long)]
+    if bool((physical < 0).any()):
+        raise ValueError("required logical page has no physical allocation")
     slots[publish] = physical.to(torch.int64) * storage_block_size + offset.to(torch.int64)
     return slots
 
@@ -114,11 +127,10 @@ def window_metadata(
     starts = positions - lens.to(positions.dtype) + 1
     visible = starts.unsqueeze(-1) + offsets
     valid = offsets.unsqueeze(0) < lens.unsqueeze(-1)
-    logical_block = torch.div(visible.clamp_min(0), BLOCK_SIZE, rounding_mode="floor")
-    block_offset = visible.clamp_min(0).remainder(BLOCK_SIZE)
-    physical = block_table[request_ids.to(torch.long).unsqueeze(-1), logical_block.to(torch.long)]
-    indices = physical.to(torch.int64) * BLOCK_SIZE + block_offset.to(torch.int64)
-    return slots, indices.masked_fill(~valid, -1).to(torch.int32), lens
+    indices = torch.full_like(visible, -1, dtype=torch.int64)
+    visible_requests = request_ids.unsqueeze(-1).expand_as(visible)
+    indices[valid] = paged_slots(visible[valid], visible_requests[valid], block_table)
+    return slots, indices.to(torch.int32), lens
 
 
 def build_forward_metadata(
@@ -166,6 +178,17 @@ def build_forward_metadata(
     for source in FLASH.kv_source_layer_ids:
         ratio = FLASH.compress_ratios[source]
         storage_rows = BLOCK_SIZE
+        table = compressed_block_tables[source]
+        if table.ndim != 2 or table.shape[0] != query_lens.numel():
+            raise ValueError("compressed block tables must have one row per request")
+        # Sparse attention can read the entire compressed history of an active request.
+        for request in range(query_lens.numel()):
+            if int(query_lens[request]) == 0:
+                continue
+            visible_rows = int(new_kv_seq_lens[request]) // ratio
+            pages = (visible_rows + storage_rows - 1) // storage_rows
+            if pages > table.shape[1] or bool((table[request, :pages] < 0).any()):
+                raise ValueError(f"source layer {source} has missing visible compressed pages")
         compressed_slots[source] = paged_slots(
             positions, request_ids, compressed_block_tables[source], storage_rows, ratio, True
         )
