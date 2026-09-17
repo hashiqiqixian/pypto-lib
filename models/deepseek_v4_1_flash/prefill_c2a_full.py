@@ -60,6 +60,8 @@ from models.deepseek_v4_1_flash.decode_c2a_full import (
     IDX_PACKED,
     IDX_SCALES,
     INPUT_NAMES,
+    FULL_ROPE_NAMES,
+    PROGRAM_INPUT_NAMES,
     MUTABLE_NAMES,
     SHARDED_NAMES,
     compare_cache,
@@ -83,6 +85,7 @@ from models.deepseek_v4_1_flash.hc_mixes import mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 from models.deepseek_v4_1_flash.hc_pre import mhc_pre
 from models.deepseek_v4_1_flash.prefill_attn_c2a_full import prefill_attn_c2a_full
+from models.deepseek_v4_1_flash.rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 
 
 NORM_EPS = FLASH.rms_norm_eps
@@ -166,8 +169,8 @@ def prefill_c2a_full(
     wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+    freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
@@ -184,8 +187,9 @@ def prefill_c2a_full(
     ],
     index_block_table: pl.Tensor[[C.B_DYN, C.TABLE_DYN], pl.INT32],
     position_ids: pl.Tensor[[C.T_DYN], pl.INT32],
-    compressed_rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-    compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    compressed_freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+    compressed_freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+    compressed_rope_positions: pl.Tensor[[C.T_DYN], pl.INT32],
     compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
     compressor_wgate: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
     compressor_state_rows: pl.Tensor[[C.T_DYN], pl.INT64],
@@ -216,6 +220,15 @@ def prefill_c2a_full(
     caller workspace, exposed so each stage can be checked. Outputs must not alias inputs.
     """
     tokens = pl.tensor.dim(x_hc, 0)
+    rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+    rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+    compressed_rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+    compressed_rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin)
+    materialize_rope_rows(
+        compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, num_tokens,
+        compressed_rope_cos, compressed_rope_sin,
+    )
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     attention_hc_pre(
@@ -277,7 +290,8 @@ def make_hc_inputs(tokens, seed, case):
 def make_attention_inputs(mode, tokens, requests, seed, case):
     """Attention fixture of the chained mode, without ``x``: the chain derives it from x_hc."""
     make = make_c2a_inputs if mode == "full" else make_c2a_reuse_inputs
-    values = make(tokens=tokens, requests=requests, seed=seed, case=case, mode="prefill")
+    options = {"full_rope_tables": True} if mode == "full" else {}
+    values = make(tokens=tokens, requests=requests, seed=seed, case=case, mode="prefill", **options)
     return {name: value for name, value in values.items() if name != "x"}
 
 
@@ -286,7 +300,18 @@ def reference_attention(mode, epochs, tensors, x, ranks):
     names, mutable_names, _, reference = MODES[mode]
     partials, results = [], []
     for rank in ranks:
-        inputs = {name: x if name == "x" else tensors[name][rank] for name in names}
+        inputs = {
+            name: x if name == "x" else tensors[name][rank]
+            for name in names if mode != "full" or name not in FULL_ROPE_NAMES
+        }
+        if mode == "full":
+            for row_name, table_name in FULL_ROPE_NAMES.items():
+                positions_name = "compressed_rope_positions" if row_name.startswith("compressed_") else "position_ids"
+                positions = tensors[positions_name][rank].to(torch.long)
+                identity = 1.0 if row_name.endswith("cos") else 0.0
+                inputs[row_name] = tensors[table_name][rank][positions.clamp_min(0)].masked_fill(
+                    positions[:, None] < 0, identity
+                )
         for _ in range(epochs):
             result = reference(inputs)
             for name in mutable_names:
@@ -480,8 +505,8 @@ def make_hc_program(capacity, world_size, epochs):
         wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
         wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
         window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
         window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
@@ -496,8 +521,9 @@ def make_hc_program(capacity, world_size, epochs):
         index_cache_scale: pl.InOut[pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0]],
         index_block_table: pl.Tensor[[C.B_DYN, C.TABLE_DYN], pl.INT32],
         position_ids: pl.Tensor[[C.T_DYN], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_rope_positions: pl.Tensor[[C.T_DYN], pl.INT32],
         compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
         compressor_wgate: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
         compressor_state_rows: pl.Tensor[[C.T_DYN], pl.INT64],
@@ -521,6 +547,7 @@ def make_hc_program(capacity, world_size, epochs):
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         """Bind the runtime shapes and run the sublayer once per epoch on one rank."""
+        freqs_cos.bind_dynamic(0, ROPE_ROWS_DYN)
         x_hc.bind_dynamic(0, T_DYN)
         window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
         compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
@@ -531,11 +558,11 @@ def make_hc_program(capacity, world_size, epochs):
             prefill_c2a_full(
                 x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
                 wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-                kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+                kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, freqs_cos, freqs_sin,
                 window_slots, window_indices, window_cache, window_cache_scale,
                 compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
                 index_cache, index_cache_scale, index_block_table, position_ids,
-                compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
+                compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, compressor_wkv, compressor_wgate,
                 compressor_state_rows, compressor_state, compressor_norm_weight,
                 compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
                 index_weights_proj, topk_indices, output_window, output_arrived, attn_input,
@@ -567,8 +594,8 @@ def make_hc_program(capacity, world_size, epochs):
         wo_a: pl.Tensor[[world_size, C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
         wo_b: pl.Tensor[[world_size, C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[world_size, C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0],
-        rope_cos: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_cos: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_sin: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
         window_slots: pl.Tensor[[world_size, C.T_DYN], pl.INT64],
         window_indices: pl.Tensor[[world_size, C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
@@ -585,8 +612,9 @@ def make_hc_program(capacity, world_size, epochs):
         index_cache_scale: pl.InOut[pl.Tensor[[world_size, C.INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0]],
         index_block_table: pl.Tensor[[world_size, C.B_DYN, C.TABLE_DYN], pl.INT32],
         position_ids: pl.Tensor[[world_size, C.T_DYN], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_cos: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_sin: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_rope_positions: pl.Tensor[[world_size, C.T_DYN], pl.INT32],
         compressor_wkv: pl.Tensor[[world_size, C.D, C.HEAD_DIM], pl.FP32],
         compressor_wgate: pl.Tensor[[world_size, C.D, C.HEAD_DIM], pl.FP32],
         compressor_state_rows: pl.Tensor[[world_size, C.T_DYN], pl.INT64],
@@ -609,6 +637,7 @@ def make_hc_program(capacity, world_size, epochs):
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         """Allocate the TP communication windows and launch one rank entry per device."""
+        freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
         x_hc.bind_dynamic(1, T_DYN)
         window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
         compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
@@ -624,12 +653,13 @@ def make_hc_program(capacity, world_size, epochs):
                 x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
                 attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank],
                 wq_b_scale[rank], wkv[rank], wkv_scale[rank], kv_norm_weight[rank],
-                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank], rope_cos[rank],
-                rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
+                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank], freqs_cos[rank],
+                freqs_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
                 window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
                 request_ids[rank], compressed_lens[rank], index_cache[rank],
                 index_cache_scale[rank], index_block_table[rank], position_ids[rank],
-                compressed_rope_cos[rank], compressed_rope_sin[rank], compressor_wkv[rank],
+                compressed_freqs_cos[rank], compressed_freqs_sin[rank], compressed_rope_positions[rank],
+                compressor_wkv[rank],
                 compressor_wgate[rank], compressor_state_rows[rank], compressor_state[rank],
                 compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
                 index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale[rank],
@@ -649,7 +679,8 @@ def build_specs(args, mode, initial_state):
     """
     world_size = TP_SIZE * args.dp
     names, mutable_names, sharded_names, _ = MODES[mode]
-    attention_names = tuple(name for name in names if name != "x")
+    program_names = PROGRAM_INPUT_NAMES if mode == "full" else names
+    attention_names = tuple(name for name in program_names if name != "x")
     ranks = {}
 
     def initialize(name):
