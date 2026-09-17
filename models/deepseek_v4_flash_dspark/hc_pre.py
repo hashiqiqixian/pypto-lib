@@ -115,7 +115,7 @@ def hc_pre_gates(
         valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
         # Each consumer reduces its partials in ascending K order.
         post_mixes = mixes_partials[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD]
-        for linear_split in pl.range(1, LINEAR_OK):
+        for linear_split in pl.unroll(1, LINEAR_OK):
             partial_t0 = linear_split * t_linear + t0
             post_mixes = pl.add(post_mixes, mixes_partials[partial_t0:partial_t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD])
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
@@ -139,7 +139,7 @@ def hc_pre_gates(
         mix_g1 = pl.load(mixes_partials, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
         mix_g2 = pl.load(mixes_partials, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
         mix_g3 = pl.load(mixes_partials, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        for linear_split in pl.range(1, LINEAR_OK):
+        for linear_split in pl.unroll(1, LINEAR_OK):
             partial_t0 = linear_split * t_linear + t0
             partial_g0 = pl.load(mixes_partials, [partial_t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
             mix_g0 = pl.add(mix_g0, partial_g0)
