@@ -23,7 +23,7 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     query_lens: torch.Tensor
     logit_row_indices: torch.Tensor
-    request_ids: torch.Tensor
+    token_to_req_indices: torch.Tensor
     moe_token_owners: torch.Tensor
     position_ids: torch.Tensor
     kv_seq_lens: torch.Tensor
@@ -33,7 +33,7 @@ class ForwardMetadata:
     window_lens: torch.Tensor
     compressed_slots: Mapping[int, torch.Tensor]
     index_slots: Mapping[int, torch.Tensor]
-    compressor_state_rows: Mapping[int, torch.Tensor]
+    state_block_tables: Mapping[int, torch.Tensor]
     compressed_seq_lens: Mapping[int, torch.Tensor]
     compressed_seq_remainders: Mapping[int, torch.Tensor]
     compressed_lens: Mapping[int, torch.Tensor]
@@ -138,8 +138,16 @@ def build_forward_metadata(
     kv_seq_lens: torch.Tensor,
     window_block_table: torch.Tensor,
     compressed_block_tables: Mapping[int, torch.Tensor],
+    *,
+    state_block_tables: Mapping[int, torch.Tensor] | None = None,
 ) -> ForwardMetadata:
-    """Lower engine inputs for packed prefill or one-token-per-request decode."""
+    """Lower packed queries using engine-owned compressor ring block tables.
+
+    Each state_block_tables[source] is INT32 [B, 1], separate from KV pages.
+    Reorder tables with requests without moving persistent state. Active requests
+    need unique allocated blocks; inactive requests may use -1. The engine owns
+    block capacity, allocation, reset and matching prefix-state restoration.
+    """
     if query_start_loc.ndim != 1 or kv_seq_lens.ndim != 1:
         raise ValueError("query_start_loc and kv_seq_lens must be one-dimensional")
     if query_start_loc.numel() != kv_seq_lens.numel() + 1:
@@ -165,7 +173,7 @@ def build_forward_metadata(
     window_slots, window_indices, window_lens = window_metadata(positions, request_ids, window_block_table)
     compressed_slots: dict[int, torch.Tensor] = {}
     index_slots: dict[int, torch.Tensor] = {}
-    state_rows: dict[int, torch.Tensor] = {}
+    state_tables: dict[int, torch.Tensor] = {}
     compressed_seq_lens: dict[int, torch.Tensor] = {}
     compressed_seq_remainders: dict[int, torch.Tensor] = {}
     compressed_lens: dict[int, torch.Tensor] = {}
@@ -206,12 +214,29 @@ def build_forward_metadata(
         complete = (positions + 1).remainder(ratio) == 0
         compressed_rope_positions[source] = torch.where(complete, positions + 1 - ratio, -1).to(torch.int32)
         if ratio > 1:
-            state_rows[source] = request_ids.to(torch.int64)
+            if state_block_tables is None or source not in state_block_tables:
+                if request_ids.numel() == 0:
+                    state_tables[source] = torch.full(
+                        (query_lens.numel(), 1), -1, dtype=torch.int32, device=query_start_loc.device
+                    )
+                    continue
+                raise ValueError(f"source layer {source} requires an engine-owned state block table")
+            blocks = state_block_tables[source]
+            if blocks.shape != (query_lens.numel(), 1) or blocks.dtype != torch.int32:
+                raise ValueError("state block tables must be INT32 [B, 1]")
+            if blocks.device != request_ids.device:
+                raise ValueError("state block tables must be on the metadata device")
+            if bool((blocks < -1).any()) or bool((blocks[query_lens > 0] < 0).any()):
+                raise ValueError("active requests need allocated state blocks; inactive blocks may be -1")
+            owned = blocks[blocks >= 0]
+            if owned.unique().numel() != owned.numel():
+                raise ValueError("active and paused requests must own distinct state blocks")
+            state_tables[source] = blocks
     return ForwardMetadata(
         query_start_loc=query_start_loc.to(torch.int32),
         query_lens=query_lens.to(torch.int32),
         logit_row_indices=logit_rows,
-        request_ids=request_ids,
+        token_to_req_indices=request_ids,
         moe_token_owners=torch.arange(
             request_ids.numel(), device=request_ids.device, dtype=torch.int32
         ).remainder(TP_SIZE),
@@ -223,7 +248,7 @@ def build_forward_metadata(
         window_lens=window_lens,
         compressed_slots=compressed_slots,
         index_slots=index_slots,
-        compressor_state_rows=state_rows,
+        state_block_tables=state_tables,
         compressed_seq_lens=compressed_seq_lens,
         compressed_seq_remainders=compressed_seq_remainders,
         compressed_lens=compressed_lens,

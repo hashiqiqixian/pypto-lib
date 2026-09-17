@@ -108,28 +108,39 @@ def compressor_ratio2(
 def compressor_ratio2_paged(
     x: torch.Tensor,
     position_ids: torch.Tensor,
-    state_rows: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    state_block_table: torch.Tensor,
     state_cache: torch.Tensor,
     wkv: torch.Tensor,
     wgate: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate ratio-2 compression against request-scoped two-head state."""
+    """Sequential ratio-2 reference with request-owned circular state blocks."""
     kv = torch.matmul(x.float(), wkv.float())
     score = torch.matmul(x.float(), wgate.float())
     latent = torch.zeros_like(kv, dtype=x.dtype)
     publish = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
-    for token in range(x.shape[0]):
-        row = int(state_rows[token])
-        if int(position_ids[token]) % 2 == 0:
-            state_cache[row, 0] = kv[token]
-            state_cache[row, 1] = score[token]
-        else:
-            pair_kv = torch.stack((state_cache[row, 0], kv[token]))
-            pair_score = torch.stack((state_cache[row, 1], score[token]))
+    capacity = state_cache.shape[1]
+    head_dim = kv.shape[-1]
+    for token in range(int(query_start_loc[-1])):
+        request = int(token_to_req_indices[token])
+        if not 0 <= request < state_block_table.shape[0]:
+            continue
+        begin, end = int(query_start_loc[request]), int(query_start_loc[request + 1])
+        position = int(position_ids[token])
+        block = int(state_block_table[request, 0])
+        if not (begin <= token < end and position >= 0 and 0 <= block < state_cache.shape[0]):
+            continue
+        if position % 2:
+            previous = state_cache[block, (position - 1) % capacity]
+            pair_kv = torch.stack((previous[:head_dim], kv[token]))
+            pair_score = torch.stack((previous[head_dim:], score[token]))
             pooled = (pair_kv * pair_score.softmax(dim=0)).sum(dim=0)
             latent[token] = rms_norm(pooled.to(x.dtype), norm_weight)
             publish[token] = True
+        state_cache[block, position % capacity, :head_dim] = kv[token]
+        state_cache[block, position % capacity, head_dim:] = score[token]
     return latent, publish
 
 

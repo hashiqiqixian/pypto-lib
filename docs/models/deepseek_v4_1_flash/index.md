@@ -88,13 +88,13 @@ quantized in HBM:
   owned by layer 20.
 - Index-key payload: logical `[blocks, 128, 1, 128]`, packed MXFP4 E2M1, with
   `[blocks, 128, 1, 4]` E8M0 group-of-32 scales.
-- Ratio-2 recurrent state: `[32, 2, 512]`, FP32 and request-scoped. Head zero
-  stores one pending KV row and head one stores its gate scores. Ratio 1 has no
-  recurrent compressor state.
+- Ratio-2 recurrent state: `[num_state_blocks, capacity, 1024]`, FP32. Each
+  ring row concatenates a 512-element KV projection and its gate scores.
+  Ratio 1 has no recurrent compressor state.
 
 Compressed KV and index-key tensors for a source share the same
-`c{ratio}a_cmp_kv` block table. Recurrent state is indexed by the DP-local
-request row and does not grow with context length. Torch goldens quantize on
+`c{ratio}a_cmp_kv` block table. Recurrent state uses a separate engine-owned
+block table and bounded ring capacity independent of context length. Torch goldens quantize on
 cache publication and dequantize on cache reads; BF16 cache values are only an
 intermediate reference representation, not the kernel ABI.
 Indexer workspaces store physical flattened cache-row ids, padded with `-1`,
@@ -107,6 +107,74 @@ previous/new KV lengths, cache slot mappings, sliding-window indices,
 per-token causal compressed lengths, per-request compressed lengths and
 remainders, ragged compressor output starts, source-token rows, and compressed
 RoPE positions. The same lowering serves prefill and continuous-batch decode.
+
+For active ratio-2 requests, `build_forward_metadata` requires the keyword
+`state_block_tables`: one INT32 `[B, 1]` table per ratio-2 source. The engine
+allocates physical state blocks and reorders table rows with the batch; block
+IDs never derive implicitly from batch row numbers. Tables are independent of
+compressed/index KV page tables. Allocated blocks, including paused requests,
+must be distinct within a source pool; inactive requests may use `-1`.
+
+The C2A prefill and decode state ABI is:
+
+- `query_start_loc`: INT32 `[B + 1]`, cumulative active query lengths, beginning
+  at zero and ending at `num_tokens` (which may be smaller than token capacity).
+- `position_ids`: INT32 `[T]`, consecutive absolute positions within each request.
+- `token_to_req_indices`: INT32 `[T]`, packed batch-row IDs consistent with the
+  query boundaries, not business request IDs.
+- `state_block_table`: INT32 `[B, 1]`, that source's engine-owned block IDs.
+- `state_cache`: FP32 `[num_state_blocks, capacity, 2 * head_dim]`, with positive
+  ring capacity and concatenated KV/gate projections in each row.
+
+The kernel computes `block * capacity + position % capacity`. At an odd chunk
+start it reads `(position - 1) % capacity`; pairs inside the current chunk use
+projection scratch. Historical reads finish before ring writes. Only the last
+writer of each ring location publishes, so chunks longer than capacity cannot
+race on aliased positions. All token positions, including odd positions, are
+retained in the ring tail. No per-token state slot mapping is passed.
+
+Only `num_tokens` rows are processed. Empty requests have equal adjacent query
+boundaries. Negative or out-of-pool block IDs perform no state reads/writes;
+the metadata builder rejects unallocated blocks for active requests. Engines
+must validate block IDs against their actual pool size before dispatch. Zero
+active rows perform no compressor-state work. The engine must also isolate
+requests omitted from the current batch and serialize concurrent calls using
+the same block.
+
+`compressor_state.CompressorStateCache` is an optional Torch-backed allocator.
+Create one instance per TP rank. Its source pools share block numbering, while
+each source has separate storage. Engines with their own allocator may supply
+independent per-source tables directly.
+
+```python
+from models.deepseek_v4_1_flash.compressor_state import CompressorStateCache
+from models.deepseek_v4_1_flash.metadata import build_forward_metadata
+
+state = CompressorStateCache(num_blocks=32, capacity=8, device=query_start_loc.device)
+request_keys = [("request-a", 0), ("request-b", 0)]
+for key in request_keys:
+    state.allocate(key)
+metadata = build_forward_metadata(
+    query_start_loc, kv_seq_lens, window_block_table, compressed_block_tables,
+    state_block_tables=state.block_tables(request_keys),
+)
+# For each source pass metadata.query_start_loc, metadata.position_ids,
+# metadata.token_to_req_indices, metadata.state_block_tables[source], and
+# state.buffers[source] to C2A. Keep the buffers across prefill/decode calls.
+saved = state.snapshot(request_keys[0], prefix_length=committed_length)
+state.release(request_keys[0])
+state.allocate(("request-a", 1), prefix_length=saved.prefix_length, snapshot=saved)
+```
+
+Use request keys including their generation. Snapshot/release must wait for
+all source kernels and outstanding readers. Snapshots copy whole ring blocks;
+restore requires matching capacity, model/rank identity and KV prefix. An odd
+prefix requires its predecessor state to be restored or recomputed; the helper
+rejects an odd-prefix allocation without a snapshot. An even prefix may start
+with a cleared ring for ordinary sequential inference. The caller supplies
+the committed prefix length; snapshots cannot be relabeled as older prefixes.
+Ring storage alone does not implement speculative acceptance/rejection or
+rollback. Allocation, KV prefix restoration and scheduling remain engine-owned.
 
 The target deployment is one eight-card A5 node with TP4 attention, two DP
 groups, and EP8 routed experts. TP1/2/4/8 and compatible EP2/4/8 shapes remain
