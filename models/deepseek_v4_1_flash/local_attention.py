@@ -37,7 +37,9 @@ def load_kernel_configuration(tp_size=1, ep_size=2):
 
 
 def load_local_attention_kernels(tp_size=1, ep_size=2):
-    """Return A5 L2 entries; reject incompatible configurations in one process."""
+    """Return A5 TP1/2/4 L2 entries; reject unsupported shapes before imports."""
+    if type(tp_size) is not int or tp_size not in (1, 2, 4):
+        raise ValueError("local V4.1 attention requires TP1, TP2, or TP4; TP8 needs C1A head-tile padding")
     with _LOAD_LOCK:
         load_kernel_configuration(tp_size, ep_size)
         # JIT caches retain artifact paths. Give each provider its own entries

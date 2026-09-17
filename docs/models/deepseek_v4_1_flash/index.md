@@ -39,8 +39,8 @@ Each attention mode and execution phase has one ownership file. SWA, C2A
 Full/Reuse, C1A Full/Reindex/Reuse, the hierarchical indexer, mHC, and TP output
 reduction have native kernel bodies. C1A prefill and decode share the same
 ratio-1 computation through factories, with separate stage window capacities
-and TP reducers. The EP-MoE body and complete model integration remain separate
-workstreams.
+and TP reducers. EP-MoE has a native dispatch/expert/combine implementation;
+complete multi-card validation and model integration remain pending.
 
 The C1A decode scripts compile and execute native A5 kernels against Torch
 goldens. They do not default to CPU-only reference execution. Select the
@@ -63,7 +63,8 @@ query token per request. The commands exit nonzero on validation failure.
 The shared native C1A kernels currently support A5 with TP1, TP2, or TP4.
 TP8 requires head-tile padding; A3 support for this native MX path has not been
 established. The broader configuration's accepted TP sizes do not imply that
-every individual kernel supports them.
+every individual kernel supports them. The host-owned `load_local_attention_kernels`
+entry rejects TP8 before importing shape-specialized kernels.
 
 | Workstream | Files |
 | --- | --- |
@@ -153,9 +154,11 @@ follow-up work.
 
 Query/output low-rank projections and shared experts use MXFP8 payloads.
 Routed expert weights remain output-major packed MXFP4 with E8M0 group-of-32
-scales in HBM. The planned kernel loads one FP4 tile, casts that tile to FP8 in
-on-chip memory, and uses the supported MXFP8 Cube path with dynamically
-quantized activations; it does not expand the complete expert tensor.
+scales in HBM. The routed projection decodes bounded FP4 weight tiles and
+quantized activation tiles into BF16 operands, accumulates Cube products in
+FP32, and rounds the output to BF16. It does not expand the complete expert
+tensor. Shared-expert projections use the MXFP8 path. These implementation
+choices still require full multi-card numerical validation.
 
 At the maximum 1,048,576-token context, the low-bit attention cache is about
 0.94 GB per request per card, compared with about 3.37 GB for BF16. At 32
@@ -173,9 +176,10 @@ The implementation milestones are ordered by dependency:
 1. Validate the implemented attention TP all-reduce, mHC, and SWA at deployment shapes.
 2. Validate C2A Full-to-Reuse cache and Top-K replay.
 3. Validate C1A prefill/decode Full, candidate selection, Reindex, and Reuse with shared cache state.
-4. Implement the three-phase EP-MoE dispatch/local-expert/combine body.
+4. Validate the implemented three-phase EP-MoE dispatch/local-expert/combine body.
 5. Compose the operators into the 40-layer prefill/decode token loop.
 
-The available attention kernels do not constitute a runnable model. A native
-checkpoint adapter, EP-MoE body, and complete token loop are still required;
-this directory is not yet connected to the `pypto-serving` V4.1 backend.
+The available kernels do not constitute a runnable model. A complete native
+token loop and multi-card acceptance evidence are still required. The serving
+development branch has an opt-in A5 TP1 adapter for the local attention entries;
+this is not a complete native eight-card model integration.
