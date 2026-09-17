@@ -60,13 +60,15 @@ def paged_slots(
     publish_only_complete: bool = False,
 ) -> torch.Tensor:
     """Map logical token positions to flattened physical cache rows."""
-    logical = torch.div(positions, logical_divisor, rounding_mode="floor")
+    publish = torch.ones_like(positions, dtype=torch.bool)
+    if publish_only_complete and logical_divisor > 1:
+        publish = (positions + 1).remainder(logical_divisor) == 0
+    slots = torch.full_like(positions, -1, dtype=torch.int64)
+    logical = torch.div(positions[publish], logical_divisor, rounding_mode="floor")
     logical_block = torch.div(logical, storage_block_size, rounding_mode="floor")
     offset = logical.remainder(storage_block_size)
-    physical = block_table[request_ids.to(torch.long), logical_block.to(torch.long)]
-    slots = physical.to(torch.int64) * storage_block_size + offset.to(torch.int64)
-    if publish_only_complete and logical_divisor > 1:
-        slots = slots.masked_fill((positions + 1).remainder(logical_divisor) != 0, -1)
+    physical = block_table[request_ids[publish].to(torch.long), logical_block.to(torch.long)]
+    slots[publish] = physical.to(torch.int64) * storage_block_size + offset.to(torch.int64)
     return slots
 
 
