@@ -59,7 +59,7 @@ def _make_cache_kernels():
     @pl.jit
     def zero_cache(
         pool: pl.InOut[pl.Tensor[[1, pool_bytes], pl.UINT8]],
-        size: pl.Scalar[pl.INT64],
+        size: pl.Scalar[pl.INDEX],
     ):
         for block in pl.parallel((size + tile_bytes - 1) // tile_bytes):
             start = block * tile_bytes
@@ -72,8 +72,8 @@ def _make_cache_kernels():
     def read_cache(
         pool: pl.Tensor[[1, pool_bytes], pl.UINT8],
         page: pl.Out[pl.Tensor[[1, page_bytes], pl.UINT8]],
-        offset: pl.Scalar[pl.INT64],
-        size: pl.Scalar[pl.INT64],
+        offset: pl.Scalar[pl.INDEX],
+        size: pl.Scalar[pl.INDEX],
     ):
         for block in pl.parallel((size + tile_bytes - 1) // tile_bytes):
             start = block * tile_bytes
@@ -86,8 +86,8 @@ def _make_cache_kernels():
     def write_cache(
         page: pl.Tensor[[1, page_bytes], pl.UINT8],
         pool: pl.InOut[pl.Tensor[[1, pool_bytes], pl.UINT8]],
-        offset: pl.Scalar[pl.INT64],
-        size: pl.Scalar[pl.INT64],
+        offset: pl.Scalar[pl.INDEX],
+        size: pl.Scalar[pl.INDEX],
     ):
         for block in pl.parallel((size + tile_bytes - 1) // tile_bytes):
             start = block * tile_bytes
