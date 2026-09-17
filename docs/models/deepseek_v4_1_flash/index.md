@@ -33,6 +33,77 @@ The attention schedule is:
 - Layers 20-39 use ratio-1 compressed sparse attention. Layer 20 owns the KV
   cache, while layers 20, 24, 28, 32, and 36 refresh the index selection.
 
+## Serving-owned full RoPE tables
+
+V4.1 provides a PyPTO inline stage that reads caller-owned full cosine/sine
+tables and writes only the active token rows inside the compiled graph. It does
+not recompute frequencies, copy the full table per call, or invoke Torch during
+dispatch. As in V4 MTP's decode forward, prepare rows once before the attention
+layers; DSpark's decode forward likewise passes prepared token-major rows to
+its layers.
+
+`rope_tables.materialize_rope_rows` accepts:
+
+- `freqs_cos`, `freqs_sin`: read-only FP32 `[table_capacity, rope_dim // 2]`
+  tables for one profile, retained by serving across calls.
+- `position_ids`: INT32 `[T]` absolute positions.
+- `num_tokens`: the active prefix length, in `[0, T]`.
+- `rope_cos`, `rope_sin`: caller-provided FP32 `[T, rope_dim // 2]` outputs.
+
+Nonnegative positions must be below table capacity. Negative positions write
+identity rotation, used for unpublished compressed tokens. Padding output
+rows remain untouched; zero active tokens launch no row work. V4.1 retains
+FP32 half-width tables for adjacent-pair rotation, rather than adopting V4's
+BF16 full-width representation.
+
+The exported `decode_attn_c2a_full`, `decode_c2a_full`, `prefill_c2a_full` and
+`c2a_full_partial` retain
+their token-major `rope_cos`/`rope_sin` and `compressed_rope_cos`/
+`compressed_rope_sin` inputs. They do not allocate RoPE row buffers or gather
+full tables on each layer invocation.
+
+The `decode_attn_c2a_full.make_program` and `prefill_c2a_full.make_hc_program`
+forward entries accept
+`freqs_cos`/`freqs_sin`, `compressed_freqs_cos`/`compressed_freqs_sin`,
+`position_ids` and `compressed_rope_positions`. All four tables share one position
+capacity in these entries. Each rank allocates four row buffers and gathers the
+query and compressed rows once, before the repeated-attention loop. Every epoch
+in that invocation reuses those read-only rows. Table generation in the driver
+is fixture initialization, not work performed during dispatch.
+
+For a multilayer forward, prepare one pair of row buffers for each distinct
+RoPE profile, position vector and active token count. Reuse those buffers for
+all layers with that same combination. A different compression source may have
+different positions even when it shares a profile; do not reuse rows across
+such combinations. Recompute rows when the positions or active token count
+change. This is per-forward reuse, not a persistent cache of selected rows.
+
+Compose the preparation before the layers:
+
+```python
+materialize_rope_rows(
+    freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin,
+)
+materialize_rope_rows(
+    compressed_freqs_cos, compressed_freqs_sin,
+    compressed_rope_positions, num_tokens, compressed_rope_cos, compressed_rope_sin,
+)
+# Pass these same row tensors to each matching row-based attention entry.
+```
+
+Supply `metadata.compressed_rope_position_ids[source]` as
+`compressed_rope_positions`; it contains compression-group start positions or
+`-1`. Pass the gathered tensors directly to their RoPE consumers so the normal
+tensor dependencies are visible. In an explicitly manual dependency region,
+preserve both producer TaskIds alongside the existing cache-publication and
+previous-epoch dependencies; source order alone does not establish an edge.
+Keep the row buffers alive and unchanged until all consuming layers complete.
+The external serving adapter and other attention modes are not migrated here.
+
+`precompute_rope_tables` remains a CPU initialization utility when the caller
+needs to generate a complete profile. It is not needed in the compiled dispatch
+path when serving already supplies full tables.
+
 ## Parallel-development structure
 
 Each attention mode and execution phase has one ownership file. Every file

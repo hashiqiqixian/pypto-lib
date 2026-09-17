@@ -499,11 +499,11 @@ def make_program(world_size, epochs, specs):
 
 def build_specs(args, initial_state=None):
     del initial_state
-    return common.assemble_specs(args, full.build_specs(args, "decode"), ATTENTION_SPEC_NAMES)
+    return common.assemble_specs(args, full.build_specs(args, "decode", full_rope_tables=False), ATTENTION_SPEC_NAMES)
 
 
 def make_golden(epochs):
-    leaf_golden = full.make_golden(1)
+    leaf_golden = full.make_golden(1, full_rope_tables=False)
 
     def golden_half(tensors):
         for _ in range(epochs):
