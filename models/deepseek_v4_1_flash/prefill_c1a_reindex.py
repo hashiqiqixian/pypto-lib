@@ -163,10 +163,115 @@ def golden_prefill_c1a_reindex(
     )
 
 
+def make_c1a_reindex_partial(indexer):
+    """Build local FP32 attention, including the mode-owned cache and index updates."""
+    @pl.jit.inline(auto_scope=False)
+    def c1a_reindex_partial(
+        x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+        wq_a: pl.Tensor[[C.D, C.Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[C.D // 32, C.Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[C.Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[C.Q_LORA, C.LOCAL_H * C.HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.LOCAL_H * C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[C.D // 32, C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[C.LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
+        window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
+        window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
+        compressed_cache_scale: pl.Tensor[
+            [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+        ],
+        request_ids: pl.Tensor[[C.T_DYN], pl.INT32],
+        compressed_lens: pl.Tensor[[C.T_DYN], pl.INT32],
+        index_cache: pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // 2], pl.UINT8],
+        index_cache_scale: pl.Tensor[
+            [C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // C.INDEX_CACHE_GROUP], pl.FP8E8M0
+        ],
+        index_block_table: pl.Tensor[[C.B_DYN, C.TABLE_DYN], pl.INT32],
+        candidate_mask: pl.Tensor[[C.T_DYN, C.CMP_POSITIONS_DYN], pl.UINT8],
+        index_wq_b: pl.Tensor[[C.Q_LORA, C.INDEX_H * C.INDEX_DIM], pl.FP8E4M3FN],
+        index_wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.INDEX_H * C.INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        index_weights_proj: pl.Tensor[[C.D, C.INDEX_H], pl.BF16],
+        topk_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
+        output: pl.Tensor[[C.T_DYN, C.D], pl.FP32],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        """Refresh ratio-1 Top-K rows inside a supplied candidate set."""
+        tokens = pl.tensor.dim(x, 0)
+        positions = pl.tensor.dim(candidate_mask, 1)
+
+        index_projection_a = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+        project_index_latent(x, wq_a, wq_a_scale, index_projection_a, num_tokens)
+        query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+        normalize_index_latent(index_projection_a, q_norm_weight, query_latent, num_tokens)
+        score_width = (positions + TOPK_LEAF - 1) // TOPK_LEAF * TOPK_LEAF
+        index_scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
+        cache_ready = pl.system.task_dummy(deps=[])
+        indexer(
+            x,
+            query_latent,
+            request_ids,
+            compressed_lens,
+            index_cache,
+            index_cache_scale,
+            index_block_table,
+            rope_cos,
+            rope_sin,
+            index_wq_b,
+            index_wq_b_scale,
+            index_weights_proj,
+            candidate_mask,
+            index_scores,
+            topk_indices,
+            num_tokens,
+            cache_ready,
+        )
+
+        prefill_c1a_partial(
+            x,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            attn_sink,
+            wo_a,
+            wo_b,
+            wo_b_scale,
+            rope_cos,
+            rope_sin,
+            window_slots,
+            window_indices,
+            window_cache,
+            window_cache_scale,
+            compressed_cache,
+            compressed_cache_scale,
+            topk_indices,
+            output,
+            num_tokens,
+        )
+        return output
+
+    return c1a_reindex_partial
+
+
 def make_prefill_c1a_reindex(
     indexer, output_reduce=prefill_tp_output_all_reduce, output_window_tokens=C.PREFILL_MAX_TOKENS,
 ):
     """Build ratio-1 attention with the selected stage communication window."""
+    partial_entry = make_c1a_reindex_partial(indexer)
     @pl.jit.inline(auto_scope=False)
     def prefill_c1a_reindex_impl(
         x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
@@ -212,39 +317,9 @@ def make_prefill_c1a_reindex(
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
     ):
-        """Refresh ratio-1 Top-K rows inside a supplied candidate set."""
         tokens = pl.tensor.dim(x, 0)
-        positions = pl.tensor.dim(candidate_mask, 1)
-
-        index_projection_a = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        project_index_latent(x, wq_a, wq_a_scale, index_projection_a, num_tokens)
-        query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        normalize_index_latent(index_projection_a, q_norm_weight, query_latent, num_tokens)
-        score_width = (positions + TOPK_LEAF - 1) // TOPK_LEAF * TOPK_LEAF
-        index_scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
-        cache_ready = pl.system.task_dummy(deps=[])
-        indexer(
-            x,
-            query_latent,
-            request_ids,
-            compressed_lens,
-            index_cache,
-            index_cache_scale,
-            index_block_table,
-            rope_cos,
-            rope_sin,
-            index_wq_b,
-            index_wq_b_scale,
-            index_weights_proj,
-            candidate_mask,
-            index_scores,
-            topk_indices,
-            num_tokens,
-            cache_ready,
-        )
-
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-        prefill_c1a_partial(
+        partial_entry(
             x,
             wq_a,
             wq_a_scale,
@@ -266,6 +341,15 @@ def make_prefill_c1a_reindex(
             window_cache_scale,
             compressed_cache,
             compressed_cache_scale,
+            request_ids,
+            compressed_lens,
+            index_cache,
+            index_cache_scale,
+            index_block_table,
+            candidate_mask,
+            index_wq_b,
+            index_wq_b_scale,
+            index_weights_proj,
             topk_indices,
             partial,
             num_tokens,

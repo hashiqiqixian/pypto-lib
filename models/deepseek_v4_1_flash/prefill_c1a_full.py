@@ -190,12 +190,10 @@ def golden_prefill_c1a_full(
     )
 
 
-def make_prefill_c1a_full(
-    indexer, output_reduce=prefill_tp_output_all_reduce, output_window_tokens=C.PREFILL_MAX_TOKENS,
-):
-    """Build ratio-1 attention with the selected stage communication window."""
+def make_c1a_full_partial(indexer):
+    """Build local FP32 attention, including the mode-owned cache and index updates."""
     @pl.jit.inline(auto_scope=False)
-    def prefill_c1a_full_impl(
+    def c1a_full_partial(
         x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
         wq_a: pl.Tensor[[C.D, C.Q_LORA], pl.FP8E4M3FN],
         wq_a_scale: pl.Tensor[[C.D // 32, C.Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
@@ -238,13 +236,8 @@ def make_prefill_c1a_full(
         index_weights_proj: pl.Tensor[[C.D, C.INDEX_H], pl.BF16],
         topk_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
         candidate_mask: pl.Tensor[[C.T_DYN, C.CMP_POSITIONS_DYN], pl.UINT8],
-        output_window: pld.DistributedTensor[[output_window_tokens, C.D], pl.FP32],
-        output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
-        group_base: pl.Scalar[pl.INT32],
-        tp_rank: pl.Scalar[pl.INT32],
+        output: pl.Tensor[[C.T_DYN, C.D], pl.FP32],
         num_tokens: pl.Scalar[pl.INT32],
-        attention_epoch: pl.Scalar[pl.INT32],
     ):
         """Publish ratio-1 caches, select sparse rows, and compute packed C1A."""
         tokens = pl.tensor.dim(x, 0)
@@ -322,7 +315,6 @@ def make_prefill_c1a_full(
         )
         hierarchical_sparse_indexer(index_scores, compressed_lens, candidate_mask)
 
-        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
         prefill_c1a_partial(
             x,
             wq_a,
@@ -346,6 +338,112 @@ def make_prefill_c1a_full(
             compressed_cache,
             compressed_cache_scale,
             topk_indices,
+            output,
+            num_tokens,
+        )
+        return output
+
+    return c1a_full_partial
+
+
+def make_prefill_c1a_full(
+    indexer, output_reduce=prefill_tp_output_all_reduce, output_window_tokens=C.PREFILL_MAX_TOKENS,
+):
+    """Build ratio-1 attention with the selected stage communication window."""
+    partial_entry = make_c1a_full_partial(indexer)
+    @pl.jit.inline(auto_scope=False)
+    def prefill_c1a_full_impl(
+        x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+        wq_a: pl.Tensor[[C.D, C.Q_LORA], pl.FP8E4M3FN],
+        wq_a_scale: pl.Tensor[[C.D // 32, C.Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+        q_norm_weight: pl.Tensor[[C.Q_LORA], pl.BF16],
+        wq_b: pl.Tensor[[C.Q_LORA, C.LOCAL_H * C.HEAD_DIM], pl.FP8E4M3FN],
+        wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.LOCAL_H * C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP8E4M3FN],
+        wkv_scale: pl.Tensor[[C.D // 32, C.HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
+        attn_sink: pl.Tensor[[C.LOCAL_H], pl.FP32],
+        wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
+        wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
+        window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
+        window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
+        window_cache_scale: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.WINDOW_CACHE_GROUP], pl.FP8E8M0],
+        compressed_cache: pl.Tensor[[C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // 2], pl.UINT8],
+        compressed_cache_scale: pl.Tensor[
+            [C.CMP_BLOCKS_DYN, 128, 1, C.HEAD_DIM // C.COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN
+        ],
+        request_ids: pl.Tensor[[C.T_DYN], pl.INT32],
+        compressed_lens: pl.Tensor[[C.T_DYN], pl.INT32],
+        index_cache: pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // 2], pl.UINT8],
+        index_cache_scale: pl.Tensor[
+            [C.INDEX_BLOCKS_DYN, 128, 1, C.INDEX_DIM // C.INDEX_CACHE_GROUP], pl.FP8E8M0
+        ],
+        index_block_table: pl.Tensor[[C.B_DYN, C.TABLE_DYN], pl.INT32],
+        compressed_rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.BF16],
+        compressor_norm_weight: pl.Tensor[[C.HEAD_DIM], pl.BF16],
+        compressed_slots: pl.Tensor[[C.T_DYN], pl.INT64],
+        index_wk: pl.Tensor[[C.HEAD_DIM, C.INDEX_DIM], pl.BF16],
+        index_norm_weight: pl.Tensor[[C.INDEX_DIM], pl.BF16],
+        index_wq_b: pl.Tensor[[C.Q_LORA, C.INDEX_H * C.INDEX_DIM], pl.FP8E4M3FN],
+        index_wq_b_scale: pl.Tensor[[C.Q_LORA // 32, C.INDEX_H * C.INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        index_weights_proj: pl.Tensor[[C.D, C.INDEX_H], pl.BF16],
+        topk_indices: pl.Tensor[[C.T_DYN, C.INDEX_TOPK], pl.INT32],
+        candidate_mask: pl.Tensor[[C.T_DYN, C.CMP_POSITIONS_DYN], pl.UINT8],
+        output_window: pld.DistributedTensor[[output_window_tokens, C.D], pl.FP32],
+        output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
+        output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+        group_base: pl.Scalar[pl.INT32],
+        tp_rank: pl.Scalar[pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+        attention_epoch: pl.Scalar[pl.INT32],
+    ):
+        tokens = pl.tensor.dim(x, 0)
+        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        partial_entry(
+            x,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            attn_sink,
+            wo_a,
+            wo_b,
+            wo_b_scale,
+            rope_cos,
+            rope_sin,
+            window_slots,
+            window_indices,
+            window_cache,
+            window_cache_scale,
+            compressed_cache,
+            compressed_cache_scale,
+            request_ids,
+            compressed_lens,
+            index_cache,
+            index_cache_scale,
+            index_block_table,
+            compressed_rope_cos,
+            compressed_rope_sin,
+            compressor_wkv,
+            compressor_norm_weight,
+            compressed_slots,
+            index_wk,
+            index_norm_weight,
+            index_wq_b,
+            index_wq_b_scale,
+            index_weights_proj,
+            topk_indices,
+            candidate_mask,
             partial,
             num_tokens,
         )

@@ -313,20 +313,28 @@ def _parse_parallel_size(name: str, default: int) -> int:
     return default
 
 
-TP_SIZE = _parse_parallel_size("tp", 4)
-EP_SIZE = _parse_parallel_size("ep", 8)
-if TP_SIZE not in SUPPORTED_TP_SIZES:
-    raise ValueError(f"--tp must be one of {SUPPORTED_TP_SIZES}, got {TP_SIZE}")
-if EP_SIZE not in SUPPORTED_EP_SIZES:
-    raise ValueError(f"--ep must be one of {SUPPORTED_EP_SIZES}, got {EP_SIZE}")
-if EP_SIZE % TP_SIZE:
-    raise ValueError(f"EP{EP_SIZE} must be divisible by TP{TP_SIZE}")
-if H % TP_SIZE:
-    raise ValueError(f"{H} attention heads cannot be evenly sharded across TP{TP_SIZE}")
-if O_GROUPS % TP_SIZE:
-    raise ValueError(f"{O_GROUPS} output groups cannot be evenly sharded across TP{TP_SIZE}")
-if N_EXPERTS % EP_SIZE:
-    raise ValueError(f"{N_EXPERTS} routed experts cannot be evenly sharded across EP{EP_SIZE}")
+def _validate_parallel_sizes(tp_size: int, ep_size: int) -> None:
+    if type(tp_size) is not int or tp_size not in SUPPORTED_TP_SIZES:
+        raise ValueError(f"TP must be one of {SUPPORTED_TP_SIZES}, got {tp_size}")
+    if type(ep_size) is not int or ep_size not in SUPPORTED_EP_SIZES:
+        raise ValueError(f"EP must be one of {SUPPORTED_EP_SIZES}, got {ep_size}")
+    if ep_size % tp_size:
+        raise ValueError(f"EP{ep_size} must be divisible by TP{tp_size}")
+    if H % tp_size or O_GROUPS % tp_size:
+        raise ValueError(f"attention heads and output groups must be divisible by TP{tp_size}")
+    if N_EXPERTS % ep_size:
+        raise ValueError(f"{N_EXPERTS} routed experts cannot be evenly sharded across EP{ep_size}")
+
+
+# The explicit host loader supplies the initial tuple before importing this
+# module. Standalone model harnesses retain their existing --tp/--ep behavior.
+_host_loader = sys.modules.get(__name__.rsplit(".", 1)[0] + ".local_attention")
+_initial_parallelism = getattr(_host_loader, "_INITIAL_PARALLELISM", None)
+TP_SIZE, EP_SIZE = _initial_parallelism if _initial_parallelism is not None else (
+    _parse_parallel_size("tp", 4), _parse_parallel_size("ep", 8)
+)
+_validate_parallel_sizes(TP_SIZE, EP_SIZE)
+del _host_loader, _initial_parallelism
 
 DP_SIZE = EP_SIZE // TP_SIZE
 LOCAL_H = H // TP_SIZE
@@ -351,3 +359,35 @@ ROUTE_WIDTH = 8
 WINDOW_CACHE_GROUP = 32
 COMPRESSED_CACHE_GROUP = 16
 INDEX_CACHE_GROUP = 32
+
+
+def configure_kernel_parallelism(tp_size: int, ep_size: int) -> None:
+    """Select shapes before importing kernels; reject already-frozen incompatible modules."""
+    global TP_SIZE, EP_SIZE, DP_SIZE, LOCAL_H, LOCAL_O_GROUPS, LOCAL_O_WIDTH, N_LOCAL_EXPERTS
+    global DECODE_RECV_MAX, PREFILL_RECV_MAX, RECV_MAX
+
+    _validate_parallel_sizes(tp_size, ep_size)
+    if (tp_size, ep_size) == (TP_SIZE, EP_SIZE):
+        return
+    prefix = __name__.rsplit(".", 1)[0] + "."
+    shape_independent = {
+        "config", "quantization", "golden", "attention_common", "rope_tables", "local_attention",
+    }
+    frozen = sorted(
+        name for name in sys.modules
+        if name.startswith(prefix) and name.removeprefix(prefix) not in shape_independent
+    )
+    if frozen:
+        raise RuntimeError(
+            f"V4.1 TP{TP_SIZE}/EP{EP_SIZE} kernels are already imported; "
+            f"select TP{tp_size}/EP{ep_size} before importing {frozen[0]}"
+        )
+    TP_SIZE, EP_SIZE = tp_size, ep_size
+    DP_SIZE = EP_SIZE // TP_SIZE
+    LOCAL_H = H // TP_SIZE
+    LOCAL_O_GROUPS = O_GROUPS // TP_SIZE
+    LOCAL_O_WIDTH = LOCAL_O_GROUPS * O_LORA
+    N_LOCAL_EXPERTS = N_EXPERTS // EP_SIZE
+    DECODE_RECV_MAX = DP_SIZE * DECODE_MAX_TOKENS
+    PREFILL_RECV_MAX = DP_SIZE * PREFILL_MAX_TOKENS
+    RECV_MAX = PREFILL_RECV_MAX
