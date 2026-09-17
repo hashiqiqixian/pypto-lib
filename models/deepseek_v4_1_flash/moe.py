@@ -139,15 +139,11 @@ def make_routed_projection(width, output_width):
     @pl.jit.inline
     def project(
         x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[output_width, width], pl.FP4],
+        weight: pl.Tensor[[output_width, width // 2], pl.UINT8],
         scale: pl.Tensor[[output_width, width // MX_GROUP], pl.FP8E8M0],
         output: pl.Tensor[[T_DYN, output_width], pl.BF16],
         num_tokens: pl.Scalar[pl.INT32],
     ):
-        # Keep this view at the leaf: the JIT infers call-site metadata for
-        # packed carriers but does not propagate reinterpret_view aliases.
-        # An already-logical FP4 input has the same shape and byte extent.
-        logical_weight = pl.reinterpret_view(weight, pl.FP4, shape=[output_width, width])
         for block in pl.spmd(output_width // PROJECTION_TILE, name_hint="moe_routed_projection"):
             n0 = block * PROJECTION_TILE
             accumulator = pl.create_tile(
@@ -160,18 +156,42 @@ def make_routed_projection(width, output_width):
                 grouped = pl.reshape(pl.cast(source, pl.FP32), [EXPERT_TILE * (K_TILE // 32), 32])
                 reduce_tmp = pl.create_tile([EXPERT_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
                 maximum = pl.maximum(pl.row_max(pl.abs(grouped), tmp_tile=reduce_tmp), 1e-4)
+                # Integer shifts require row layout; restore columns for group broadcasts.
+                maximum = pl.reshape(maximum, [1, EXPERT_TILE * (K_TILE // 32)])
                 bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
                 exponent = pl.shrs(pl.add(bits, 8388607), 23)
                 factor = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+                factor = pl.reshape(factor, [EXPERT_TILE * (K_TILE // 32), 1])
                 quantized = pl.cast(pl.row_expand_div(grouped, factor), pl.FP8E4M3FN, mode="rint")
                 source_fp32 = pl.reshape(
                     pl.row_expand_mul(pl.cast(quantized, pl.FP32), factor), [EXPERT_TILE, K_TILE]
                 )
-                payload = pl.load(logical_weight, [n0, k0], [PROJECTION_TILE, K_TILE])
-                # A5 TCVT supports FP4 -> BF16 directly; all E2M1 values are exact.
-                values = pl.cast(pl.cast(payload, pl.BF16), pl.FP32)
+                payload = pl.load(weight, [n0, k0 // 2], [PROJECTION_TILE, K_TILE // 2])
+                # Keep checkpoint bytes packed in GM. As in C1A index decoding,
+                # interleave low/high E2M1 nibbles only within this matrix tile.
+                payload_i32 = pl.ands(pl.cast(pl.reinterpret_view(payload, pl.INT8), pl.INT32), 255)
+                low = pl.reshape(pl.ands(payload_i32, 15), [1, PROJECTION_TILE * K_TILE // 2])
+                high = pl.reshape(pl.ands(pl.shrs(payload_i32, 4), 15), [1, PROJECTION_TILE * K_TILE // 2])
+                combined_codes = pl.concat(low, high)
+                output_ids = pl.tile.arange(0, [1, PROJECTION_TILE * K_TILE], dtype=pl.INT32)
+                code_indices = pl.add(
+                    pl.shrs(output_ids, 1), pl.mul(pl.ands(output_ids, 1), PROJECTION_TILE * K_TILE // 2)
+                )
+                code_tmp = pl.create_tile([1, PROJECTION_TILE * K_TILE], dtype=pl.INT32)
+                codes = pl.tile.gather(combined_codes, code_indices, code_tmp)
+                magnitude_codes = pl.ands(codes, 7)
+                magnitude = pl.mul(pl.cast(magnitude_codes, pl.FP32), 0.5)
+                extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 4), 0), 1)
+                magnitude = pl.add(magnitude, pl.mul(pl.cast(extra, pl.FP32), 0.5))
+                extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 5), 0), 1)
+                magnitude = pl.add(magnitude, pl.mul(pl.cast(extra, pl.FP32), 0.5))
+                extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 6), 0), 1)
+                magnitude = pl.add(magnitude, pl.mul(pl.cast(extra, pl.FP32), 1.5))
+                sign = pl.cast(pl.ands(pl.shrs(codes, 3), 1), pl.FP32)
+                values = pl.mul(magnitude, pl.add(pl.mul(sign, -2.0), 1.0))
                 scale_tile = pl.load(scale, [n0, k0 // 32], [PROJECTION_TILE, K_TILE // 32])
-                scale_bits = pl.ands(pl.cast(pl.reinterpret_view(scale_tile, pl.INT8), pl.INT32), 255)
+                scale_bytes = pl.reinterpret_view(scale_tile, pl.UINT8)
+                scale_bits = pl.ands(pl.cast(pl.reinterpret_view(scale_bytes, pl.INT8), pl.INT32), 255)
                 scale_value = pl.reinterpret_view(pl.maximum(pl.shls(scale_bits, 23), 4194304), pl.FP32)
                 values = pl.reshape(values, [PROJECTION_TILE * (K_TILE // 32), 32])
                 weights = pl.reshape(
@@ -278,9 +298,11 @@ def quantize_dispatch(
     for token in pl.spmd(num_tokens, name_hint="moe_dispatch_quantize"):
         grouped = pl.reshape(pl.cast(x[token:token + 1, :], pl.FP32), [D // 32, 32])
         maximum = pl.maximum(pl.row_max(pl.abs(grouped)), 1e-4)
+        maximum = pl.reshape(maximum, [1, D // 32])
         bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
         exponent = pl.shrs(pl.add(bits, 8388607), 23)
         factor = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+        factor = pl.reshape(factor, [D // 32, 1])
         values = pl.cast(pl.row_expand_div(grouped, factor), pl.FP8E4M3FN, mode="rint")
         payload[token:token + 1, :] = pl.reshape(values, [1, D])
         signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
@@ -295,11 +317,11 @@ def moe(
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.FP4],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D // 2], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D // MX_GROUP], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP4],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER // 2], pl.UINT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER // MX_GROUP], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.FP4],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D // 2], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D // MX_GROUP], pl.FP8E8M0],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
