@@ -42,6 +42,11 @@ def test_flash_layers_resolve_latest_matching_cache_owners(config):
             assert actual == (max(owners) if owners else None)
 
 
+def test_candidate_cache_owner_cannot_change_after_publication(config):
+    with pytest.raises(ValueError, match="invalidate candidate ownership"):
+        replace(config.FLASH, kv_source_layer_ids=(2, 8, 14, 20, 24))
+
+
 @pytest.fixture
 def config(monkeypatch):
     # Configuration only needs symbolic dimension declarations, no compiler.

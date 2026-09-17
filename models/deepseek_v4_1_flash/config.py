@@ -214,6 +214,8 @@ class DeepSeekV41Config:
             raise ValueError("candidate_source_layer_id must also be an index source")
         if self.candidate_source_layer_id not in self.kv_source_layer_ids:
             raise ValueError("candidate_source_layer_id must share the compressed cache it filters")
+        if any(source > self.candidate_source_layer_id for source in self.kv_source_layer_ids):
+            raise ValueError("a KV source after the candidate source would invalidate candidate ownership")
 
 
 FLASH = DeepSeekV41Config(
