@@ -26,7 +26,7 @@ from models.deepseek_v4_1_flash.quantization import (
 
 CASE_DEFAULT = "multi_1k"
 CASE_TOKENS = 64
-CASE_MAX_TOKENS = 128
+CASE_MAX_TOKENS = C.PREFILL_MAX_TOKENS
 CASE_PAGE = 128
 CASE_NAMES = (CASE_DEFAULT, "causal", "mixed", "long")
 

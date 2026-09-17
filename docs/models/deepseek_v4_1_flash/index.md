@@ -124,8 +124,13 @@ round-robin across the four TP ranks. This prevents replicated attention rows
 from being dispatched four times; MoE combine returns the rows to the TP
 layout. DSA context parallelism is intentionally out of scope.
 
-The service capacity contract is 32 active sequences and 4,096 scheduled
-prefill token rows per DP group. With five reserved DSpark draft rows plus one
+The service capacity contract is 32 active sequences and 8,192 scheduled
+prefill token rows per DP group. The prefill TP output window has the same
+row capacity, so one request can supply all 8,192 query rows. This is distinct
+from two DP groups processing separate 4,096-token requests or a short query
+reading 8,192 historical cache entries. The C1A `--case causal --tokens 8192`
+fixture exercises the single-request capacity; allocate resources for its
+full query, cache and reference tensors before running it. With five reserved DSpark draft rows plus one
 target row, the decode ABI reserves 192 token rows per DP group. DP2 therefore
 supports up to 64 active sequences globally. DSpark execution itself remains
 follow-up work.
