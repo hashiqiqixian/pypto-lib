@@ -124,6 +124,16 @@ per-token causal compressed lengths, per-request compressed lengths and
 remainders, ragged compressor output starts, source-token rows, and compressed
 RoPE positions. The same lowering serves prefill and continuous-batch decode.
 
+For active ratio-2 requests, `build_forward_metadata` requires the keyword
+`compressor_state_slots`: a mapping from each KV source layer to an INT32/INT64
+`[B]` vector of engine-owned stable state rows. Rows must be distinct among
+active requests and lie in `[0, MAX_BATCH_PER_DP)`. Reorder these vectors with
+the batch while leaving persistent state in its original slots. Inactive
+requests may use `-1`; an empty batch needs no state mapping. The caller owns
+reset before slot reassignment and pending-pair restoration on resume. This
+preserves the existing bounded state-pool ABI; it is not a ring-cache or
+speculative rollback implementation.
+
 The target deployment is one eight-card A5 node with TP4 attention, two DP
 groups, and EP8 routed experts. The configuration accepts TP1/2/4/8 and
 compatible EP2/4/8 shapes; native C1A currently has the narrower TP1/2/4
