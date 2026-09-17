@@ -97,9 +97,12 @@ def make_projection(width, output_width, output_dtype=pl.BF16):
                         grouped = pl.reshape(pl.cast(values, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
                         reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
                         maximum = pl.maximum(pl.row_max(pl.abs(grouped), tmp_tile=reduce_tmp), 1e-4)
+                        # Integer shifts require a row-major tile, unlike row_max's column result.
+                        maximum = pl.reshape(maximum, [1, MX_M_TILE * (K_TILE // 32)])
                         bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
                         exponent = pl.shrs(pl.add(bits, 8388607), 23)
                         group_scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+                        group_scale = pl.reshape(group_scale, [MX_M_TILE * (K_TILE // 32), 1])
                         payload = pl.cast(
                             pl.row_expand_div(grouped, group_scale), pl.FP8E4M3FN, mode="rint"
                         )
