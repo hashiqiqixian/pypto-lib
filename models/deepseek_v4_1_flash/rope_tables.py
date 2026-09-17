@@ -15,14 +15,11 @@ import torch
 from models.deepseek_v4_1_flash.config import FLASH, DeepSeekV41Config
 
 
-def precompute_rope_tables(
-    sequence_length: int,
+def _rope_frequencies(
     compressed_attention: bool,
-    config: DeepSeekV41Config = FLASH,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return FP32 cosine and sine tables for adjacent-pair rotary embedding."""
-    if sequence_length <= 0:
-        raise ValueError("sequence_length must be positive")
+    config: DeepSeekV41Config,
+) -> torch.Tensor:
+    """Share the CPU FP32 base/YaRN frequencies across both table APIs."""
     dim = config.qk_rope_head_dim
     base = config.compress_rope_theta if compressed_attention else config.rope_theta
     frequencies = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -38,6 +35,18 @@ def precompute_rope_tables(
         ramp = ((ramp - low) / max(high - low, 1e-3)).clamp(0, 1)
         smooth = 1 - ramp
         frequencies = frequencies / config.rope_factor * (1 - smooth) + frequencies * smooth
+    return frequencies
+
+
+def precompute_rope_tables(
+    sequence_length: int,
+    compressed_attention: bool,
+    config: DeepSeekV41Config = FLASH,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP32 cosine and sine tables for adjacent-pair rotary embedding."""
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+    frequencies = _rope_frequencies(compressed_attention, config)
     angles = torch.outer(torch.arange(sequence_length, dtype=torch.float32), frequencies)
     return angles.cos(), angles.sin()
 
@@ -53,11 +62,9 @@ def select_rope_rows(
         empty = torch.empty(shape, dtype=torch.float32, device=position_ids.device)
         return empty, empty.clone()
     valid = position_ids >= 0
-    maximum = max(int(position_ids.clamp_min(0).max()) + 1, 1)
-    cos, sin = precompute_rope_tables(maximum, compressed_attention, config)
-    cos = cos.to(position_ids.device)
-    sin = sin.to(position_ids.device)
-    rows = position_ids.clamp_min(0).to(torch.long)
-    selected_cos = cos[rows].masked_fill(~valid.unsqueeze(-1), 1.0)
-    selected_sin = sin[rows].masked_fill(~valid.unsqueeze(-1), 0.0)
+    # Keep the full-table API's CPU FP32 math while allocating only requested rows.
+    rows = position_ids.clamp_min(0).to(device="cpu", dtype=torch.long).to(torch.float32)
+    angles = rows.unsqueeze(-1) * _rope_frequencies(compressed_attention, config)
+    selected_cos = angles.cos().to(position_ids.device).masked_fill(~valid.unsqueeze(-1), 1.0)
+    selected_sin = angles.sin().to(position_ids.device).masked_fill(~valid.unsqueeze(-1), 0.0)
     return selected_cos, selected_sin
