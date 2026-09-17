@@ -33,6 +33,38 @@ The attention schedule is:
 - Layers 20-39 use ratio-1 compressed sparse attention. Layer 20 owns the KV
   cache, while layers 20, 24, 28, 32, and 36 refresh the index selection.
 
+## Reusable RoPE tables
+
+Serving callers can generate each RoPE profile once with
+`precompute_rope_tables(capacity, compressed_attention=...)`, move the returned
+FP32 cosine/sine tables to the execution device once, and retain them across
+requests. Use `materialize_token_rope_tables(cos, sin, position_ids)` to gather
+rows without recomputing frequencies or trigonometric functions. Positions
+must be INT32/INT64 tensors on the same device as the tables. Outputs retain
+the table dtype and device, with shape `[*position_ids.shape, rope_dim // 2]`.
+Negative positions yield identity rotation; nonnegative positions must be
+below the allocated capacity. Unlike V4's duplicated full-width tables, V4.1
+uses half-width tables for adjacent-pair rotation.
+
+```python
+from models.deepseek_v4_1_flash.rope_tables import (
+    materialize_token_rope_tables,
+    precompute_rope_tables,
+)
+
+# Initialize once per profile and device; retain these tensors in the caller.
+cos, sin = precompute_rope_tables(capacity, compressed_attention=False)
+cos, sin = cos.to(device), sin.to(device)
+
+# Each forward: position_ids is already on device.
+rope_cos, rope_sin = materialize_token_rope_tables(cos, sin, position_ids)
+```
+
+The caller owns table lifetime, capacity, and matching the model configuration
+and attention profile. This library API does not allocate a serving cache or
+change kernel arguments. `select_rope_rows` remains available for callers that
+compute rows on demand without retaining a full table.
+
 ## Parallel-development structure
 
 Each attention mode and execution phase has one ownership file. Every file
