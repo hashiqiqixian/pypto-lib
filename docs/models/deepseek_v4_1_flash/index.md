@@ -134,6 +134,15 @@ reset before slot reassignment and pending-pair restoration on resume. This
 preserves the existing bounded state-pool ABI; it is not a ring-cache or
 speculative rollback implementation.
 
+Query boundaries and history lengths must be INT32 or INT64; floating-point
+and boolean lengths are rejected before conversion. Physical cache pages may
+be shared for read-only prefixes, but pages written by the current invocation
+must be private. The engine must perform copy-on-write for shared tail pages
+before building metadata. Ownership checks include retained history of inactive
+requests represented in the batch; the engine must also protect requests that
+are absent from the metadata. The same rule applies to compressed and index
+pools, including aliases within one request's block table.
+
 The target deployment is one eight-card A5 node with TP4 attention, two DP
 groups, and EP8 routed experts. The configuration accepts TP1/2/4/8 and
 compatible EP2/4/8 shapes; native C1A currently has the narrower TP1/2/4

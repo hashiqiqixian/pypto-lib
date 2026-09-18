@@ -133,6 +133,40 @@ def window_metadata(
     return slots, indices.to(torch.int32), lens
 
 
+def _validate_writable_pages(
+    block_table: torch.Tensor,
+    old_lengths: torch.Tensor,
+    new_lengths: torch.Tensor,
+    window: int | None = None,
+) -> None:
+    """Allow shared read-only pages, but require private pages before writes.
+
+    The engine must perform copy-on-write before passing a shared tail page.
+    Include inactive requests' retained history so active writes cannot corrupt
+    a paused request. Also reject writable aliases within one request's table.
+    """
+    if block_table.ndim != 2 or block_table.shape[0] != old_lengths.numel():
+        raise ValueError("block tables must have one row per request")
+    seen: set[int] = set()
+    shared: set[int] = set()
+    written: set[int] = set()
+    for request, (old, new) in enumerate(zip(old_lengths.tolist(), new_lengths.tolist())):
+        first = 0 if window is None else max(0, old - window + int(new > old))
+        first_page = first // BLOCK_SIZE
+        last_page = (new + BLOCK_SIZE - 1) // BLOCK_SIZE
+        pages = block_table[request, first_page:last_page].tolist()
+        for logical, physical in enumerate(pages, first_page):
+            if physical < 0:
+                continue
+            if physical in seen:
+                shared.add(physical)
+            seen.add(physical)
+            if new > old and logical >= old // BLOCK_SIZE:
+                written.add(physical)
+    if shared & written:
+        raise ValueError("writable cache pages must be private; copy shared pages before writing")
+
+
 def build_forward_metadata(
     query_start_loc: torch.Tensor,
     kv_seq_lens: torch.Tensor,
@@ -174,6 +208,8 @@ def build_forward_metadata(
     local_offsets -= query_start_loc[request_ids.to(torch.long)].to(local_offsets.dtype)
     positions = kv_seq_lens[request_ids.to(torch.long)].to(torch.int64) + local_offsets
     window_slots, window_indices, window_lens = window_metadata(positions, request_ids, window_block_table)
+    new_kv_seq_lens = kv_seq_lens.to(torch.int64) + query_lens
+    _validate_writable_pages(window_block_table, kv_seq_lens, new_kv_seq_lens, FLASH.sliding_window)
     compressed_slots: dict[int, torch.Tensor] = {}
     index_slots: dict[int, torch.Tensor] = {}
     state_rows: dict[int, torch.Tensor] = {}
@@ -184,7 +220,6 @@ def build_forward_metadata(
     compressor_source_rows: dict[int, torch.Tensor] = {}
     compressor_positions: dict[int, torch.Tensor] = {}
     compressed_rope_positions: dict[int, torch.Tensor] = {}
-    new_kv_seq_lens = kv_seq_lens.to(torch.int64) + query_lens
     for source in FLASH.kv_source_layer_ids:
         ratio = FLASH.compress_ratios[source]
         storage_rows = BLOCK_SIZE
@@ -199,6 +234,11 @@ def build_forward_metadata(
             pages = (visible_rows + storage_rows - 1) // storage_rows
             if pages > table.shape[1] or bool((table[request, :pages] < 0).any()):
                 raise ValueError(f"source layer {source} has missing visible compressed pages")
+        _validate_writable_pages(
+            table,
+            torch.div(kv_seq_lens, ratio, rounding_mode="floor"),
+            torch.div(new_kv_seq_lens, ratio, rounding_mode="floor"),
+        )
         compressed_slots[source] = paged_slots(
             positions, request_ids, compressed_block_tables[source], storage_rows, ratio, True
         )
