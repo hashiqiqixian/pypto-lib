@@ -151,6 +151,8 @@ def build_forward_metadata(
     """
     if query_start_loc.ndim != 1 or kv_seq_lens.ndim != 1:
         raise ValueError("query_start_loc and kv_seq_lens must be one-dimensional")
+    if any(value.dtype not in (torch.int32, torch.int64) for value in (query_start_loc, kv_seq_lens)):
+        raise ValueError("query_start_loc and kv_seq_lens must contain INT32 or INT64 lengths")
     if query_start_loc.numel() != kv_seq_lens.numel() + 1:
         raise ValueError("query_start_loc must contain one more element than kv_seq_lens")
     query_lens = query_start_loc[1:].to(torch.int64) - query_start_loc[:-1].to(torch.int64)
