@@ -321,7 +321,7 @@ def compressor_state_write(
         position = pl.read(position_ids, [t])
         if request >= 0 and request < pl.tensor.dim(state_block_table, 0):
             begin = pl.read(query_start_loc, [request])
-            end = pl.min(pl.read(query_start_loc, [request + 1]), num_tokens)
+            end = pl.read(query_start_loc, [request + 1])
             block = pl.read(state_block_table, [request, 0])
             if t >= begin and t < end and position >= 0 and block >= 0 and block < blocks:
                 if t + capacity >= end:
