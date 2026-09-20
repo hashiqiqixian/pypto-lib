@@ -32,10 +32,14 @@ def ring_sequence(
     previous_kv: pl.InOut[pl.Tensor[[3, C.T_DYN, C.HEAD_DIM], pl.FP32]],
     previous_scores: pl.InOut[pl.Tensor[[3, C.T_DYN, C.HEAD_DIM], pl.FP32]],
 ):
+    with pl.spmd(3, name_hint="initialize_pair_outputs") as initialized:
+        step = pl.tile.get_block_idx()
+        previous_kv[step, :, :] = pl.full([32, C.HEAD_DIM], dtype=pl.FP32, value=17.0)
+        previous_scores[step, :, :] = pl.full([32, C.HEAD_DIM], dtype=pl.FP32, value=19.0)
     count0 = pl.read(counts, [0])
     pk0 = previous_kv[0]
     ps0 = previous_scores[0]
-    pair0 = compressor_pair(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, pk0, ps0, count0, None)
+    pair0 = compressor_pair(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, pk0, ps0, count0, initialized)
     ready0 = compressor_state_write(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, count0, pair0)
     count1 = pl.read(counts, [1])
     pk1 = previous_kv[1]
