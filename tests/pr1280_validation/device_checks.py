@@ -51,12 +51,13 @@ def ring_sequence(
     previous_scores2: pl.InOut[pl.Tensor[[C.T_DYN, C.HEAD_DIM], pl.FP32]],
 ):
     with pl.spmd(1, name_hint="initialize_pair_outputs") as initialized:
-        previous_kv0[:, :] = pl.full([32, 512], dtype=pl.FP32, value=17.0)
-        previous_scores0[:, :] = pl.full([32, 512], dtype=pl.FP32, value=19.0)
-        previous_kv1[:, :] = pl.full([32, 512], dtype=pl.FP32, value=17.0)
-        previous_scores1[:, :] = pl.full([32, 512], dtype=pl.FP32, value=19.0)
-        previous_kv2[:, :] = pl.full([32, 512], dtype=pl.FP32, value=17.0)
-        previous_scores2[:, :] = pl.full([32, 512], dtype=pl.FP32, value=19.0)
+        row = pl.tile.get_block_idx()
+        previous_kv0[row : row+32, :] = pl.full([32, 512], dtype=pl.FP32, value=17.0)
+        previous_scores0[row : row+32, :] = pl.full([32, 512], dtype=pl.FP32, value=19.0)
+        previous_kv1[row : row+32, :] = pl.full([32, 512], dtype=pl.FP32, value=17.0)
+        previous_scores1[row : row+32, :] = pl.full([32, 512], dtype=pl.FP32, value=19.0)
+        previous_kv2[row : row+32, :] = pl.full([32, 512], dtype=pl.FP32, value=17.0)
+        previous_scores2[row : row+32, :] = pl.full([32, 512], dtype=pl.FP32, value=19.0)
     pair0 = compressor_pair(kv0, scores0, positions0, requests0, starts0, tables0, state, previous_kv0, previous_scores0, count0, initialized)
     ready0 = compressor_state_write(kv0, scores0, positions0, requests0, starts0, tables0, state, count0, pair0)
     pair1 = compressor_pair(kv1, scores1, positions1, requests1, starts1, tables1, state, previous_kv1, previous_scores1, count1, ready0)
