@@ -16,7 +16,7 @@ from models.deepseek_v4_1_flash.attention_tp import OUTPUT_T_DYN
 from models.deepseek_v4_1_flash.hc_mixes import mhc_mixes
 from models.deepseek_v4_1_flash.hc_pre import mhc_pre
 from models.deepseek_v4_1_flash.hc_post import mhc_post
-from models.deepseek_v4_1_flash.moe import moe
+from models.deepseek_v4_1_flash.moe import moe_core
 
 D = C.D
 HC = C.HC_MULT
@@ -221,7 +221,7 @@ def tp_ep_layer_tail(
         moe_input = pl.create_tensor([BLOCK, D], dtype=pl.BF16)
         mhc_pre(after_attention, pre_mix, moe_input)
         moe_output = pl.create_tensor([BLOCK, D], dtype=pl.BF16)
-        moe(
+        moe_core(
             moe_input, norm_weight, gate_weight, correction_bias,
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
             routed_w3, routed_w3_scale, shared_w1, shared_w1_scale,

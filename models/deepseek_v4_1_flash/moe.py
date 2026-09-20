@@ -109,8 +109,8 @@ def golden_moe(
     return result.reshape(shape)
 
 
-@pl.jit
-def moe(
+@pl.jit.inline
+def moe_core(
     x: pl.Tensor[[C.T_DYN, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
@@ -138,7 +138,7 @@ def moe(
     data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    output: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
+    output: pl.Tensor[[C.T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -201,6 +201,54 @@ def moe(
         # would escape its defining scope during PTOAS SSA conversion.
         combine(routed_y, recv_route_local, shared_output, output, recv_meta_local,
                 routed_output, combine_arrived, num_tokens, ep_rank, moe_epoch)
+
+    return output
+
+
+@pl.jit
+def moe(
+    x: pl.Tensor[[C.T_DYN, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
+    correction_bias: pl.Tensor[[C.N_EXPERTS], pl.FP32],
+    # Device ABI: the checkpoint [expert,out,in] FP4 weights are converted offline to
+    # [expert,in,out] FP8.
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, C.MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    shared_w1: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    shared_w2: pl.Tensor[[C.MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[C.MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
+    shared_w3: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
+    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
+    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
+    arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    output: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+    ep_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+):
+    return moe_core(
+        x, norm_weight, gate_weight, correction_bias,
+        routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
+        routed_w3, routed_w3_scale, shared_w1, shared_w1_scale,
+        shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
+        recv_meta, recv_x, recv_scale, recv_weights,
+        recv_routes, arrived, data_arrived, routed_output,
+        combine_arrived, output, num_tokens, ep_rank,
+        moe_epoch,
+    )
 
 
 @pl.jit.host
