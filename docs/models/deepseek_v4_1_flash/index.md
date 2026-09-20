@@ -185,12 +185,19 @@ Validation of this boundary has separate hardware requirements:
   and BF16 EP combine. The TP/mHC boundary has passed TP4/EP8 device checks
   with repeated windows, unequal DP token counts, and empty shards.
 - Production dispatch includes MX scale repacking with `tile.tmov_x2zz`,
-  which has no A3 code generator. An A3 byte-transport diagnostic that omits
-  this step does not validate the complete FP8/MX dispatch or expert path.
+  which has no A3 code generator. An external A3 byte-transport diagnostic
+  has passed six rounds of TP4/EP8 dispatch/combine window reuse, both across
+  rank invocations and within one rank orchestration. It checks payload and
+  scale bytes, weights, route IDs, counts, and returned sums, including empty
+  rounds and an expert receiving 24 rows. It omits final MX scale repacking
+  and substitutes synthetic expert results, so it does not validate the
+  complete FP8/MX dispatch or expert path.
 - The complete tail and all twelve sharded Attention entries have passed A5
-  code generation. Complete-tail device numerics, including FP8/MX experts
-  and repeated EP window reuse, still require A5 hardware. Code generation
-  alone does not establish binary execution or performance acceptance.
+  code generation. The complete tail additionally passes PTOAS assembly and
+  kernel/orchestration binary compilation. Complete-tail device numerics,
+  including FP8/MX experts and repeated EP window reuse, still require A5
+  hardware. These builds do not establish device execution or performance
+  acceptance.
 
 The service capacity contract is 32 active sequences and 4,096 scheduled
 prefill token rows per DP group. With five reserved DSpark draft rows plus one
