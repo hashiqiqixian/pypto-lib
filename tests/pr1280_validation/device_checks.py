@@ -33,11 +33,15 @@ def ring_sequence(
     previous_scores: pl.InOut[pl.Tensor[[3, C.T_DYN, C.HEAD_DIM], pl.FP32]],
 ):
     count = pl.read(counts, [0])
-    pair_ready = compressor_pair(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, previous_kv[0], previous_scores[0], count, None)
+    pk = previous_kv[0]
+    ps = previous_scores[0]
+    pair_ready = compressor_pair(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, pk, ps, count, None)
     state_ready = compressor_state_write(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, count, pair_ready)
     for step in pl.range(1, 3):
         count = pl.read(counts, [step])
-        pair_ready = compressor_pair(kv[step], scores[step], positions[step], requests[step], starts[step], tables[step], state, previous_kv[step], previous_scores[step], count, state_ready)
+        pk_step = previous_kv[step]
+        ps_step = previous_scores[step]
+        pair_ready = compressor_pair(kv[step], scores[step], positions[step], requests[step], starts[step], tables[step], state, pk_step, ps_step, count, state_ready)
         state_ready = compressor_state_write(kv[step], scores[step], positions[step], requests[step], starts[step], tables[step], state, count, pair_ready)
     return state, previous_kv, previous_scores
 

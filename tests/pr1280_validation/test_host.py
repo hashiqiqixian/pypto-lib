@@ -73,7 +73,8 @@ def test_builder(empty):
     if not empty:
         for s in state:
             assert m.compressed_slots[s].tolist() == [-1]
-        tables[next(iter(tables))][0, 0] = -1
+        for table in tables.values():
+            table[0, 0] = -1
         with pytest.raises(ValueError, match='visible compressed'):
             build_forward_metadata(q, kv, window, tables, state_block_tables=state)
 
@@ -113,7 +114,7 @@ def test_lifecycle():
 def test_chunked(capacity):
     torch.manual_seed(42)
     x = torch.randn(19, 16, dtype=torch.bfloat16)
-    wk, wg, norm = torch.randn(16, 8), torch.randn(16, 8), torch.ones(8)
+    wk, wg, norm = torch.eye(16)[:, :8], torch.eye(16)[:, 8:], torch.ones(8)
     state = torch.zeros(1, capacity, 16)
     expected, _ = compressor_ratio2_paged(x, torch.arange(19), torch.tensor([0, 19]), torch.zeros(19, dtype=torch.int32), torch.tensor([[0]]), state, wk, wg, norm)
     split = torch.zeros(3, capacity, 16)
@@ -132,4 +133,3 @@ def test_goldens(phase, variant, ratio, mode):
     from models.deepseek_v4_1_flash._golden_smoke import run_attention_golden
     m = importlib.import_module(f'models.deepseek_v4_1_flash.{phase}_{variant}')
     run_attention_golden(getattr(m, f'golden_{phase}_{variant}'), ratio, mode)
-
