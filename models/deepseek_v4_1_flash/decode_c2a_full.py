@@ -221,6 +221,7 @@ def compressor_pair(
     """Read pair partners before any ring positions can be overwritten."""
     blocks = pl.tensor.dim(state_cache, 0)
     capacity = pl.tensor.dim(state_cache, 1)
+    flat = pl.reshape(state_cache, [blocks, capacity * (2 * HEAD_DIM)])
     with pl.spmd(num_tokens, name_hint="c2a_compressor_pair", deps=[state_ready]) as pair_tid:
         t = pl.tile.get_block_idx()
         prev_kv[t : t + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
@@ -237,9 +238,9 @@ def compressor_pair(
                         prev_kv[t : t + 1, :] = kv_proj[t - 1 : t, :]
                         prev_score[t : t + 1, :] = score_proj[t - 1 : t, :]
                     else:
-                        slot = (position - 1) % capacity
-                        prev_kv[t : t + 1, :] = state_cache[block, slot : slot + 1, :HEAD_DIM]
-                        prev_score[t : t + 1, :] = state_cache[block, slot : slot + 1, HEAD_DIM:]
+                        offset = ((position - 1) % capacity) * (2 * HEAD_DIM)
+                        prev_kv[t : t + 1, :] = flat[block : block + 1, offset : offset + HEAD_DIM]
+                        prev_score[t : t + 1, :] = flat[block : block + 1, offset + HEAD_DIM : offset + 2 * HEAD_DIM]
     return pair_tid
 
 
@@ -315,6 +316,7 @@ def compressor_state_write(
     """
     blocks = pl.tensor.dim(state_cache, 0)
     capacity = pl.tensor.dim(state_cache, 1)
+    flat = pl.reshape(state_cache, [blocks, capacity * (2 * HEAD_DIM)])
     with pl.spmd(num_tokens, name_hint="c2a_compressor_state", deps=[pair_ready]) as state_tid:
         t = pl.tile.get_block_idx()
         request = pl.cast(pl.read(token_to_req_indices, [t]), pl.INDEX)
@@ -325,9 +327,9 @@ def compressor_state_write(
             block = pl.read(state_block_table, [request, 0])
             if t >= begin and t < end and position >= 0 and block >= 0 and block < blocks:
                 if t + capacity >= end:
-                    slot = position % capacity
-                    state_cache[block, slot : slot + 1, :HEAD_DIM] = kv_proj[t : t + 1, :]
-                    state_cache[block, slot : slot + 1, HEAD_DIM:] = score_proj[t : t + 1, :]
+                    offset = (position % capacity) * (2 * HEAD_DIM)
+                    flat[block : block + 1, offset : offset + HEAD_DIM] = kv_proj[t : t + 1, :]
+                    flat[block : block + 1, offset + HEAD_DIM : offset + 2 * HEAD_DIM] = score_proj[t : t + 1, :]
     return state_tid
 
 
