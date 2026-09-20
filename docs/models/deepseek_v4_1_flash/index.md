@@ -128,11 +128,11 @@ sees the same token batch. `wq_a`, `wkv`, compressor, indexer, and the
 single-head KV caches are replicated. `wq_b`, query heads, attention sinks,
 and output groups are sharded across TP ranks. Each rank computes
 16 query heads and two output groups. Standalone Attention entries retain
-all-reduce. Layer integration uses the `*_sharded` Attention leaves followed
+all-reduce. Layer integration uses Attention leaves with `reduce_scatter=True`, followed
 by [tp_ep_layer.py](../../../models/deepseek_v4_1_flash/tp_ep_layer.py):
 
 1. Run Attention mHC pre on the replicated residual stream.
-2. Call the mode-specific `*_sharded` Attention leaf. ReduceScatter sums FP32
+2. Call the mode-specific Attention leaf with `reduce_scatter=True`. It sums FP32
    projection partials and writes this rank's contiguous token range, with
    one BF16 cast after accumulation.
 3. Call `tp_ep_layer_tail` with that shard, the original residual, and the
@@ -140,11 +140,13 @@ by [tp_ep_layer.py](../../../models/deepseek_v4_1_flash/tp_ep_layer.py):
    SUM, runs Attention mHC post, MoE mHC pre, EP MoE, and MoE mHC post, then
    gathers the FP32 residual streams within the TP group.
 
-Prefill SWA and C2A sharded leaves live in `prefill_attn_*`; their `prefill_*`
-mHC wrappers retain the standalone replicated-output path. Decode C1A sharded
+Prefill SWA and C2A leaves live in `prefill_attn_*`; their `prefill_*`
+mHC wrappers retain the standalone replicated-output path. Decode C1A
 leaves live in `decode_attn_c1a_*`; the `decode_c1a_*` mHC wrappers retain
-the replicated-output path. C1A prefill and the other decode leaves export
-`*_sharded` in their existing files. Do not feed an
+the replicated-output path. The layout flag is `pl.constexpr`: it is removed
+from the device ABI. Direct Python compilation defaults to `False`; DSL
+callers must explicitly pass `False` (AllReduce) or `True` (ReduceScatter).
+Do not feed an
 already all-reduced output to ReduceScatter, or apply Attention mHC post twice.
 
 For a DP group's `T` active rows and local TP rank `r`, the range is
@@ -197,7 +199,7 @@ stacked weights and one active token count per rank. It starts after
 Attention ReduceScatter; callers supply the mode-specific Attention inputs
 and cache metadata separately. DSA context parallelism is outside this boundary.
 
-The complete tail and all twelve sharded Attention entries pass A5 code
+The complete tail and all twelve Attention modes with ReduceScatter pass A5 code
 generation; the tail also passes binary compilation. A3 TP4/EP8 checks cover
 reduction, mHC/residual reconstruction and byte-transport diagnostics. A5
 TP2/EP4 and TP4/EP4 full-tail checks cover actual FP8/MX experts, dispatch,

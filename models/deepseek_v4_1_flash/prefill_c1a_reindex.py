@@ -54,9 +54,7 @@ from models.deepseek_v4_1_flash.attention_common import (
     golden_compressed_attention,
     quantized_cache_compare,
 )
-from models.deepseek_v4_1_flash.attention_tp import (
-    prefill_tp_output_all_reduce, prefill_tp_output_reduce_scatter, OUTPUT_T_DYN,
-)
+from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce, OUTPUT_T_DYN
 from models.deepseek_v4_1_flash.config import AttentionMode
 
 
@@ -175,7 +173,7 @@ def golden_prefill_c1a_reindex(
     )
 
 
-def make_prefill_c1a_reindex(indexer, output_reduce=prefill_tp_output_all_reduce):
+def make_prefill_c1a_reindex(indexer):
     @pl.jit.inline(auto_scope=False)
     def prefill_c1a_reindex_impl(
         x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
@@ -220,6 +218,7 @@ def make_prefill_c1a_reindex(indexer, output_reduce=prefill_tp_output_all_reduce
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
         attention_epoch: pl.Scalar[pl.INT32],
+        reduce_scatter: pl.constexpr = False,
     ):
         """Refresh ratio-1 Top-K rows inside a supplied candidate set."""
         tokens = pl.tensor.dim(x, 0)
@@ -277,7 +276,7 @@ def make_prefill_c1a_reindex(indexer, output_reduce=prefill_tp_output_all_reduce
             partial,
             num_tokens,
         )
-        output_reduce(
+        prefill_tp_output_all_reduce(
             partial,
             output_window,
             output_arrived,
@@ -285,7 +284,7 @@ def make_prefill_c1a_reindex(indexer, output_reduce=prefill_tp_output_all_reduce
             group_base,
             tp_rank,
             num_tokens,
-            attention_epoch,
+            attention_epoch, reduce_scatter,
         )
         return output
 
@@ -293,7 +292,6 @@ def make_prefill_c1a_reindex(indexer, output_reduce=prefill_tp_output_all_reduce
 
 
 prefill_c1a_reindex = make_prefill_c1a_reindex(paged_indexer)
-prefill_c1a_reindex_sharded = make_prefill_c1a_reindex(paged_indexer, prefill_tp_output_reduce_scatter)
 prefill_c1a_reindex_watch = make_prefill_c1a_reindex(paged_indexer_direct)
 
 
@@ -355,7 +353,7 @@ def prefill_c1a_reindex_test(
         compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table, candidate_mask,
         index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices,
-        output_window, output_arrived, output, 0, tp_rank, num_tokens, 1,
+        output_window, output_arrived, output, 0, tp_rank, num_tokens, 1, False,
     )
 
 
@@ -458,11 +456,7 @@ def golden_prefill_c1a_reindex_case(tensors):
     apply_distributed_golden("reindex", golden_prefill_c1a_reindex, tensors)
 
 
-__all__ = [
-    "golden_prefill_c1a_reindex",
-    "prefill_c1a_reindex",
-    "prefill_c1a_reindex_sharded",
-]
+__all__ = ["golden_prefill_c1a_reindex", "prefill_c1a_reindex"]
 
 
 if __name__ == _SCRIPT_ENTRY_POINT:

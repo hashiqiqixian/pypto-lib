@@ -196,7 +196,7 @@ def tp_ep_layer_tail(
     moe_epoch_base: pl.Scalar[pl.INT32],
     residual_epoch: pl.Scalar[pl.INT32],
 ):
-    """Complete a layer after any *_sharded Attention entry.
+    """Complete a layer after Attention with reduce_scatter=True.
 
     All EP ranks use the same positive shard capacity and therefore the same
     number of MoE rounds, even when their DP token counts differ or are zero.
@@ -248,6 +248,7 @@ def tp_ep_layer_tail(
     tp_residual_all_gather(shard, residual_window, residual_arrived, output,
                            group_base, tp_rank, num_tokens, residual_epoch)
     return output
+
 
 
 @pl.jit.host
