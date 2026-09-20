@@ -63,19 +63,21 @@ def materialize_rope_rows(
     Padding rows are untouched. Return the producer TaskId for consumers that
     use explicit dependencies, as the attention entries do with cache_ready.
     """
-    with pl.spmd(num_tokens, name_hint="v41_rope_rows") as rope_ready:
-        token = pl.tile.get_block_idx()
-        position = pl.cast(pl.read(position_ids, [token]), pl.INDEX)
-        if position >= 0:
-            rope_cos[token : token + 1, :] = freqs_cos[position : position + 1, :]
-            rope_sin[token : token + 1, :] = freqs_sin[position : position + 1, :]
-        else:
-            rope_cos[token : token + 1, :] = pl.full(
-                [1, ROPE_DIM // 2], dtype=pl.FP32, value=1.0
-            )
-            rope_sin[token : token + 1, :] = pl.full(
-                [1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0
-            )
+    # A fixed worker grid also supports idle ranks: never submit core_num=0.
+    with pl.spmd(32, name_hint="v41_rope_rows") as rope_ready:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens, 32):
+            position = pl.cast(pl.read(position_ids, [token]), pl.INDEX)
+            if position >= 0:
+                rope_cos[token : token + 1, :] = freqs_cos[position : position + 1, :]
+                rope_sin[token : token + 1, :] = freqs_sin[position : position + 1, :]
+            else:
+                rope_cos[token : token + 1, :] = pl.full(
+                    [1, ROPE_DIM // 2], dtype=pl.FP32, value=1.0
+                )
+                rope_sin[token : token + 1, :] = pl.full(
+                    [1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0
+                )
     return rope_ready
 
 
