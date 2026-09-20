@@ -54,7 +54,22 @@ rows remain untouched; zero active tokens launch no row work. V4.1 retains
 FP32 half-width tables for adjacent-pair rotation, rather than adopting V4's
 BF16 full-width representation.
 
-Inside a `@pl.jit` serving wrapper, compose the stage before attention:
+The exported `decode_c2a_full` and `prefill_c2a_full` entries now perform this
+gather before calling their shared attention implementation. Pass `freqs_cos`
+and `freqs_sin` for the query profile, `compressed_freqs_cos` and
+`compressed_freqs_sin` for the compressed profile, and
+`metadata.compressed_rope_positions[source]` as `compressed_rope_positions`.
+All four full tables use the same position capacity. These replace the four
+token-major RoPE arguments on these two entries; existing callers must migrate
+their arguments. `position_ids` still supplies the query positions.
+
+Both executable C2A drivers use this interface through `make_program`, including
+repeated attention epochs. Full tables are graph inputs; their generation in
+the driver is fixture initialization, not work performed during dispatch.
+The shared low-level `c2a_full_partial` keeps its token-major RoPE interface.
+Other attention modes and the external serving adapter are not migrated here.
+
+For a caller composing a different low-level attention entry, use:
 
 ```python
 rope_ready = materialize_rope_rows(
@@ -62,13 +77,15 @@ rope_ready = materialize_rope_rows(
 )
 ```
 
-The returned producer TaskId can be passed through the attention entry's
+The returned producer TaskId can be passed through the low-level entry's
 `cache_ready` dependency alongside other required producers. Attention's
 existing low-level arguments still consume token-major rows. For compressed
 publication, call the same stage with the compressed profile's full tables
 and `metadata.compressed_rope_positions[source]`, which already contains
 compression-group start positions or `-1`. Preserve dependencies on both
-query and compressed row producers when composing Full attention. Serving
+query and compressed row producers when composing attention. The C2A Full
+entries pass the gathered tensors directly to their RoPE consumers; their
+existing cache-publication and previous-epoch dependencies are retained. Serving
 owns graph composition, profile choice, table capacity and lifetime.
 
 `precompute_rope_tables` remains a CPU initialization utility when the caller
