@@ -21,6 +21,8 @@ from golden import ScalarSpec, TensorSpec, run
 from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.decode_c2a_full import IDX_PACKED, IDX_SCALES, LEAF, index_select
 
+QUERY_WIDTH = C.INDEX_H * C.INDEX_DIM
+
 
 @pl.jit
 def index_entry(
@@ -37,7 +39,7 @@ def index_entry(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(query_input, 0)
-    query = pl.create_tensor([tokens, C.INDEX_H * C.INDEX_DIM], dtype=pl.BF16)
+    query = pl.create_tensor([tokens, QUERY_WIDTH], dtype=pl.BF16)
     # A real producer supplies the existing publication dependency argument.
     with pl.spmd(num_tokens, name_hint="validation_query_publish") as publish_ready:
         token = pl.tile.get_block_idx()
