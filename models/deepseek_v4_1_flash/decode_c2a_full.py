@@ -549,16 +549,22 @@ def index_select(
         if length <= INDEX_TOPK:
             for c in pl.range(INDEX_TOPK // SCORE_TILE):
                 p0 = c * SCORE_TILE
-                block_id = pl.read(block_table, [request, p0 // 128])
-                ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
-                # Integer scalars broadcast correctly into a tensor op; an FP32 runtime
-                # scalar does not, and a one-element column is below the tile alignment.
-                slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
-                visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
-                block_base = pl.cast(block_id * 128 + p0 % 128, pl.INT32)
-                physical = pl.cast(pl.add(ramp, block_base), pl.FP32)
-                masked = pl.sub(pl.mul(visible, pl.add(physical, 1.0)), 1.0)
-                topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.cast(masked, pl.INT32, mode="rint")
+                # Inactive tiles need no page-table entry.
+                if p0 < length:
+                    block_id = pl.read(block_table, [request, p0 // 128])
+                    ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
+                    # Integer scalars broadcast correctly into a tensor op; an FP32 runtime
+                    # scalar does not, and a one-element column is below the tile alignment.
+                    slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
+                    visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
+                    block_base = pl.cast(block_id * 128 + p0 % 128, pl.INT32)
+                    physical = pl.cast(pl.add(ramp, block_base), pl.FP32)
+                    masked = pl.sub(pl.mul(visible, pl.add(physical, 1.0)), 1.0)
+                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.cast(masked, pl.INT32, mode="rint")
+                else:
+                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.full(
+                        [1, SCORE_TILE], dtype=pl.INT32, value=-1
+                    )
         else:
             running = pl.tile.full([1, PAIR_WIDTH], dtype=pl.FP32, value=SORT_FLOOR)
             weight_row = pl.reshape(pl.cast(weights[t : t + 1, :], pl.FP32), [INDEX_H, 1])
@@ -566,81 +572,90 @@ def index_select(
                 leaf_base = leaf * LEAF
                 for c in pl.range(LEAF_TILES):
                     p0 = leaf_base + c * SCORE_TILE
-                    block_id = pl.read(block_table, [request, p0 // 128])
-                    base = pl.cast(pl.max(block_id, 0), pl.INDEX) * 128 + p0 % 128
-                    packed = flat[base : base + SCORE_TILE, :]
-                    wide = pl.reinterpret_view(pl.cast(packed, target_type=pl.UINT16), pl.INT16)
-                    low = pl.ands(wide, 15)
-                    high = pl.ands(pl.shrs(wide, 4), 15)
-                    low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
-                    low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
-                    low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
-                    # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                    # unsupported integer cast on the exponent-assembly path.
-                    low_pow2 = pl.div(
-                        pl.add(pl.add(pl.mul(pl.mul(low_exponent, low_exponent), low_exponent),
-                                      pl.mul(low_exponent, 5.0)), 6.0),
-                        6.0,
-                    )
-                    low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
-                    low_is_normal = pl.minimum(low_exponent, 1.0)
-                    low_magnitude = pl.add(
-                        pl.mul(low_is_normal, low_normal),
-                        pl.mul(pl.mul(pl.sub(low_is_normal, 1.0), -1.0), pl.mul(low_fraction, 0.5)),
-                    )
-                    low_value = pl.mul(low_magnitude, pl.mul(pl.sub(pl.mul(low_sign, 2.0), 1.0), -1.0))
-                    high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
-                    high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
-                    high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
-                    # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                    # unsupported integer cast on the exponent-assembly path.
-                    high_pow2 = pl.div(
-                        pl.add(pl.add(pl.mul(pl.mul(high_exponent, high_exponent), high_exponent),
-                                      pl.mul(high_exponent, 5.0)), 6.0),
-                        6.0,
-                    )
-                    high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
-                    high_is_normal = pl.minimum(high_exponent, 1.0)
-                    high_magnitude = pl.add(
-                        pl.mul(high_is_normal, high_normal),
-                        pl.mul(pl.mul(pl.sub(high_is_normal, 1.0), -1.0), pl.mul(high_fraction, 0.5)),
-                    )
-                    high_value = pl.mul(high_magnitude, pl.mul(pl.sub(pl.mul(high_sign, 2.0), 1.0), -1.0))
-                    scale_tile = pl.slice(scale_wide, [SCORE_TILE // 8, 32], [base // 8, 0])
-                    raw_codes = pl.reinterpret_view(scale_tile, pl.UINT8)
-                    signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                    codes = pl.ands(signed_codes, 255)
-                    factors = pl.reinterpret_view(
-                        pl.maximum(pl.shls(codes, 23), E8M0_FLOOR_BITS), pl.FP32
-                    )
-                    factor_column = pl.reshape(factors, [SCORE_TILE * IDX_SCALES, 1])
-                    low_scaled = pl.reshape(
-                        pl.row_expand_mul(
-                            pl.reshape(low_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
-                        ),
-                        [SCORE_TILE, IDX_PACKED],
-                    )
-                    high_scaled = pl.reshape(
-                        pl.row_expand_mul(
-                            pl.reshape(high_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
-                        ),
-                        [SCORE_TILE, IDX_PACKED],
-                    )
-                    keys = pl.concat(
-                        pl.cast(low_scaled, pl.BF16, mode="rint"),
-                        pl.cast(high_scaled, pl.BF16, mode="rint"),
-                    )
-                    query_tile = query_flat[t * INDEX_H : t * INDEX_H + INDEX_H, :]
-                    scored = pl.maximum(pl.matmul(query_tile, keys, b_trans=True), 0.0)
-                    row = pl.col_sum(pl.row_expand_mul(scored, weight_row))
-                    ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
-                    slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
-                    visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
-                    row = pl.maximum(pl.add(row, pl.mul(pl.sub(visible, 1.0), MASK_BIAS)), SORT_FLOOR)
-                    leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = row
-                    leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.add(
-                        ramp, pl.cast(base, pl.INT32)
-                    )
+                    # The last leaf may extend beyond the visible page table.
+                    if p0 < length:
+                        block_id = pl.read(block_table, [request, p0 // 128])
+                        base = pl.cast(pl.max(block_id, 0), pl.INDEX) * 128 + p0 % 128
+                        packed = flat[base : base + SCORE_TILE, :]
+                        wide = pl.reinterpret_view(pl.cast(packed, target_type=pl.UINT16), pl.INT16)
+                        low = pl.ands(wide, 15)
+                        high = pl.ands(pl.shrs(wide, 4), 15)
+                        low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
+                        low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
+                        low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
+                        # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
+                        # unsupported integer cast on the exponent-assembly path.
+                        low_pow2 = pl.div(
+                            pl.add(pl.add(pl.mul(pl.mul(low_exponent, low_exponent), low_exponent),
+                                          pl.mul(low_exponent, 5.0)), 6.0),
+                            6.0,
+                        )
+                        low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
+                        low_is_normal = pl.minimum(low_exponent, 1.0)
+                        low_magnitude = pl.add(
+                            pl.mul(low_is_normal, low_normal),
+                            pl.mul(pl.mul(pl.sub(low_is_normal, 1.0), -1.0), pl.mul(low_fraction, 0.5)),
+                        )
+                        low_value = pl.mul(low_magnitude, pl.mul(pl.sub(pl.mul(low_sign, 2.0), 1.0), -1.0))
+                        high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
+                        high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
+                        high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
+                        # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
+                        # unsupported integer cast on the exponent-assembly path.
+                        high_pow2 = pl.div(
+                            pl.add(pl.add(pl.mul(pl.mul(high_exponent, high_exponent), high_exponent),
+                                          pl.mul(high_exponent, 5.0)), 6.0),
+                            6.0,
+                        )
+                        high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
+                        high_is_normal = pl.minimum(high_exponent, 1.0)
+                        high_magnitude = pl.add(
+                            pl.mul(high_is_normal, high_normal),
+                            pl.mul(pl.mul(pl.sub(high_is_normal, 1.0), -1.0), pl.mul(high_fraction, 0.5)),
+                        )
+                        high_value = pl.mul(high_magnitude, pl.mul(pl.sub(pl.mul(high_sign, 2.0), 1.0), -1.0))
+                        scale_tile = pl.slice(scale_wide, [SCORE_TILE // 8, 32], [base // 8, 0])
+                        raw_codes = pl.reinterpret_view(scale_tile, pl.UINT8)
+                        signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
+                        codes = pl.ands(signed_codes, 255)
+                        factors = pl.reinterpret_view(
+                            pl.maximum(pl.shls(codes, 23), E8M0_FLOOR_BITS), pl.FP32
+                        )
+                        factor_column = pl.reshape(factors, [SCORE_TILE * IDX_SCALES, 1])
+                        low_scaled = pl.reshape(
+                            pl.row_expand_mul(
+                                pl.reshape(low_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
+                            ),
+                            [SCORE_TILE, IDX_PACKED],
+                        )
+                        high_scaled = pl.reshape(
+                            pl.row_expand_mul(
+                                pl.reshape(high_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
+                            ),
+                            [SCORE_TILE, IDX_PACKED],
+                        )
+                        keys = pl.concat(
+                            pl.cast(low_scaled, pl.BF16, mode="rint"),
+                            pl.cast(high_scaled, pl.BF16, mode="rint"),
+                        )
+                        query_tile = query_flat[t * INDEX_H : t * INDEX_H + INDEX_H, :]
+                        scored = pl.maximum(pl.matmul(query_tile, keys, b_trans=True), 0.0)
+                        row = pl.col_sum(pl.row_expand_mul(scored, weight_row))
+                        ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
+                        slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
+                        visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
+                        row = pl.maximum(pl.add(row, pl.mul(pl.sub(visible, 1.0), MASK_BIAS)), SORT_FLOOR)
+                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = row
+                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.add(
+                            ramp, pl.cast(base, pl.INT32)
+                        )
+                    else:
+                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
+                            [1, SCORE_TILE], dtype=pl.FP32, value=SORT_FLOOR
+                        )
+                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
+                            [1, SCORE_TILE], dtype=pl.INT32, value=-1
+                        )
                 score_row = pl.load(leaf_scores, [t, 0], [1, LEAF], target_memory=pl.Mem.Vec)
                 row_ids = pl.load(leaf_rows, [t, 0], [1, LEAF], target_memory=pl.Mem.Vec)
                 pairs = pl.sort32(score_row, pl.reinterpret_view(row_ids, pl.UINT32))
