@@ -53,6 +53,8 @@ def host_checks(mode):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--tp', type=int, default=1, choices=[1])
+    parser.add_argument('--ep', type=int, default=2, choices=[2])
     parser.add_argument('--mode', choices=['decode', 'prefill'], default='decode')
     parser.add_argument('--platform', choices=['a5', 'a5sim'], default='a5sim')
     parser.add_argument('--compile-only', action='store_true')
