@@ -154,6 +154,7 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--host-only", action="store_true")
     parser.add_argument("--runtime-dir")
+    parser.add_argument("--platform", choices=("a5", "a5sim", "a2a3"), default="a5")
     parser.add_argument("--device", type=int, default=int(os.environ.get("TASK_DEVICE", "0")))
     args = parser.parse_args()
     torch.set_num_threads(1)
@@ -174,7 +175,7 @@ def main():
         result = run(
             fn=index_entry, specs=specs, golden_fn=reference, compile_only=args.compile_only,
             runtime_dir=args.runtime_dir,
-            config=dict(platform="a2a3", device_id=args.device, dump_passes=True),
+            config=dict(platform=args.platform, device_id=args.device, dump_passes=True),
             compare_fn={"topk_indices": exact, "leaf_rows": exact}, rtol=0, atol=0,
         )
         record = dict(case=name, passed=result.passed, work_dir=str(result.work_dir), error=str(result.error))
