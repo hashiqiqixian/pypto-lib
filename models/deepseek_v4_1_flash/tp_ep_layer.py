@@ -50,7 +50,8 @@ def pack_layer_shard(
     count: pl.Scalar[pl.INT32],
 ):
     """Select matching residual/mHC rows without reducing their TP replicas."""
-    full_flat = pl.reshape(residual, [pl.tensor.dim(residual, 0), HC_DIM])
+    full_rows = pl.tensor.dim(residual, 0)
+    full_flat = pl.reshape(residual, [full_rows, HC_DIM])
     local_flat = pl.reshape(residual_block, [BLOCK, HC_DIM])
     for t in pl.spmd(BLOCK, name_hint="tp_ep_pack"):
         source = shard_first + block_first + t
@@ -89,7 +90,8 @@ def unpack_layer_shard(
     count: pl.Scalar[pl.INT32],
 ):
     block_flat = pl.reshape(block, [BLOCK, HC_DIM])
-    shard_flat = pl.reshape(shard, [pl.tensor.dim(shard, 0), HC_DIM])
+    shard_rows = pl.tensor.dim(shard, 0)
+    shard_flat = pl.reshape(shard, [shard_rows, HC_DIM])
     for t in pl.spmd(BLOCK, name_hint="tp_ep_unpack"):
         if t < count:
             for col in pl.range(0, HC_DIM, 512):
@@ -112,8 +114,10 @@ def tp_residual_all_gather(
     width = (num_tokens + TP_SIZE - 1) // TP_SIZE
     first = pl.min(tp_rank * width, num_tokens)
     count = pl.min(width, num_tokens - first)
-    flat = pl.reshape(shard, [pl.tensor.dim(shard, 0), HC_DIM])
-    output_flat = pl.reshape(output, [pl.tensor.dim(output, 0), HC_DIM])
+    shard_rows = pl.tensor.dim(shard, 0)
+    flat = pl.reshape(shard, [shard_rows, HC_DIM])
+    output_rows = pl.tensor.dim(output, 0)
+    output_flat = pl.reshape(output, [output_rows, HC_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_hc_reuse", allow_early_resolve=False) as reused:
         for peer in pl.range(TP_SIZE):
             pld.system.wait(arrived, offsets=[peer, 0], expected=(epoch - 1) * 2, cmp=pld.WaitCmp.Ge)
