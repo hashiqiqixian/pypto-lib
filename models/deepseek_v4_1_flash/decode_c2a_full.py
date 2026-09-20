@@ -562,7 +562,7 @@ def index_select(
                     masked = pl.sub(pl.mul(visible, pl.add(physical, 1.0)), 1.0)
                     topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.cast(masked, pl.INT32, mode="rint")
                 else:
-                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.tile.full(
+                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.full(
                         [1, SCORE_TILE], dtype=pl.INT32, value=-1
                     )
         else:
@@ -650,10 +650,10 @@ def index_select(
                             ramp, pl.cast(base, pl.INT32)
                         )
                     else:
-                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.tile.full(
+                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
                             [1, SCORE_TILE], dtype=pl.FP32, value=SORT_FLOOR
                         )
-                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.tile.full(
+                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
                             [1, SCORE_TILE], dtype=pl.INT32, value=-1
                         )
                 score_row = pl.load(leaf_scores, [t, 0], [1, LEAF], target_memory=pl.Mem.Vec)
