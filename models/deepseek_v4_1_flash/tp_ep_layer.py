@@ -31,6 +31,7 @@ RECV_MAX = C.EP_SIZE * C.MOE_TOKENS
 AUX_WIDTH = C.AUX_WIDTH
 ROUTE_WIDTH = C.ROUTE_WIDTH
 BLOCK = C.MOE_TOKENS
+TOPK = C.TOPK
 SHARD_MAX = (C.PREFILL_MAX_TOKENS + TP_SIZE - 1) // TP_SIZE
 
 
@@ -277,7 +278,7 @@ def l3_tp_ep_layer_tail(
     recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-    routed_output_buf = pld.alloc_window_buffer([BLOCK * C.TOPK, D], dtype=pl.BF16)
+    routed_output_buf = pld.alloc_window_buffer([BLOCK * TOPK, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
 
     residual_buf = pld.alloc_window_buffer([SHARD_MAX, HC_DIM], dtype=pl.FP32)
@@ -290,7 +291,7 @@ def l3_tp_ep_layer_tail(
         recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
         arrived = pld.window(arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buf, [BLOCK * C.TOPK, D], dtype=pl.BF16)
+        routed_output = pld.window(routed_output_buf, [BLOCK * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
         residual_window = pld.window(residual_buf, [SHARD_MAX, HC_DIM], dtype=pl.FP32)
         residual_arrived = pld.window(residual_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
