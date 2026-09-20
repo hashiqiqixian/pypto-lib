@@ -402,11 +402,11 @@ def make_c1a_reduce(scatter=False):
                     output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1, cmp=pld.WaitCmp.Ge
                 )
         first = pl.cast(0, pl.INT32)
-        count = num_tokens
+        count = pl.cast(num_tokens, pl.INT32)
         if scatter:
             width = (num_tokens + TP_SIZE - 1) // TP_SIZE
-            first = pl.min(tp_rank * width, num_tokens)
-            count = pl.min(width, num_tokens - first)
+            first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
+            count = pl.cast(pl.min(width, num_tokens - first), pl.INT32)
         with pl.spmd(32, name_hint="c1a_tp_reduce", deps=[arrived]) as reduced:
             worker = pl.tile.get_block_idx()
             for tile in pl.range(worker, count * (D // 512), 32):

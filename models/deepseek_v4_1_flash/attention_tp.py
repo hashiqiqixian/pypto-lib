@@ -35,11 +35,11 @@ def make_prefill_tp_output_reduce(scatter=False):
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         first = pl.cast(0, pl.INT32)
-        count = num_tokens
+        count = pl.cast(num_tokens, pl.INT32)
         if scatter:
             width = (num_tokens + TP_SIZE - 1) // TP_SIZE
-            first = pl.min(tp_rank * width, num_tokens)
-            count = pl.min(width, num_tokens - first)
+            first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
+            count = pl.cast(pl.min(width, num_tokens - first), pl.INT32)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_reuse", allow_early_resolve=False) as reuse_tid:
             for peer in pl.range(TP_SIZE):
                 previous_epoch = (attention_epoch - 1) * 2
@@ -102,11 +102,11 @@ def make_decode_tp_output_reduce(scatter=False):
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         first = pl.cast(0, pl.INT32)
-        count = num_tokens
+        count = pl.cast(num_tokens, pl.INT32)
         if scatter:
             width = (num_tokens + TP_SIZE - 1) // TP_SIZE
-            first = pl.min(tp_rank * width, num_tokens)
-            count = pl.min(width, num_tokens - first)
+            first = pl.cast(pl.min(tp_rank * width, num_tokens), pl.INT32)
+            count = pl.cast(pl.min(width, num_tokens - first), pl.INT32)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_tp_reuse", allow_early_resolve=False) as reuse_tid:
             for peer in pl.range(TP_SIZE):
                 pld.system.wait(output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
