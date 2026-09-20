@@ -148,7 +148,18 @@ def golden_rope(v):
 
 
 def specs(values):
-    return [TensorSpec(k, list(v.shape), v.dtype, init_value=v) if isinstance(v, torch.Tensor) else ScalarSpec(k, torch.int32, v) for k,v in values.items()]
+    return [TensorSpec(k, list(v.shape), v.dtype, init_value=v) if isinstance(v, torch.Tensor) else ScalarSpec(k, torch.int32, v, compile_runtime=True) for k,v in values.items()]
+
+
+def exact_compare(name):
+    def compare(actual, expected, **kwargs):
+        same = torch.equal(actual, expected)
+        if not same:
+            mismatch = actual != expected
+            rows = mismatch.reshape(actual.shape[0], -1).any(dim=1).nonzero().flatten().tolist()
+            print(f'DIFF {name}: rows={rows} max_abs={(actual.float()-expected.float()).abs().max().item()}', flush=True)
+        return same, 'exact copy/state comparison'
+    return compare
 
 
 def main():
@@ -173,7 +184,7 @@ def main():
             continue
         print(f'CASE {name}',flush=True)
         try:
-            result=run(fn=fn,specs=specs(values),golden_fn=reference,compile_only=args.compile_only,config=dict(platform='a2a3',device_id=args.device),rtol=0,atol=0)
+            result=run(fn=fn,specs=specs(values),golden_fn=reference,compile_only=args.compile_only,config=dict(platform='a2a3',device_id=args.device),compare_fn={k: exact_compare(k) for k in values if k.startswith(('previous_', 'out_')) or k == 'state'},rtol=0,atol=0)
             print(f'RESULT {name} passed={result.passed} work_dir={result.work_dir} error={result.error}',flush=True)
             if not result.passed:
                 failures.append(name)
