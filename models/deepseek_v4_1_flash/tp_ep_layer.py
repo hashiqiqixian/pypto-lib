@@ -33,6 +33,7 @@ ROUTE_WIDTH = C.ROUTE_WIDTH
 BLOCK = C.MOE_TOKENS
 TOPK = C.TOPK
 SHARD_MAX = (C.PREFILL_MAX_TOKENS + TP_SIZE - 1) // TP_SIZE
+SIGNAL_WINDOW_BYTES = 64
 
 
 @pl.jit.inline
@@ -284,13 +285,15 @@ def l3_tp_ep_layer_tail(
     recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
     recv_weights_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
     recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    # The runtime carves buffers consecutively; isolate signal cache maintenance
+    # from adjacent payloads while retaining the packed logical counter views.
+    arrived_buf = pld.alloc_window_buffer(SIGNAL_WINDOW_BYTES)
+    data_arrived_buf = pld.alloc_window_buffer(SIGNAL_WINDOW_BYTES)
     routed_output_buf = pld.alloc_window_buffer([BLOCK * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer(SIGNAL_WINDOW_BYTES)
 
     residual_buf = pld.alloc_window_buffer([SHARD_MAX, HC_DIM], dtype=pl.FP32)
-    residual_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    residual_signal_buf = pld.alloc_window_buffer(SIGNAL_WINDOW_BYTES)
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)

@@ -280,10 +280,11 @@ def l3_moe(
     recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
     recv_weights_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
     recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    # Counter views remain packed, but each allocation owns its cache line.
+    arrived_buf = pld.alloc_window_buffer(64)
+    data_arrived_buf = pld.alloc_window_buffer(64)
     routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    combine_arrived_buf = pld.alloc_window_buffer(64)
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
