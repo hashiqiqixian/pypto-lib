@@ -79,24 +79,3 @@ def materialize_rope_rows(
                     [1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0
                 )
     return rope_ready
-
-
-def select_rope_rows(
-    position_ids: torch.Tensor,
-    compressed_attention: bool,
-    config: DeepSeekV41Config = FLASH,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize the RoPE rows needed by one packed forward invocation."""
-    if position_ids.numel() == 0:
-        shape = (*position_ids.shape, config.qk_rope_head_dim // 2)
-        empty = torch.empty(shape, dtype=torch.float32, device=position_ids.device)
-        return empty, empty.clone()
-    valid = position_ids >= 0
-    maximum = max(int(position_ids.clamp_min(0).max()) + 1, 1)
-    cos, sin = precompute_rope_tables(maximum, compressed_attention, config)
-    cos = cos.to(position_ids.device)
-    sin = sin.to(position_ids.device)
-    rows = position_ids.clamp_min(0).to(torch.long)
-    selected_cos = cos[rows].masked_fill(~valid.unsqueeze(-1), 1.0)
-    selected_sin = sin[rows].masked_fill(~valid.unsqueeze(-1), 0.0)
-    return selected_cos, selected_sin

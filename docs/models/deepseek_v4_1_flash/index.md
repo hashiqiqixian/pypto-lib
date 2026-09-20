@@ -89,9 +89,8 @@ existing cache-publication and previous-epoch dependencies are retained. Serving
 owns graph composition, profile choice, table capacity and lifetime.
 
 `precompute_rope_tables` remains a CPU initialization utility when the caller
-needs to generate a complete profile. `select_rope_rows` remains the Torch
-reference/fixture utility; neither is needed in the compiled dispatch path
-when serving already supplies full tables.
+needs to generate a complete profile. It is not needed in the compiled dispatch
+path when serving already supplies full tables.
 
 ## Parallel-development structure
 
