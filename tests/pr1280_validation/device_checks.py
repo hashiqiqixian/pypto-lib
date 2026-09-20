@@ -34,8 +34,8 @@ def ring_sequence(
 ):
     with pl.spmd(3, name_hint="initialize_pair_outputs") as initialized:
         step = pl.tile.get_block_idx()
-        previous_kv[step, :, :] = pl.full([32, C.HEAD_DIM], dtype=pl.FP32, value=17.0)
-        previous_scores[step, :, :] = pl.full([32, C.HEAD_DIM], dtype=pl.FP32, value=19.0)
+        previous_kv[step, :, :] = pl.full([32, 512], dtype=pl.FP32, value=17.0)
+        previous_scores[step, :, :] = pl.full([32, 512], dtype=pl.FP32, value=19.0)
     count0 = pl.read(counts, [0])
     pk0 = previous_kv[0]
     ps0 = previous_scores[0]
