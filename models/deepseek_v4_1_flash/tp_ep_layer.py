@@ -54,16 +54,6 @@ def pack_layer_shard(
     local_flat = pl.reshape(residual_block, [BLOCK, HC_DIM])
     for t in pl.spmd(BLOCK, name_hint="tp_ep_pack"):
         source = shard_first + block_first + t
-        for h in pl.unroll(HC):
-            post_value = pl.cast(0.0, pl.FP32)
-            if t < count:
-                post_value = pl.read(post, [source, h])
-            pl.write(post_block, [t, h], post_value)
-            for k in pl.unroll(HC):
-                mix_value = pl.cast(0.0, pl.FP32)
-                if t < count:
-                    mix_value = pl.read(mixes, [source, h, k])
-                pl.write(mixes_block, [t, h, k], mix_value)
         for col in pl.range(0, D, 512):
             value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
             if t < count:
@@ -74,6 +64,20 @@ def pack_layer_shard(
             if t < count:
                 residual_value = pl.load(full_flat, [source, col], [1, 512])
             local_flat = pl.store(residual_value, [t, col], local_flat)
+    # Scalar metadata writes must not share cache lines across cores.
+    for _ in pl.spmd(1, name_hint="tp_ep_pack_metadata"):
+        for t in pl.range(BLOCK):
+            source = shard_first + block_first + t
+            for h in pl.unroll(HC):
+                post_value = pl.cast(0.0, pl.FP32)
+                if t < count:
+                    post_value = pl.read(post, [source, h])
+                pl.write(post_block, [t, h], post_value)
+                for k in pl.unroll(HC):
+                    mix_value = pl.cast(0.0, pl.FP32)
+                    if t < count:
+                        mix_value = pl.read(mixes, [source, h, k])
+                    pl.write(mixes_block, [t, h, k], mix_value)
     return attention_block, residual_block, post_block, mixes_block
 
 
