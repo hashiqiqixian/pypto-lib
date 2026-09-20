@@ -127,11 +127,59 @@ The first implementation targets pure head tensor parallelism. Every TP rank
 sees the same token batch. `wq_a`, `wkv`, compressor, indexer, and the
 single-head KV caches are replicated. `wq_b`, query heads, attention sinks,
 and output groups are sharded across TP ranks. Each rank computes
-16 query heads and two output groups; one FP32 TP all-reduce reconstructs the
-complete hidden output. Before EP8 dispatch, token-row ownership is assigned
-round-robin across the four TP ranks. This prevents replicated attention rows
-from being dispatched four times; MoE combine returns the rows to the TP
-layout. DSA context parallelism is intentionally out of scope.
+16 query heads and two output groups. Standalone Attention entries retain
+all-reduce. Layer integration uses the `*_sharded` Attention leaves followed
+by [tp_ep_layer.py](../../../models/deepseek_v4_1_flash/tp_ep_layer.py):
+
+1. Run Attention mHC pre on the replicated residual stream.
+2. Call the mode-specific `*_sharded` Attention leaf. ReduceScatter sums FP32
+   projection partials and writes this rank's contiguous token range, with
+   one BF16 cast after accumulation.
+3. Call `tp_ep_layer_tail` with that shard, the original residual, and the
+   Attention post/residual mix coefficients. It selects matching rows without
+   SUM, runs Attention mHC post, MoE mHC pre, EP MoE, and MoE mHC post, then
+   gathers the FP32 residual streams within the TP group.
+
+Prefill SWA and C2A sharded leaves live in `prefill_attn_*`; their `prefill_*`
+mHC wrappers retain the standalone replicated-output path. C1A prefill and
+all decode leaves export `*_sharded` in their existing files. Do not feed an
+already all-reduced output to ReduceScatter, or apply Attention mHC post twice.
+
+For a DP group's `T` active rows and local TP rank `r`, the range is
+`width = ceil(T / TP)`, `first = min(r * width, T)`, and
+`count = min(width, T - first)`. Attention, residual, and mHC coefficients
+share this mapping. TP4 with eight rows gives `[0:2]`, `[2:4]`, `[4:6]`,
+`[6:8]`. AllGather restores the token order and all four residual streams.
+
+All EP ranks must allocate the same positive shard capacity
+`S >= max_DP(ceil(T / TP))`, at most `ceil(PREFILL_MAX_TOKENS / TP)`.
+`T` can differ across DP groups but must agree within a TP group and fit the
+input capacity and the chosen Attention phase limit. Every EP rank executes
+`ceil(S / MOE_TOKENS)` rounds, including empty shards. Padding does not route
+or contribute to returned results; the expert kernels retain fixed block
+padding. Only the first `count` shard rows and first `T` gathered rows are
+defined.
+
+MoE consumes distinct rank-local tokens and no longer accepts `token_owners`
+or a TP rank. `ForwardMetadata` no longer constructs `moe_token_owners`.
+Combine returns routes to their source rank. Two DP groups of eight rows
+produce 16 unique tokens and 96 top-six assignments.
+
+Window counters start at zero. Attention, MoE, and residual epochs start at
+one; advance Attention/residual epochs by one per call and `moe_epoch_base`
+by `ceil(S / MOE_TOKENS)`. Keep each window with its counters, and do not
+overlap invocations on the same windows. Each combine counter receives
+`N_LOCAL_EXPERTS` payload notifications plus one consumption notification per
+round. The next dispatch waits for every rank, including itself, to consume
+the preceding round before reusing windows. The separate dispatch payload
+counter advances by `N_LOCAL_EXPERTS` per round.
+
+`l3_tp_ep_layer_tail` allocates the L3 windows and launches all ranks, taking
+stacked weights and one active token count per rank. It starts after
+Attention ReduceScatter; callers supply the mode-specific Attention inputs
+and cache metadata separately. This implementation does not establish
+TP4/EP8 device accuracy or throughput acceptance. DSA context parallelism
+is outside this boundary.
 
 The service capacity contract is 32 active sequences and 4,096 scheduled
 prefill token rows per DP group. With five reserved DSpark draft rows plus one
