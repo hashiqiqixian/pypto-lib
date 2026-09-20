@@ -177,9 +177,20 @@ counter advances by `N_LOCAL_EXPERTS` per round.
 `l3_tp_ep_layer_tail` allocates the L3 windows and launches all ranks, taking
 stacked weights and one active token count per rank. It starts after
 Attention ReduceScatter; callers supply the mode-specific Attention inputs
-and cache metadata separately. This implementation does not establish
-TP4/EP8 device accuracy or throughput acceptance. DSA context parallelism
-is outside this boundary.
+and cache metadata separately. DSA context parallelism is outside this boundary.
+
+Validation of this boundary has separate hardware requirements:
+
+- A3 can validate the FP32/BF16 TP reduction, mHC post, residual reconstruction,
+  and BF16 EP combine. The TP/mHC boundary has passed TP4/EP8 device checks
+  with repeated windows, unequal DP token counts, and empty shards.
+- Production dispatch includes MX scale repacking with `tile.tmov_x2zz`,
+  which has no A3 code generator. An A3 byte-transport diagnostic that omits
+  this step does not validate the complete FP8/MX dispatch or expert path.
+- The complete tail and all twelve sharded Attention entries have passed A5
+  code generation. Complete-tail device numerics, including FP8/MX experts
+  and repeated EP window reuse, still require A5 hardware. Code generation
+  alone does not establish binary execution or performance acceptance.
 
 The service capacity contract is 32 active sequences and 4,096 scheduled
 prefill token rows per DP group. With five reserved DSpark draft rows plus one
