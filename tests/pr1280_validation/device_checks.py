@@ -32,17 +32,21 @@ def ring_sequence(
     previous_kv: pl.InOut[pl.Tensor[[3, C.T_DYN, C.HEAD_DIM], pl.FP32]],
     previous_scores: pl.InOut[pl.Tensor[[3, C.T_DYN, C.HEAD_DIM], pl.FP32]],
 ):
-    count = pl.read(counts, [0])
-    pk = previous_kv[0]
-    ps = previous_scores[0]
-    pair_ready = compressor_pair(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, pk, ps, count, None)
-    state_ready = compressor_state_write(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, count, pair_ready)
-    for step in pl.range(1, 3):
-        count = pl.read(counts, [step])
-        pk_step = previous_kv[step]
-        ps_step = previous_scores[step]
-        pair_ready = compressor_pair(kv[step], scores[step], positions[step], requests[step], starts[step], tables[step], state, pk_step, ps_step, count, state_ready)
-        state_ready = compressor_state_write(kv[step], scores[step], positions[step], requests[step], starts[step], tables[step], state, count, pair_ready)
+    count0 = pl.read(counts, [0])
+    pk0 = previous_kv[0]
+    ps0 = previous_scores[0]
+    pair0 = compressor_pair(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, pk0, ps0, count0, None)
+    ready0 = compressor_state_write(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, count0, pair0)
+    count1 = pl.read(counts, [1])
+    pk1 = previous_kv[1]
+    ps1 = previous_scores[1]
+    pair1 = compressor_pair(kv[1], scores[1], positions[1], requests[1], starts[1], tables[1], state, pk1, ps1, count1, ready0)
+    ready1 = compressor_state_write(kv[1], scores[1], positions[1], requests[1], starts[1], tables[1], state, count1, pair1)
+    count2 = pl.read(counts, [2])
+    pk2 = previous_kv[2]
+    ps2 = previous_scores[2]
+    pair2 = compressor_pair(kv[2], scores[2], positions[2], requests[2], starts[2], tables[2], state, pk2, ps2, count2, ready1)
+    ready2 = compressor_state_write(kv[2], scores[2], positions[2], requests[2], starts[2], tables[2], state, count2, pair2)
     return state, previous_kv, previous_scores
 
 
