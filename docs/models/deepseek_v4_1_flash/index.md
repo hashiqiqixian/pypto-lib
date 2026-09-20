@@ -197,40 +197,18 @@ stacked weights and one active token count per rank. It starts after
 Attention ReduceScatter; callers supply the mode-specific Attention inputs
 and cache metadata separately. DSA context parallelism is outside this boundary.
 
-Validation of this boundary has separate hardware requirements:
+The complete tail and all twelve sharded Attention entries pass A5 code
+generation; the tail also passes binary compilation. A3 TP4/EP8 checks cover
+reduction, mHC/residual reconstruction and byte-transport diagnostics. A5
+TP2/EP4 and TP4/EP4 full-tail checks cover actual FP8/MX experts, dispatch,
+combine and repeated window reuse with nonzero structured weights, unequal
+token counts and empty shards. Every valid value meets the elementwise
+tolerance, and TP replicas agree exactly. See [PR #1305](https://github.com/hw-native-sys/pypto-lib/pull/1305)
+for revisions, cases and numerical evidence.
 
-- A3 can validate the FP32/BF16 TP reduction, mHC post, residual reconstruction,
-  and BF16 EP combine. The TP/mHC boundary has passed TP4/EP8 device checks
-  with repeated windows, unequal DP token counts, and empty shards.
-- Production dispatch includes MX scale repacking with `tile.tmov_x2zz`,
-  which has no A3 code generator. An external A3 byte-transport diagnostic
-  has passed six rounds of TP4/EP8 dispatch/combine window reuse, both across
-  rank invocations and within one rank orchestration. It checks payload and
-  scale bytes, weights, route IDs, counts, and returned sums, including empty
-  rounds and an expert receiving 24 rows. It omits final MX scale repacking
-  and substitutes synthetic expert results, so it does not validate the
-  complete FP8/MX dispatch or expert path.
-- The complete tail and all twelve sharded Attention entries have passed A5
-  code generation. The complete tail additionally passes PTOAS assembly and
-  kernel/orchestration binary compilation.
-- The production L3 tail passes A5 TP2/EP4 device numerics with DP counts
-  `(65,17)`, including empty blocks and three internal MoE rounds. This uses
-  nonzero, expert-distinguishable structured FP8/MX weights and an independent
-  reference, exercising production scale repacking, routed and shared experts,
-  dispatch/combine, and residual AllGather. The maximum absolute output error
-  is `0.00390625`, with no valid values outside `0.008 * abs(reference) + 0.001`.
-  After separating the shared W2 epilogue, three independent TP2/EP4 runs
-  also pass three invocations on the same windows with DP counts `(8,7)`,
-  `(1,0)`, and `(65,17)`. Each checks 4,014,080 valid values with maximum
-  absolute error `0.0009765625`, no tolerance violations, and identical TP
-  replicas. The comparator rejects any valid value outside the stated bound;
-  an earlier aggregate outlier quota had hidden a small shared-path failure.
-  TP4/EP4 also passes three invocations with counts `8,1,65`, checking
-  6,062,080 valid values with maximum absolute error `0.00390625`, no tolerance
-  violations, and identical TP replicas.
-  This starts after Attention ReduceScatter. A5 TP4/EP8 device acceptance
-  remains outstanding because the available workspace allocation is four cards.
-  No complete Attention/model execution or performance result is established.
+A5 TP4/EP8 device acceptance, integrated Attention/model execution and
+performance measurements remain outstanding. Tail validation starts after
+Attention ReduceScatter and does not use real checkpoint weights.
 
 The service capacity contract is 32 active sequences and 4,096 scheduled
 prefill token rows per DP group. With five reserved DSpark draft rows plus one
