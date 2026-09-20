@@ -160,10 +160,26 @@ or contribute to returned results; the expert kernels retain fixed block
 padding. Only the first `count` shard rows and first `T` gathered rows are
 defined.
 
+Empty blocks initialize gate outputs and skip normalization and route-selection
+grids, whose device launches require a positive block count. They still
+participate in every EP communication round.
+
 MoE consumes distinct rank-local tokens and no longer accepts `token_owners`
 or a TP rank. `ForwardMetadata` no longer constructs `moe_token_owners`.
 Combine returns routes to their source rank. Two DP groups of eight rows
 produce 16 unique tokens and 96 top-six assignments.
+
+Place communication buffers on 64-byte boundaries and reserve at least one
+cache line for each packed signal buffer. The L3 tail and MoE drivers allocate
+64 bytes for each signal while retaining the logical `[rank, 1]` counter view;
+this prevents signal cache maintenance from touching neighboring payloads.
+
+The shared expert stores its W2 result in FP32 GM before a separate Vector
+task converts it to BF16, matching the routed expert's output pattern.
+This avoids the pinned A5 local C2V startup defect
+([pypto#2829](https://github.com/hw-native-sys/pypto/issues/2829)), which also
+reproduces independently on the tail validation toolchain. The extra GM
+traffic and task have not been benchmarked.
 
 Window counters start at zero. Attention, MoE, and residual epochs start at
 one; advance Attention/residual epochs by one per call and `moe_epoch_base`
@@ -194,10 +210,25 @@ Validation of this boundary has separate hardware requirements:
   complete FP8/MX dispatch or expert path.
 - The complete tail and all twelve sharded Attention entries have passed A5
   code generation. The complete tail additionally passes PTOAS assembly and
-  kernel/orchestration binary compilation. Complete-tail device numerics,
-  including FP8/MX experts and repeated EP window reuse, still require A5
-  hardware. These builds do not establish device execution or performance
-  acceptance.
+  kernel/orchestration binary compilation.
+- The production L3 tail passes A5 TP2/EP4 device numerics with DP counts
+  `(65,17)`, including empty blocks and three internal MoE rounds. This uses
+  nonzero, expert-distinguishable structured FP8/MX weights and an independent
+  reference, exercising production scale repacking, routed and shared experts,
+  dispatch/combine, and residual AllGather. The maximum absolute output error
+  is `0.00390625`, with no valid values outside `0.008 * abs(reference) + 0.001`.
+  After separating the shared W2 epilogue, three independent TP2/EP4 runs
+  also pass three invocations on the same windows with DP counts `(8,7)`,
+  `(1,0)`, and `(65,17)`. Each checks 4,014,080 valid values with maximum
+  absolute error `0.0009765625`, no tolerance violations, and identical TP
+  replicas. The comparator rejects any valid value outside the stated bound;
+  an earlier aggregate outlier quota had hidden a small shared-path failure.
+  TP4/EP4 also passes three invocations with counts `8,1,65`, checking
+  6,062,080 valid values with maximum absolute error `0.00390625`, no tolerance
+  violations, and identical TP replicas.
+  This starts after Attention ReduceScatter. A5 TP4/EP8 device acceptance
+  remains outstanding because the available workspace allocation is four cards.
+  No complete Attention/model execution or performance result is established.
 
 The service capacity contract is 32 active sequences and 4,096 scheduled
 prefill token rows per DP group. With five reserved DSpark draft rows plus one
