@@ -238,8 +238,8 @@ def compressor_pair(
                         prev_score[t : t + 1, :] = score_proj[t - 1 : t, :]
                     else:
                         slot = (position - 1) % capacity
-                        prev_kv[t : t + 1, :] = pl.reshape(state_cache[block : block + 1, slot : slot + 1, :HEAD_DIM], [1, HEAD_DIM])
-                        prev_score[t : t + 1, :] = pl.reshape(state_cache[block : block + 1, slot : slot + 1, HEAD_DIM:], [1, HEAD_DIM])
+                        prev_kv[t : t + 1, :] = state_cache[block, slot : slot + 1, :HEAD_DIM]
+                        prev_score[t : t + 1, :] = state_cache[block, slot : slot + 1, HEAD_DIM:]
     return pair_tid
 
 
@@ -321,17 +321,13 @@ def compressor_state_write(
         position = pl.read(position_ids, [t])
         if request >= 0 and request < pl.tensor.dim(state_block_table, 0):
             begin = pl.read(query_start_loc, [request])
-            end = pl.read(query_start_loc, [request + 1])
+            end = pl.min(pl.read(query_start_loc, [request + 1]), num_tokens)
             block = pl.read(state_block_table, [request, 0])
             if t >= begin and t < end and position >= 0 and block >= 0 and block < blocks:
                 if t + capacity >= end:
                     slot = position % capacity
-                    state_cache[block : block + 1, slot : slot + 1, :HEAD_DIM] = pl.reshape(
-                        kv_proj[t : t + 1, :], [1, 1, HEAD_DIM]
-                    )
-                    state_cache[block : block + 1, slot : slot + 1, HEAD_DIM:] = pl.reshape(
-                        score_proj[t : t + 1, :], [1, 1, HEAD_DIM]
-                    )
+                    state_cache[block, slot : slot + 1, :HEAD_DIM] = kv_proj[t : t + 1, :]
+                    state_cache[block, slot : slot + 1, HEAD_DIM:] = score_proj[t : t + 1, :]
     return state_tid
 
 
