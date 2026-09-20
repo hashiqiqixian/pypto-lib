@@ -21,36 +21,36 @@ from models.deepseek_v4_1_flash.rope_tables import materialize_rope_rows, precom
 
 @pl.jit
 def ring_sequence(
-    kv: pl.Tensor[[3, C.T_DYN, C.HEAD_DIM], pl.FP32],
-    scores: pl.Tensor[[3, C.T_DYN, C.HEAD_DIM], pl.FP32],
-    positions: pl.Tensor[[3, C.T_DYN], pl.INT32],
-    requests: pl.Tensor[[3, C.T_DYN], pl.INT32],
-    starts: pl.Tensor[[3, C.Q_START_DYN], pl.INT32],
-    tables: pl.Tensor[[3, C.B_DYN, 1], pl.INT32],
+    kv: pl.Tensor[[96, C.HEAD_DIM], pl.FP32],
+    scores: pl.Tensor[[96, C.HEAD_DIM], pl.FP32],
+    positions: pl.Tensor[[96], pl.INT32],
+    requests: pl.Tensor[[96], pl.INT32],
+    starts: pl.Tensor[[12], pl.INT32],
+    tables: pl.Tensor[[9, 1], pl.INT32],
     counts: pl.Tensor[[3], pl.INT32],
     state: pl.InOut[pl.Tensor[[C.STATE_BLOCKS_DYN, C.STATE_CAPACITY_DYN, 2*C.HEAD_DIM], pl.FP32]],
-    previous_kv: pl.InOut[pl.Tensor[[3, C.T_DYN, C.HEAD_DIM], pl.FP32]],
-    previous_scores: pl.InOut[pl.Tensor[[3, C.T_DYN, C.HEAD_DIM], pl.FP32]],
+    previous_kv: pl.InOut[pl.Tensor[[96, C.HEAD_DIM], pl.FP32]],
+    previous_scores: pl.InOut[pl.Tensor[[96, C.HEAD_DIM], pl.FP32]],
 ):
     with pl.spmd(3, name_hint="initialize_pair_outputs") as initialized:
         step = pl.tile.get_block_idx()
-        previous_kv[step, :, :] = pl.full([32, 512], dtype=pl.FP32, value=17.0)
-        previous_scores[step, :, :] = pl.full([32, 512], dtype=pl.FP32, value=19.0)
+        previous_kv[step*32 : step*32+32, :] = pl.full([32, 512], dtype=pl.FP32, value=17.0)
+        previous_scores[step*32 : step*32+32, :] = pl.full([32, 512], dtype=pl.FP32, value=19.0)
     count0 = pl.read(counts, [0])
-    pk0 = previous_kv[0]
-    ps0 = previous_scores[0]
-    pair0 = compressor_pair(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, pk0, ps0, count0, initialized)
-    ready0 = compressor_state_write(kv[0], scores[0], positions[0], requests[0], starts[0], tables[0], state, count0, pair0)
+    pk0 = previous_kv[0:32, :]
+    ps0 = previous_scores[0:32, :]
+    pair0 = compressor_pair(kv[0:32, :], scores[0:32, :], positions[0:32], requests[0:32], starts[0:4], tables[0:3, :], state, pk0, ps0, count0, initialized)
+    ready0 = compressor_state_write(kv[0:32, :], scores[0:32, :], positions[0:32], requests[0:32], starts[0:4], tables[0:3, :], state, count0, pair0)
     count1 = pl.read(counts, [1])
-    pk1 = previous_kv[1]
-    ps1 = previous_scores[1]
-    pair1 = compressor_pair(kv[1], scores[1], positions[1], requests[1], starts[1], tables[1], state, pk1, ps1, count1, ready0)
-    ready1 = compressor_state_write(kv[1], scores[1], positions[1], requests[1], starts[1], tables[1], state, count1, pair1)
+    pk1 = previous_kv[32:64, :]
+    ps1 = previous_scores[32:64, :]
+    pair1 = compressor_pair(kv[32:64, :], scores[32:64, :], positions[32:64], requests[32:64], starts[4:8], tables[3:6, :], state, pk1, ps1, count1, ready0)
+    ready1 = compressor_state_write(kv[32:64, :], scores[32:64, :], positions[32:64], requests[32:64], starts[4:8], tables[3:6, :], state, count1, pair1)
     count2 = pl.read(counts, [2])
-    pk2 = previous_kv[2]
-    ps2 = previous_scores[2]
-    pair2 = compressor_pair(kv[2], scores[2], positions[2], requests[2], starts[2], tables[2], state, pk2, ps2, count2, ready1)
-    ready2 = compressor_state_write(kv[2], scores[2], positions[2], requests[2], starts[2], tables[2], state, count2, pair2)
+    pk2 = previous_kv[64:96, :]
+    ps2 = previous_scores[64:96, :]
+    pair2 = compressor_pair(kv[64:96, :], scores[64:96, :], positions[64:96], requests[64:96], starts[8:12], tables[6:9, :], state, pk2, ps2, count2, ready1)
+    ready2 = compressor_state_write(kv[64:96, :], scores[64:96, :], positions[64:96], requests[64:96], starts[8:12], tables[6:9, :], state, count2, pair2)
     return state, previous_kv, previous_scores
 
 
@@ -87,10 +87,23 @@ def ring_values(capacity, case):
         if case == 'invalid':
             v['tables'][step,0,0] = -1
             v['tables'][step,2,0] = 5
+    for name in ('kv', 'scores', 'previous_kv', 'previous_scores'):
+        v[name] = v[name].reshape(96, C.HEAD_DIM)
+    for name in ('positions', 'requests'):
+        v[name] = v[name].reshape(96)
+    v['starts'] = v['starts'].reshape(12)
+    v['tables'] = v['tables'].reshape(9, 1)
     return v
 
 
 def golden_ring(v):
+    v = dict(v)
+    for name in ('kv', 'scores', 'previous_kv', 'previous_scores'):
+        v[name] = v[name].reshape(3, 32, C.HEAD_DIM)
+    for name in ('positions', 'requests'):
+        v[name] = v[name].reshape(3, 32)
+    v['starts'] = v['starts'].reshape(3, 4)
+    v['tables'] = v['tables'].reshape(3, 3, 1)
     head = C.HEAD_DIM
     capacity = v['state'].shape[1]
     for step in range(3):
