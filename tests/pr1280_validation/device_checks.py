@@ -59,9 +59,12 @@ def main():
     failures=[]
     for compressed in (False,True):
         cos,sin=precompute_rope_tables(257,compressed)
-        for count in (0,1,7):
+        for count in (0,1,7,33,65):
             name=f'rope-{int(compressed)}-{count}'
-            values=dict(cos=cos,sin=sin,positions=torch.tensor([256,-1,0,3,3,129,-9,999999],dtype=torch.int32),count=count,out_cos=torch.full((8,C.ROPE_DIM//2),17.),out_sin=torch.full((8,C.ROPE_DIM//2),19.))
+            positions=torch.arange(66,dtype=torch.int32)
+            positions[:7]=torch.tensor([256,-1,0,3,3,129,-9])
+            positions[-1]=999999
+            values=dict(cos=cos,sin=sin,positions=positions,count=count,out_cos=torch.full((66,C.ROPE_DIM//2),17.),out_sin=torch.full((66,C.ROPE_DIM//2),19.))
             result=run(fn=rope_entry,specs=specs(values),golden_fn=golden_rope,compile_only=args.compile_only,config=dict(platform='a2a3',device_id=args.device),compare_fn={k:exact_compare(k) for k in ('out_cos','out_sin')},rtol=0,atol=0)
             print(f'RESULT {name} passed={result.passed} work_dir={result.work_dir} error={result.error}',flush=True)
             if not result.passed:
