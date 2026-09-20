@@ -68,10 +68,10 @@ def pack_layer_shard(
                 value = pl.load(attention, [block_first + t, col], [1, 512])
             attention_block = pl.store(value, [t, col], attention_block)
         for col in pl.range(0, HC_DIM, 512):
-            value = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
+            residual_value = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
             if t < count:
-                value = pl.load(full_flat, [source, col], [1, 512])
-            local_flat = pl.store(value, [t, col], local_flat)
+                residual_value = pl.load(full_flat, [source, col], [1, 512])
+            local_flat = pl.store(residual_value, [t, col], local_flat)
     return attention_block, residual_block, post_block, mixes_block
 
 
