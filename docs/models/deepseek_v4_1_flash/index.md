@@ -141,8 +141,10 @@ by [tp_ep_layer.py](../../../models/deepseek_v4_1_flash/tp_ep_layer.py):
    gathers the FP32 residual streams within the TP group.
 
 Prefill SWA and C2A sharded leaves live in `prefill_attn_*`; their `prefill_*`
-mHC wrappers retain the standalone replicated-output path. C1A prefill and
-all decode leaves export `*_sharded` in their existing files. Do not feed an
+mHC wrappers retain the standalone replicated-output path. Decode C1A sharded
+leaves live in `decode_attn_c1a_*`; the `decode_c1a_*` mHC wrappers retain
+the replicated-output path. C1A prefill and the other decode leaves export
+`*_sharded` in their existing files. Do not feed an
 already all-reduced output to ReduceScatter, or apply Attention mHC post twice.
 
 For a DP group's `T` active rows and local TP rank `r`, the range is

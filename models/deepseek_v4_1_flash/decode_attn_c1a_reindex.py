@@ -138,7 +138,7 @@ decode_attn_c1a_reindex = make_decode_attn_c1a_reindex()
 decode_attn_c1a_reindex_sharded = make_decode_attn_c1a_reindex(c1a_finish_sharded)
 
 
-__all__ = ["golden_decode_attn_c1a_reindex", "decode_attn_c1a_reindex"]
+__all__ = ["golden_decode_attn_c1a_reindex", "decode_attn_c1a_reindex", "decode_attn_c1a_reindex_sharded"]
 
 
 @pl.jit
@@ -293,5 +293,3 @@ def main():
 _SCRIPT_ENTRY_POINT = "__" + "main__"
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()
-
-__all__.append("decode_attn_c1a_reindex_sharded")

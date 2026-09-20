@@ -1666,6 +1666,7 @@ __all__ = [
     "golden_decode_attn_c1a_reindex",
     "golden_decode_attn_c1a_reuse",
     "decode_attn_c1a_full",
+    "decode_attn_c1a_full_sharded",
     "c1a_previous_epoch",
     "c1a_prepare",
     "c1a_index",
@@ -2231,5 +2232,3 @@ def main():
 _SCRIPT_ENTRY_POINT = "__" + "main__"
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()
-
-__all__.append("decode_attn_c1a_full_sharded")

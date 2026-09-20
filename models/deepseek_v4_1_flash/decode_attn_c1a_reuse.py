@@ -108,7 +108,7 @@ decode_attn_c1a_reuse = make_decode_attn_c1a_reuse()
 decode_attn_c1a_reuse_sharded = make_decode_attn_c1a_reuse(c1a_finish_sharded)
 
 
-__all__ = ["golden_decode_attn_c1a_reuse", "decode_attn_c1a_reuse"]
+__all__ = ["golden_decode_attn_c1a_reuse", "decode_attn_c1a_reuse", "decode_attn_c1a_reuse_sharded"]
 
 
 @pl.jit
@@ -229,5 +229,3 @@ def main():
 _SCRIPT_ENTRY_POINT = "__" + "main__"
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()
-
-__all__.append("decode_attn_c1a_reuse_sharded")
