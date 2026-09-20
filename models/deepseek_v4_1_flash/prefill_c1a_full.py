@@ -45,7 +45,9 @@ from models.deepseek_v4_1_flash.attention_common import (
     golden_compressed_attention,
     quantized_cache_compare,
 )
-from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce
+from models.deepseek_v4_1_flash.attention_tp import (
+    prefill_tp_output_all_reduce, prefill_tp_output_reduce_scatter, OUTPUT_T_DYN,
+)
 from models.deepseek_v4_1_flash.config import AttentionMode
 from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import hierarchical_sparse_indexer
 from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
@@ -195,7 +197,7 @@ def golden_prefill_c1a_full(
     )
 
 
-def make_prefill_c1a_full(indexer):
+def make_prefill_c1a_full(indexer, output_reduce=prefill_tp_output_all_reduce):
     @pl.jit.inline(auto_scope=False)
     def prefill_c1a_full_impl(
         x: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
@@ -242,7 +244,7 @@ def make_prefill_c1a_full(indexer):
         candidate_mask: pl.Tensor[[C.T_DYN, C.CMP_POSITIONS_DYN], pl.UINT8],
         output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, C.D], pl.FP32],
         output_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-        output: pl.Tensor[[C.T_DYN, C.D], pl.BF16],
+        output: pl.Tensor[[OUTPUT_T_DYN, C.D], pl.BF16],
         group_base: pl.Scalar[pl.INT32],
         tp_rank: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
@@ -351,7 +353,7 @@ def make_prefill_c1a_full(indexer):
             partial,
             num_tokens,
         )
-        prefill_tp_output_all_reduce(
+        output_reduce(
             partial,
             output_window,
             output_arrived,
@@ -367,6 +369,7 @@ def make_prefill_c1a_full(indexer):
 
 
 prefill_c1a_full = make_prefill_c1a_full(paged_indexer)
+prefill_c1a_full_sharded = make_prefill_c1a_full(paged_indexer, prefill_tp_output_reduce_scatter)
 prefill_c1a_full_watch = make_prefill_c1a_full(paged_indexer_direct)
 
 
@@ -559,7 +562,11 @@ def golden_prefill_c1a_full_case(tensors):
     apply_distributed_golden("full", golden_prefill_c1a_full, tensors)
 
 
-__all__ = ["golden_prefill_c1a_full", "prefill_c1a_full"]
+__all__ = [
+    "golden_prefill_c1a_full",
+    "prefill_c1a_full",
+    "prefill_c1a_full_sharded",
+]
 
 
 if __name__ == _SCRIPT_ENTRY_POINT:
