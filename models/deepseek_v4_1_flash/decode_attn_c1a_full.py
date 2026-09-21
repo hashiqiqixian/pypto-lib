@@ -1626,7 +1626,11 @@ def decode_attn_c1a_full(
     topk_tid = select_index_topk(
         scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid,
     )
-    hierarchical_sparse_indexer(scores, compressed_lens, candidate_mask)
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    active_scores = pl.slice(scores, [active_tokens, width], [0, 0])
+    active_lens = pl.slice(compressed_lens, [active_tokens], [0])
+    active_candidates = pl.slice(candidate_mask, [active_tokens, width], [0, 0])
+    hierarchical_sparse_indexer(active_scores, active_lens, active_candidates)
     c1a_finish(
         query, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, window_indices,
         topk_indices, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output_window, output_arrived,

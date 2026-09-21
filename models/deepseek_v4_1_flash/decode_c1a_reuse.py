@@ -55,6 +55,7 @@ from models.deepseek_v4_1_flash.decode_attn_c1a_reuse import (
     decode_attn_c1a_reuse,
     golden_decode_attn_c1a_reuse,
 )
+from models.deepseek_v4_1_flash.attention_tp import decode_tp_output_all_reduce
 from models.deepseek_v4_1_flash.hc_post import mhc_post
 from models.deepseek_v4_1_flash.prefill_c2a_full import attention_hc_pre
 
@@ -106,17 +107,36 @@ def decode_c1a_reuse(
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     # The coefficients are staggered: collapse with the pre-mix the previous sub-layer
     # produced, apply post/residual immediately, and hand this site's pre-mix forward.
-    attention_hc_pre(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
-        next_pre_mix, post_mix, residual_mix, hidden,
-    )
-    decode_attn_c1a_reuse(
-        hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-        wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
-        window_cache_scale, compressed_cache, compressed_cache_scale, compressed_indices, output_window,
-        output_arrived, attn_out, group_base, tp_rank, num_tokens, attention_epoch,
-    )
-    mhc_post(attn_out, x_hc, post_mix, residual_mix, output)
+    if num_tokens > 0:
+        # mHC operates on the active prefix, just like the attention leaf.
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        active_x = pl.slice(x_hc, [active_tokens, HC_MULT, D], [0, 0, 0])
+        active_pre = pl.slice(pre_mix, [active_tokens, HC_MULT], [0, 0])
+        active_next = pl.slice(next_pre_mix, [active_tokens, HC_MULT], [0, 0])
+        active_post = pl.slice(post_mix, [active_tokens, HC_MULT], [0, 0])
+        active_residual = pl.slice(residual_mix, [active_tokens, HC_MULT, HC_MULT], [0, 0, 0])
+        active_hidden = pl.slice(hidden, [active_tokens, D], [0, 0])
+        attention_hc_pre(
+            active_x, active_pre, hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_weight, active_next, active_post, active_residual, active_hidden,
+        )
+        decode_attn_c1a_reuse(
+            hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
+            window_cache_scale, compressed_cache, compressed_cache_scale, compressed_indices, output_window,
+            output_arrived, attn_out, group_base, tp_rank, num_tokens, attention_epoch,
+        )
+        active_attn = pl.slice(attn_out, [active_tokens, D], [0, 0])
+        active_output = pl.slice(output, [active_tokens, HC_MULT, D], [0, 0, 0])
+        mhc_post(active_attn, active_x, active_post, active_residual, active_output)
+    else:
+        # Advance the shared epoch without submitting zero-block attention tasks.
+        residual_flat = pl.reshape(x_hc, [tokens, HC_DIM])
+        empty_partial = pl.slice(residual_flat, [tokens, D], [0, 0])
+        decode_tp_output_all_reduce(
+            empty_partial, output_window, output_arrived, attn_out,
+            group_base, tp_rank, num_tokens, attention_epoch,
+        )
     return output
 
 

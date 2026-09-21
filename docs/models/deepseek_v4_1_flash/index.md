@@ -88,7 +88,12 @@ entries reuse. All three decode entries take `attn_norm_weight` (`[D]`, BF16)
 and apply input RMSNorm after collapse, before the attention projections.
 The host drivers carry this replicated weight as `[TP_SIZE, D]`. The Q-latent
 and KV normalization weights remain separate; attention-only entries still
-expect already normalized input.
+expect already normalized input. Decode callers pass `0 <= num_tokens <=
+token_capacity`; only that prefix participates in mHC and attention.
+The inline entries leave the `output` and `next_pre_mix` padding rows
+untouched. Full also restricts candidate-mask selection to the active prefix. Callers needing those initial padding values copied back must
+expose the buffers as `InOut` at their entry. Empty work still advances the
+shared attention communication epoch on every rank.
 
 The final HC collapse has no learned head parameters: it applies the last
 layer's delayed `pre_mix` directly to the four residual streams. HC mixes are
