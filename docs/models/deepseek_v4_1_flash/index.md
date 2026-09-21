@@ -71,6 +71,11 @@ Reuse consumes the source layer's physical Top-K rows and has no compressor or
 indexer weights. The hierarchical indexer first selects 2,048 blocks of eight
 compressed positions at layer 20; later reindex layers select their final 512
 positions only inside that candidate mask.
+The prefill paged indexer decodes at most 256 tiles of 64 keys per wave,
+using a fixed 4 MiB BF16 scratch buffer. Each wave waits for the preceding
+score reads before reusing it. The FP32 score matrix still scales with
+`token_capacity * history_capacity`; this bound on decoded keys is not a
+claim that every combination of the maximum capacities fits in memory.
 
 Each decoder C1A mode keeps its attention operator in `decode_attn_c1a_*.py` and
 adds an mHC-wired `decode_c1a_*.py` entry. V4.1 staggers the coefficients:
