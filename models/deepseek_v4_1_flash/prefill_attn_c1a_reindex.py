@@ -32,7 +32,7 @@ import torch
 from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.prefill_c1a_common import prefill_c1a_partial
 from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr
-from models.deepseek_v4_1_flash.prefill_c1a_indexer import TOPK_LEAF, make_paged_indexer
+from models.deepseek_v4_1_flash.prefill_c1a_indexer import make_paged_indexer
 from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
@@ -216,14 +216,11 @@ def make_prefill_attn_c1a_reindex(indexer):
     ):
         """Refresh ratio-1 Top-K rows inside a supplied candidate set."""
         tokens = pl.tensor.dim(x, 0)
-        positions = pl.tensor.dim(candidate_mask, 1)
 
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
-        score_width = (positions + TOPK_LEAF - 1) // TOPK_LEAF * TOPK_LEAF
-        index_scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
         cache_ready = pl.system.task_dummy(deps=[])
-        indexer(
+        indexer_completion = indexer(
             x,
             query_latent,
             request_ids,
@@ -237,7 +234,6 @@ def make_prefill_attn_c1a_reindex(indexer):
             index_wq_b_scale,
             index_weights_proj,
             candidate_mask,
-            index_scores,
             topk_indices,
             num_tokens,
             cache_ready,

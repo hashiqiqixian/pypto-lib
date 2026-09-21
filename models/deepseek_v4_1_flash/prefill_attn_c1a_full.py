@@ -37,7 +37,7 @@ from models.deepseek_v4_1_flash.prefill_c1a_common import (
 )
 from models.deepseek_v4_1_flash.attention_ops import make_bf16_projection, make_norm, make_rope
 from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr
-from models.deepseek_v4_1_flash.prefill_c1a_indexer import TOPK_LEAF, make_paged_indexer
+from models.deepseek_v4_1_flash.prefill_c1a_indexer import make_paged_indexer
 from models.deepseek_v4_1_flash.attention_common import (
     AttentionGoldenResult,
     golden_compressed_attention,
@@ -45,7 +45,6 @@ from models.deepseek_v4_1_flash.attention_common import (
 )
 from models.deepseek_v4_1_flash.attention_tp import prefill_tp_output_all_reduce
 from models.deepseek_v4_1_flash.config import AttentionMode
-from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import hierarchical_sparse_indexer
 from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
@@ -249,7 +248,6 @@ def make_prefill_attn_c1a_full(indexer):
     ):
         """Publish ratio-1 caches, select sparse rows, and compute packed C1A."""
         tokens = pl.tensor.dim(x, 0)
-        positions = pl.tensor.dim(candidate_mask, 1)
 
         compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         project_compressed(x, compressor_wkv, compressed_projection, num_tokens)
@@ -298,9 +296,7 @@ def make_prefill_attn_c1a_full(indexer):
 
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
-        score_width = (positions + TOPK_LEAF - 1) // TOPK_LEAF * TOPK_LEAF
-        index_scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
-        indexer(
+        indexer_completion = indexer(
             x,
             query_latent,
             request_ids,
@@ -314,12 +310,10 @@ def make_prefill_attn_c1a_full(indexer):
             index_wq_b_scale,
             index_weights_proj,
             candidate_mask,
-            index_scores,
             topk_indices,
             num_tokens,
             index_ready,
         )
-        hierarchical_sparse_indexer(index_scores, compressed_lens, candidate_mask)
 
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
         prefill_c1a_partial(
