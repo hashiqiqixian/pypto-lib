@@ -145,8 +145,9 @@ def decode_c1a_full_test(
     )
 
 
-def make_program(tokens, pages, epochs=1, active=1):
+def make_program(tokens, pages, epochs=1, active=1, transition=False):
     """Build a distributed host using static packed-FP4 storage dimensions."""
+    TRANSITION = transition
     ACTIVE = active
     TOKENS = tokens
     PAGES = pages
@@ -209,6 +210,10 @@ def make_program(tokens, pages, epochs=1, active=1):
         transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
         signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
         for epoch in pl.range(1, EPOCHS + 1):
+            active_count = ACTIVE
+            if TRANSITION:
+                if epoch == 1:
+                    active_count = 0
             for rank in pl.unroll(TP_SIZE):
                 output_window = pld.window(transport, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
                 output_arrived = pld.window(signals, [TP_SIZE, 1], dtype=pl.INT32)
@@ -234,7 +239,7 @@ def make_program(tokens, pages, epochs=1, active=1):
                     compressed_rope_sin[rank], compressor_wkv[rank], compressor_norm_weight[rank],
                     compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank],
                     index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], candidate_mask[rank],
-                    output_window, output_arrived, output[rank], next_pre_mix[rank], 0, rank, ACTIVE,
+                    output_window, output_arrived, output[rank], next_pre_mix[rank], 0, rank, active_count,
                     epoch, device=rank,
                 )
 

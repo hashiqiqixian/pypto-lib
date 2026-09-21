@@ -108,8 +108,9 @@ def decode_c1a_reuse_test(
     )
 
 
-def make_program(tokens, pages, epochs=1, active=1):
+def make_program(tokens, pages, epochs=1, active=1, transition=False):
     """Build a distributed host using static packed-FP4 storage dimensions."""
+    TRANSITION = transition
     ACTIVE = active
     TOKENS = tokens
     PAGES = pages
@@ -154,6 +155,10 @@ def make_program(tokens, pages, epochs=1, active=1):
         transport = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
         signals = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
         for epoch in pl.range(1, EPOCHS + 1):
+            active_count = ACTIVE
+            if TRANSITION:
+                if epoch == 1:
+                    active_count = 0
             for rank in pl.unroll(TP_SIZE):
                 output_window = pld.window(transport, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
                 output_arrived = pld.window(signals, [TP_SIZE, 1], dtype=pl.INT32)
@@ -172,7 +177,7 @@ def make_program(tokens, pages, epochs=1, active=1):
                     wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank],
                     window_cache[rank], window_cache_scale[rank], compressed_cache[rank],
                     compressed_cache_scale[rank], compressed_indices[rank], output_window, output_arrived,
-                    output[rank], next_pre_mix[rank], 0, rank, ACTIVE, epoch, device=rank,
+                    output[rank], next_pre_mix[rank], 0, rank, active_count, epoch, device=rank,
                 )
 
     return host

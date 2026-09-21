@@ -37,6 +37,7 @@ def main():
     parser.add_argument("-d", default="0")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--reference-only", action="store_true")
+    parser.add_argument("--transition", action="store_true")
     args = parser.parse_args()
     active = args.active
     values = F.build_hc_validation_values(args.mode, args.tokens, 2, seed=37)
@@ -49,12 +50,13 @@ def main():
             values[name][:, active:] = -1
     wrapper = importlib.import_module(f"padding_{args.mode}")
     module = importlib.import_module(f"models.deepseek_v4_1_flash.decode_c1a_{args.mode}")
-    host = wrapper.make_program(args.tokens, 2, epochs=2, active=active)
+    host = wrapper.make_program(args.tokens, 2, epochs=2, active=active, transition=args.transition)
 
     def reference(tensors):
         if active:
             prefix = {n: (v[:, :active] if n in TOKEN_NAMES else v) for n, v in tensors.items()}
-            F.golden_c1a_hc_case(prefix, getattr(module, f"golden_decode_attn_c1a_{args.mode}"), 2)
+            F.golden_c1a_hc_case(prefix, getattr(module, f"golden_decode_attn_c1a_{args.mode}"),
+                                 1 if args.transition else 2)
 
     def compare_prefix(compare):
         def check(actual, expected, **kwargs):
