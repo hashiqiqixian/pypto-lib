@@ -79,7 +79,11 @@ lane zero at the very first site), applies this site's `post_mix` and
 `residual_mix` immediately, and hands its own computed `pre_mix` to the next
 sub-layer, so it returns the new streams and that coefficient. The full entry
 also hosts the shared HC fixture, goldens, and validation harness the other two
-entries reuse.
+entries reuse. All three decode entries take `attn_norm_weight` (`[D]`, BF16)
+and apply input RMSNorm after collapse, before the attention projections.
+The host drivers carry this replicated weight as `[TP_SIZE, D]`. The Q-latent
+and KV normalization weights remain separate; attention-only entries still
+expect already normalized input.
 
 The final HC collapse has no learned head parameters: it applies the last
 layer's delayed `pre_mix` directly to the four residual streams. HC mixes are

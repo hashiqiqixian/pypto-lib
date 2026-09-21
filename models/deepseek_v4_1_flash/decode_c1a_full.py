@@ -10,8 +10,9 @@
 
 The attention operator stays in ``decode_attn_c1a_full.py``; this entry consumes the staggered
 ``pre_mix`` the previous sub-layer produced (identity one-hot at the very first site),
-computes this site's coefficients with ``mhc_mixes``, collapses with ``mhc_pre``, runs the
-operator, and expands the residual with ``mhc_post``. ``post_mix`` and ``residual_mix``
+computes this site's coefficients, collapses and applies input RMSNorm with
+``attention_hc_pre``, runs the operator, and expands the residual with ``mhc_post``.
+``post_mix`` and ``residual_mix``
 apply immediately, while the computed ``pre_mix`` is handed to the next sub-layer. The
 module also hosts the shared HC fixture, goldens, and validation harness the reindex and
 reuse entries reuse.
@@ -78,9 +79,9 @@ from models.deepseek_v4_1_flash.decode_attn_c1a_full import (
     golden_decode_attn_c1a_full,
     topk_indices_compare,
 )
-from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
+from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes
 from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
-from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
+from models.deepseek_v4_1_flash.prefill_c2a_full import attention_hc_pre, golden_attention_input
 
 
 @pl.jit.inline(auto_scope=False)
@@ -90,6 +91,7 @@ def decode_c1a_full(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -145,8 +147,10 @@ def decode_c1a_full(
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     # The coefficients are staggered: collapse with the pre-mix the previous sub-layer
     # produced, apply post/residual immediately, and hand this site's pre-mix forward.
-    mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    mhc_pre(x_hc, pre_mix, hidden)
+    attention_hc_pre(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
+        next_pre_mix, post_mix, residual_mix, hidden,
+    )
     decode_attn_c1a_full(
         hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
@@ -167,6 +171,7 @@ def decode_c1a_full_test(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -227,7 +232,7 @@ def decode_c1a_full_test(
     index_block_table.bind_dynamic(1, TABLE_DYN)
     candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
     return decode_c1a_full(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, wq_a, wq_a_scale, q_norm_weight,
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots,
         window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
@@ -261,6 +266,7 @@ def make_program(tokens, pages, epochs=1):
         hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
         hc_attn_scale: pl.Tensor[[TP_SIZE, 3], pl.FP32],
         hc_attn_base: pl.Tensor[[TP_SIZE, MIX_HC], pl.FP32],
+        attn_norm_weight: pl.Tensor[[TP_SIZE, D], pl.BF16],
         wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
         wq_a_scale: pl.Tensor[[TP_SIZE, D // 32, Q_LORA], pl.FP8E8M0],
         q_norm_weight: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
@@ -325,7 +331,7 @@ def make_program(tokens, pages, epochs=1):
                 ] = index_wq_b_scale[rank]
                 decode_c1a_full_test(
                     x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank],
-                    hc_attn_base[rank], wq_a[rank],
+                    hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank],
                     wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r, wkv[rank],
                     wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank],
                     wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank],
@@ -357,6 +363,8 @@ def build_hc_validation_values(mode, tokens, pages, seed=17, case="random"):
     values["hc_attn_fn"] = torch.randn(TP_SIZE, MIX_HC, HC_DIM, generator=generator) / math.sqrt(HC_DIM)
     values["hc_attn_scale"] = torch.randn(TP_SIZE, 3, generator=generator)
     values["hc_attn_base"] = torch.randn(TP_SIZE, MIX_HC, generator=generator)
+    norm_weight = (0.5 + torch.rand(D, generator=generator)).to(torch.bfloat16)
+    values["attn_norm_weight"] = norm_weight.unsqueeze(0).repeat(TP_SIZE, 1)
     values["output"] = torch.zeros(TP_SIZE, tokens, HC_MULT, D, dtype=torch.float32)
     values["next_pre_mix"] = torch.zeros(TP_SIZE, tokens, HC_MULT, dtype=torch.float32)
     return values
@@ -404,9 +412,9 @@ def next_pre_mix_compare(actual, expected, **kwargs):
 def hc_topk_indices_compare(mode):
     """Tie-tolerant top-k comparison for the mHC entries.
 
-    The attention comparator rebuilds the index scores from the collapsed stream, which the
-    mHC entries carry as HC tensors rather than ``x``; derive it here from the staggered
-    pre-mix and hand it over under that name before delegating.
+    The attention comparator rebuilds index scores from the normalized collapsed stream.
+    The mHC entries carry HC tensors rather than ``x``; derive it here from the staggered
+    pre-mix and input RMSNorm weight, and hand it over under that name before delegating.
     """
     inner = topk_indices_compare(mode)
 
@@ -414,7 +422,9 @@ def hc_topk_indices_compare(mode):
         inputs = kwargs.get("inputs")
         if inputs is not None and "x" not in inputs:
             hidden = [
-                golden_mhc_pre(inputs["x_hc"][rank], inputs["pre_mix"][rank])
+                golden_attention_input(
+                    inputs["x_hc"][rank], inputs["pre_mix"][rank], inputs["attn_norm_weight"][rank]
+                )
                 for rank in range(TP_SIZE)
             ]
             inputs["x"] = torch.stack(hidden)
@@ -425,11 +435,11 @@ def hc_topk_indices_compare(mode):
 
 
 def golden_c1a_hc_case(tensors, attn_golden, epochs=1):
-    """Reference for an mHC-wired entry: mixes -> attention -> expansion.
+    """Reference for an mHC-wired entry: mixes -> input RMSNorm -> attention -> expansion.
 
     One DP group collapses its stream with the staggered pre-mix the fixture carries, runs
-    the attention golden per rank on the collapsed hidden, hands this site's computed pre-mix
-    to the next sub-layer, publishes the cache state the operator returned, reduces the
+    the attention golden per rank on normalized collapsed hidden, hands this site's computed
+    pre-mix to the next sub-layer, publishes the cache state the operator returned, reduces the
     attention partials, and expands the reduced result back onto the four streams.
     """
     parameters = [name for name in inspect.signature(attn_golden).parameters if name != "x"]
@@ -442,7 +452,9 @@ def golden_c1a_hc_case(tensors, attn_golden, epochs=1):
                 x_hc, tensors["hc_attn_fn"][rank], tensors["hc_attn_scale"][rank], tensors["hc_attn_base"][rank]
             )
             tensors["next_pre_mix"][rank].copy_(next_pre_mix)
-            hidden = golden_mhc_pre(x_hc, tensors["pre_mix"][rank])
+            hidden = golden_attention_input(
+                x_hc, tensors["pre_mix"][rank], tensors["attn_norm_weight"][rank]
+            )
             result = attn_golden(x=hidden, **{name: tensors[name][rank] for name in parameters})
             partials.append(result.output.float())
             mixes.append((x_hc, post_mix, residual_mix))
