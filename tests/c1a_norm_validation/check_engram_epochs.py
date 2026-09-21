@@ -18,6 +18,7 @@ import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 from golden import run, TensorSpec, ratio_allclose
 from models.deepseek_v4_1_flash import engram as E
+from models.deepseek_v4_1_flash.engram import engram_tp
 
 TP, T, EPOCHS = E.TP_SIZE, 3, 3
 N, ROWS, HD, K, V, H, D = E.N_HASH_COLS, E.ROWS_PER_RANK, E.HEAD_DIM, E.ENGRAM_K, E.KV_OUT, E.HC_MULT, E.D
@@ -47,7 +48,7 @@ def rank_entry(
             for token in pl.range(T):
                 for col in pl.range(N):
                     pl.write(prepared, [token, col], pl.read(ids, [epoch, token, col]) + offset)
-        E.engram_tp(prepared, table, wkv, weight, x[epoch], out[epoch],
+        engram_tp(prepared, table, wkv, weight, x[epoch], out[epoch],
                     window, signal, rank, epoch + 1)
     return out
 

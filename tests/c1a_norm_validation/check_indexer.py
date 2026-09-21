@@ -131,13 +131,13 @@ def main():
             cutoff = scores.topk(count).values[-1]
             assert bool((scores[chosen] >= cutoff).all())
             assert set(torch.where(scores > cutoff)[0].tolist()).issubset(chosen)
-        return True
+        return True, "valid tied Top-K"
 
     result = run(fn=make_entry(args.candidates),
                  specs=[TensorSpec(n, list(v.shape), v.dtype, init_value=lambda n=n: values[n].clone())
                         for n, v in values.items()],
                  golden_fn=lambda v: reference(v, args.candidates),
-                 compare_fn={"scores": lambda a, b, **kw: torch.equal(a, b), "topk": compare_topk},
+                 compare_fn={"scores": lambda a, b, **kw: (torch.equal(a, b), "exact constructed scores"), "topk": compare_topk},
                  compile_only=args.compile_only,
                  config={"platform": "a5", "device_id": args.d})
     assert result.passed, result.error

@@ -59,7 +59,7 @@ def main():
         def check(actual, expected, **kwargs):
             assert torch.equal(actual[:, active:], expected[:, active:]), "padding changed"
             if not active:
-                return True
+                return True, "empty prefix preserves padding"
             return compare(actual[:, :active], expected[:, :active], **kwargs)
         return check
 
