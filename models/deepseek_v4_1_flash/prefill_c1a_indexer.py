@@ -22,7 +22,7 @@ from models.deepseek_v4_1_flash.config import (
     T_DYN,
 )
 from models.deepseek_v4_1_flash.prefill_c1a_common import K_TILE, M_TILE, make_projection, make_rope
-from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import hierarchical_sparse_indexer
+from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import _hierarchical_sparse_indexer
 
 
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5
@@ -580,8 +580,7 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
                     if use_candidates:
                         completion[0] = topk_tid
                     else:
-                        candidate_scores = pl.slice(chunk_scores, [rows, positions], [0, 0])
-                        candidate_tid = hierarchical_sparse_indexer(candidate_scores, chunk_lens, chunk_candidates)
+                        candidate_tid = _hierarchical_sparse_indexer(chunk_scores, chunk_lens, chunk_candidates)
                         # Join both score readers before the next chunk overwrites the arena.
                         completion[0] = pl.system.task_dummy(deps=[topk_tid, candidate_tid])
         return completion[0]

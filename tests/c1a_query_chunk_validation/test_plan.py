@@ -75,7 +75,7 @@ def exercise(capacity, active, history, budget, candidates):
     )
     namespace = dict(pl=fake, TOPK_LEAF=8192, D=5120, Q_LORA=1024, ROPE_DIM=64, INDEX_TOPK=512,
                      use_candidates=candidates, max_logits_bytes=budget, paged_indexer_chunk=kernel,
-                     hierarchical_sparse_indexer=select)
+                     _hierarchical_sparse_indexer=select)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[entry], type_ignores=[])), str(source), "exec"), namespace)
     params = []
     row_widths = dict(x=5120, query_latent=1024, request_ids=None, compressed_lens=None,

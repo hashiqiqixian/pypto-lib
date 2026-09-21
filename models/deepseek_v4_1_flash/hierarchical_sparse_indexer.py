@@ -24,6 +24,7 @@ CANDIDATE_LEAF = 8192
 CANDIDATE_SHORT_LEAF = 2048
 CANDIDATE_MAX_BLOCKS = FLASH.max_position_embeddings // CANDIDATE_BLOCK_SIZE
 CANDIDATE_MAX_LEAVES = (CANDIDATE_MAX_BLOCKS + CANDIDATE_LEAF - 1) // CANDIDATE_LEAF
+INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
 
 
 def golden_hierarchical_sparse_indexer(
@@ -126,8 +127,8 @@ def _sort_candidate_short_leaf(
 
 
 @pl.jit.inline(auto_scope=False)
-def hierarchical_sparse_indexer(
-    index_scores: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.FP32],
+def _hierarchical_sparse_indexer(
+    index_scores: pl.Tensor[[T_DYN, INDEX_SCORE_POSITIONS_DYN], pl.FP32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
 ):
@@ -245,6 +246,17 @@ def hierarchical_sparse_indexer(
         mask = pl.tile.set_validshape(mask, 1, valid)
         pl.store(mask, [token, position], candidate_mask)
     return publish_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def hierarchical_sparse_indexer(
+    index_scores: pl.Tensor[[T_DYN, INDEX_SCORE_POSITIONS_DYN], pl.FP32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
+):
+    """Select candidate blocks from scores with optional trailing row padding."""
+    _hierarchical_sparse_indexer(index_scores, compressed_lens, candidate_mask)
+    return candidate_mask
 
 
 __all__ = ["golden_hierarchical_sparse_indexer", "hierarchical_sparse_indexer"]
