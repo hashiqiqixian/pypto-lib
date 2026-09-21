@@ -372,7 +372,7 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
                 score_completion[0] = score_tid
 
         if direct_topk:
-            with pl.spmd(num_tokens, name_hint="c1a_index_topk_direct", deps=[cache_ready]) as direct_tid:
+            with pl.spmd(num_tokens, name_hint="c1a_index_topk_direct", deps=[score_completion[0]]) as direct_tid:
                 token = pl.tile.get_block_idx()
                 request = pl.read(request_ids, [token])
                 visible_i32 = pl.read(compressed_lens, [token])
