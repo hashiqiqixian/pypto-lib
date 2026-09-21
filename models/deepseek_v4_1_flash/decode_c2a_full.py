@@ -1109,8 +1109,8 @@ def decode_c2a_full(
     wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
-    freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
-    freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+    rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
     window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN],
@@ -1127,9 +1127,8 @@ def decode_c2a_full(
     ],
     index_block_table: pl.Tensor[[C.B_DYN, C.TABLE_DYN], pl.INT32],
     position_ids: pl.Tensor[[C.T_DYN], pl.INT32],
-    compressed_freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
-    compressed_freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
-    compressed_rope_positions: pl.Tensor[[C.T_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
     compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
     compressor_wgate: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
     compressor_state_rows: pl.Tensor[[C.T_DYN], pl.INT64],
@@ -1161,15 +1160,6 @@ def decode_c2a_full(
                 cmp=pld.WaitCmp.Ge,
             )
     tokens = pl.tensor.dim(x, 0)
-    rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
-    rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
-    compressed_rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
-    compressed_rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
-    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin)
-    materialize_rope_rows(
-        compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, num_tokens,
-        compressed_rope_cos, compressed_rope_sin,
-    )
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     c2a_full_partial(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
@@ -1928,14 +1918,24 @@ def make_program(operator, capacity, world_size, epochs):
         index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
         index_block_table.bind_dynamic(0, B_DYN)
         index_block_table.bind_dynamic(1, TABLE_DYN)
+        tokens = pl.tensor.dim(x, 0)
+        rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+        rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+        compressed_rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+        compressed_rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+        materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin)
+        materialize_rope_rows(
+            compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, num_tokens,
+            compressed_rope_cos, compressed_rope_sin,
+        )
         for step in pl.range(epochs):
             operator(
                 x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-                kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, freqs_cos, freqs_sin,
+                kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
                 window_slots, window_indices, window_cache, window_cache_scale,
                 compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
                 index_cache, index_cache_scale, index_block_table, position_ids,
-                compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, compressor_wkv, compressor_wgate,
+                compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
                 compressor_state_rows, compressor_state, compressor_norm_weight,
                 compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
                 index_weights_proj, topk_indices, output_window, output_arrived, output,
