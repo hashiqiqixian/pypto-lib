@@ -279,12 +279,15 @@ def engram_tp(
     lookup_window: pld.DistributedTensor[[TP_MAX_TOKENS, ENGRAM_K], pl.BF16],
     signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    engram_epoch: pl.Scalar[pl.INT32],
 ):
     """One TP rank: gather against the local table shard, all-reduce the lookup.
 
     The gathered rows are linear in the table, so summing every rank's
     zero-masked partial lookup reproduces the full-table gather. The reduction
     is fused chunk-wise into the projection loop to keep tiles small.
+    All ranks use the same 1-based epoch, incremented for every reuse of these
+    zero-initialized windows. Odd counters publish; even counters release.
     """
     t_dim = pl.tensor.dim(hash_ids, 0)
     t_blocks = (t_dim + T_TILE - 1) // T_TILE
@@ -318,9 +321,19 @@ def engram_tp(
             lookup, valid_rows, ENGRAM_K
         )
 
+    # Do not overwrite a lookup until all ranks consumed its previous epoch.
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="engram_tp_reuse", allow_early_resolve=False
+    ) as reuse_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(
+                signal=signal, offsets=[peer, 0],
+                expected=(engram_epoch - 1) * 2, cmp=pld.WaitCmp.Ge,
+            )
+
     # Publish this rank's partial lookup into its own window slice, then barrier.
     with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="engram_tp_publish", deps=[gather_tid]
+        level=pl.Level.CORE_GROUP, name_hint="engram_tp_publish", deps=[gather_tid, reuse_tid]
     ) as publish_tid:
         pld.tensor.put(
             dst=lookup_window,
@@ -333,14 +346,13 @@ def engram_tp(
             chunk_cols=2048,
         )
         for peer in pl.range(TP_SIZE):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=signal,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+            pld.system.notify(
+                target=signal,
+                peer=peer,
+                offsets=[my_rank, 0],
+                value=1,
+                op=pld.NotifyOp.AtomicAdd,
+            )
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="engram_tp_wait",
@@ -348,13 +360,12 @@ def engram_tp(
         allow_early_resolve=False,
     ) as wait_tid:
         for src in pl.range(TP_SIZE):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=signal,
-                    offsets=[src, 0],
-                    expected=1,
-                    cmp=pld.WaitCmp.Ge,
-                )
+            pld.system.wait(
+                signal=signal,
+                offsets=[src, 0],
+                expected=engram_epoch * 2 - 1,
+                cmp=pld.WaitCmp.Ge,
+            )
 
     # ---- Stage 1: all-reduce the lookup chunk-wise, project to key|value.
     # Every element has exactly one non-zero contributor across the ranks, so
@@ -362,7 +373,7 @@ def engram_tp(
     # first K chunk goes through pl.matmul so the accumulator is produced in
     # Acc memory; later chunks accumulate onto it.
     kv = pl.create_tensor([t_dim, KV_OUT], dtype=pl.FP32)
-    with pl.spmd(t_blocks * n_blocks, name_hint="engram_tp_matmul", deps=[wait_tid]):
+    with pl.spmd(t_blocks * n_blocks, name_hint="engram_tp_matmul", deps=[wait_tid]) as matmul_tid:
         block = pl.tile.get_block_idx()
         t0 = (block // n_blocks) * T_TILE
         n0 = (block % n_blocks) * N_TILE
@@ -406,6 +417,24 @@ def engram_tp(
             acc = pl.matmul_acc(acc, a_tile, w_tile)
         pl.store(pl.set_validshape(acc, valid_rows, N_TILE), [t0, n0], kv)
 
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="engram_tp_release", deps=[matmul_tid]
+    ) as release_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(
+                target=signal, peer=peer, offsets=[my_rank, 0],
+                value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="engram_tp_consumed",
+        deps=[release_tid], allow_early_resolve=False,
+    ):
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(
+                signal=signal, offsets=[peer, 0],
+                expected=engram_epoch * 2, cmp=pld.WaitCmp.Ge,
+            )
+
     # ---- Stage 2: per (token block, hc copy) gate and residual add
     engram_gate(kv, weight, x, out)
     return out
@@ -422,6 +451,7 @@ def engram_tp_rank(
     lookup_window: pld.DistributedTensor[[TP_MAX_TOKENS, ENGRAM_K], pl.BF16],
     signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    engram_epoch: pl.Scalar[pl.INT32],
 ):
     """Run the Engram block on one TP rank for standalone validation."""
     hash_ids.bind_dynamic(0, T_DYN)
@@ -429,7 +459,7 @@ def engram_tp_rank(
     out.bind_dynamic(0, T_DYN)
     engram_tp(
         hash_ids, engram_table, wkv_weight, weight, x, out,
-        lookup_window, signal, my_rank,
+        lookup_window, signal, my_rank, engram_epoch,
     )
     return out
 
@@ -463,6 +493,7 @@ def engram_tp_group(
             lookup_window,
             signal,
             rank,
+            1,
             device=rank,
         )
 

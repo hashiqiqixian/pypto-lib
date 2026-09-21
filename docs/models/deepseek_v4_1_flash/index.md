@@ -198,6 +198,12 @@ round-robin across the four TP ranks. This prevents replicated attention rows
 from being dispatched four times; MoE combine returns the rows to the TP
 layout. DSA context parallelism is intentionally out of scope.
 
+`engram_tp` and `engram_tp_rank` require a shared, one-based `engram_epoch`.
+Start zeroed lookup/signal windows at epoch one and increment the epoch on
+every reuse, consistently across ranks. The signal counts both publication
+and consumption; it must not be reset between calls. `engram_tp_group`
+allocates fresh windows and passes epoch one for its single call.
+
 The service capacity contract is 32 active sequences and 4,096 scheduled
 prefill token rows per DP group. With five reserved DSpark draft rows plus one
 target row, the decode ABI reserves 192 token rows per DP group. DP2 therefore
