@@ -52,6 +52,7 @@ from models.deepseek_v4_1_flash.config import (
     LOCAL_H,
     LOCAL_O_WIDTH,
     Q_LORA,
+    ROPE_DIM,
     INDEX_BLOCKS_DYN,
     MIX_HC,
     ORI_BLOCKS_DYN,
@@ -558,10 +559,10 @@ def make_hc_program(capacity, world_size, epochs):
         state_cache.bind_dynamic(0, C.STATE_BLOCKS_DYN)
         if num_tokens > 0:
             tokens = pl.tensor.dim(x_hc, 0)
-            rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
-            rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
-            compressed_rope_cos = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
-            compressed_rope_sin = pl.create_tensor([tokens, C.ROPE_DIM // 2], dtype=pl.FP32)
+            rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+            rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+            compressed_rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+            compressed_rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
             materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin)
             materialize_rope_rows(
                 compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, num_tokens,
