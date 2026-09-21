@@ -131,7 +131,7 @@ def hierarchical_sparse_indexer(
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
 ):
-    """Select top-scoring blocks and expand them into a position mask."""
+    """Write the selected-block mask and return its publication TaskId."""
     tokens = pl.tensor.dim(index_scores, 0)
     positions = pl.tensor.dim(candidate_mask, 1)
     block_count = (positions + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
@@ -235,7 +235,7 @@ def hierarchical_sparse_indexer(
                         # Each token owns a distinct 128-byte-aligned row.
                         pl.write(aligned_mask, [token, position], pl.cast(1, pl.UINT8))
 
-    with pl.spmd(tokens * mask_tiles, name_hint="c1a_candidate_publish", deps=[topk_tid]):
+    with pl.spmd(tokens * mask_tiles, name_hint="c1a_candidate_publish", deps=[topk_tid]) as publish_tid:
         work = pl.tile.get_block_idx()
         token = work // mask_tiles
         tile = work % mask_tiles
@@ -244,7 +244,7 @@ def hierarchical_sparse_indexer(
         mask = pl.load(aligned_mask, [token, position], [1, 128])
         mask = pl.tile.set_validshape(mask, 1, valid)
         pl.store(mask, [token, position], candidate_mask)
-    return candidate_mask
+    return publish_tid
 
 
 __all__ = ["golden_hierarchical_sparse_indexer", "hierarchical_sparse_indexer"]

@@ -73,9 +73,14 @@ compressed positions at layer 20; later reindex layers select their final 512
 positions only inside that candidate mask.
 The prefill paged indexer decodes at most 256 tiles of 64 keys per wave,
 using a fixed 4 MiB BF16 scratch buffer. Each wave waits for the preceding
-score reads before reusing it. The FP32 score matrix still scales with
-`token_capacity * history_capacity`; this bound on decoded keys is not a
-claim that every combination of the maximum capacities fits in memory.
+score reads before reusing it. Queries are additionally split by a 512 MiB
+FP32 score budget, including Top-K row padding. Each chunk completes Top-K
+and, for Full, candidate-mask selection before the next chunk overwrites the
+shared score buffer. Reindex reads the supplied candidate-mask slice. The
+factory's `max_logits_bytes` argument can specialize the budget; at least one
+padded score row is retained. The budget covers scores, not persistent caches,
+the output candidate mask, or selection scratch, and does not guarantee that
+all capacity combinations fit in memory.
 
 Each decoder C1A mode keeps its attention operator in `decode_attn_c1a_*.py` and
 adds an mHC-wired `decode_c1a_*.py` entry. V4.1 staggers the coefficients:

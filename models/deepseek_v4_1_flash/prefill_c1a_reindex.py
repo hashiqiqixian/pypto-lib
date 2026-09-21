@@ -35,7 +35,7 @@ from models.deepseek_v4_1_flash.prefill_c1a_common import (
     make_projection,
     prefill_c1a_partial,
 )
-from models.deepseek_v4_1_flash.prefill_c1a_indexer import TOPK_LEAF, make_paged_indexer
+from models.deepseek_v4_1_flash.prefill_c1a_indexer import make_paged_indexer
 from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
@@ -221,14 +221,11 @@ def make_prefill_c1a_reindex(indexer):
     ):
         """Refresh ratio-1 Top-K rows inside a supplied candidate set."""
         tokens = pl.tensor.dim(x, 0)
-        positions = pl.tensor.dim(candidate_mask, 1)
 
         index_projection_a = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         project_index_latent(x, wq_a, wq_a_scale, index_projection_a, num_tokens)
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         normalize_index_latent(index_projection_a, q_norm_weight, query_latent, num_tokens)
-        score_width = (positions + TOPK_LEAF - 1) // TOPK_LEAF * TOPK_LEAF
-        index_scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
         cache_ready = pl.system.task_dummy(deps=[])
         indexer(
             x,
@@ -244,7 +241,6 @@ def make_prefill_c1a_reindex(indexer):
             index_wq_b_scale,
             index_weights_proj,
             candidate_mask,
-            index_scores,
             topk_indices,
             num_tokens,
             cache_ready,

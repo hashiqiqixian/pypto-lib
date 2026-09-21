@@ -22,12 +22,14 @@ from models.deepseek_v4_1_flash.config import (
     T_DYN,
 )
 from models.deepseek_v4_1_flash.prefill_c1a_common import K_TILE, M_TILE, make_projection, make_rope
+from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import hierarchical_sparse_indexer
 
 
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5
 INDEX_PAGE = 128
 INDEX_SCORE_TILE = 64
 INDEX_SCORE_WAVE = 256
+INDEX_MAX_LOGITS_BYTES = 512 * 1024 * 1024
 INDEX_PACKED_ELEMENTS = INDEX_SCORE_TILE * INDEX_DIM // 2
 TOPK_LEAF = 8192
 TOPK_PAIR_WIDTH = 2 * INDEX_TOPK
@@ -132,11 +134,11 @@ def _sort_topk_leaf(
     pl.store(top_pairs, [output_slot, 0], arena)
 
 
-def make_paged_indexer(use_candidates=False, direct_topk=False):
+def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes=INDEX_MAX_LOGITS_BYTES):
     """Specialize paged FP4 index scoring with optional candidate filtering."""
 
     @pl.jit.inline(auto_scope=False)
-    def paged_indexer(
+    def paged_indexer_chunk(
         x: pl.Tensor[[T_DYN, D], pl.BF16],
         query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
         request_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -370,7 +372,7 @@ def make_paged_indexer(use_candidates=False, direct_topk=False):
                 score_completion[0] = score_tid
 
         if direct_topk:
-            with pl.spmd(num_tokens, name_hint="c1a_index_topk_direct", deps=[cache_ready]):
+            with pl.spmd(num_tokens, name_hint="c1a_index_topk_direct", deps=[cache_ready]) as direct_tid:
                 token = pl.tile.get_block_idx()
                 request = pl.read(request_ids, [token])
                 visible_i32 = pl.read(compressed_lens, [token])
@@ -388,6 +390,7 @@ def make_paged_indexer(use_candidates=False, direct_topk=False):
                     pl.write(topk_indices, [token, lane], physical_row_i32)
                 direct_scores = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=0.0)
                 pl.store(direct_scores, [token, 0], scores)
+            score_completion[0] = direct_tid
         else:
             root_rows = tokens * TOPK_GROUPS_PER_TOKEN
             pair_arena = pl.create_tensor(
@@ -447,7 +450,7 @@ def make_paged_indexer(use_candidates=False, direct_topk=False):
                             root_slot,
                         )
 
-            with pl.spmd(num_tokens, name_hint="c1a_index_topk_merge", deps=[group_tid]):
+            with pl.spmd(num_tokens, name_hint="c1a_index_topk_merge", deps=[group_tid]) as merge_tid:
                 token = pl.tile.get_block_idx()
                 request = pl.read(request_ids, [token])
                 merge_visible_i32 = pl.read(compressed_lens, [token])
@@ -515,6 +518,72 @@ def make_paged_indexer(use_candidates=False, direct_topk=False):
                                 pl.INT32,
                             )
                         pl.write(topk_indices, [token, lane], physical_row_i32)
+
+            score_completion[0] = merge_tid
+        return score_completion[0]
+
+    if max_logits_bytes < TOPK_LEAF * 4:
+        raise ValueError("the score budget must hold at least one Top-K leaf")
+
+    @pl.jit.inline(auto_scope=False)
+    def paged_indexer(
+        x: pl.Tensor[[T_DYN, D], pl.BF16],
+        query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+        request_ids: pl.Tensor[[T_DYN], pl.INT32],
+        compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+        index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+        index_cache_scale: pl.Tensor[
+            [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0,
+        ],
+        index_block_table: pl.Tensor,
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+        index_wq_b_scale: pl.Tensor[
+            [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN,
+        ],
+        index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+        candidate_mask: pl.Tensor,
+        topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+        cache_ready: pl.Scalar[pl.TASK_ID],
+    ):
+        """Score and select query chunks within the FP32 logits budget."""
+        positions = pl.tensor.dim(candidate_mask, 1)
+        score_width = (positions + TOPK_LEAF - 1) // TOPK_LEAF * TOPK_LEAF
+        completion = pl.array.create(1, pl.TASK_ID)
+        completion[0] = cache_ready
+        if num_tokens > 0:
+            active_tokens = pl.cast(num_tokens, pl.INDEX)
+            chunk_tokens = pl.min(active_tokens, pl.max(1, max_logits_bytes // (score_width * 4)))
+            scores = pl.create_tensor([chunk_tokens, score_width], dtype=pl.FP32)
+            for begin in pl.range(0, active_tokens, chunk_tokens):
+                with pl.scope():
+                    rows = pl.min(chunk_tokens, active_tokens - begin)
+                    chunk_x = pl.slice(x, [rows, D], [begin, 0])
+                    chunk_latent = pl.slice(query_latent, [rows, Q_LORA], [begin, 0])
+                    chunk_requests = pl.slice(request_ids, [rows], [begin])
+                    chunk_lens = pl.slice(compressed_lens, [rows], [begin])
+                    chunk_cos = pl.slice(rope_cos, [rows, ROPE_DIM // 2], [begin, 0])
+                    chunk_sin = pl.slice(rope_sin, [rows, ROPE_DIM // 2], [begin, 0])
+                    chunk_candidates = pl.slice(candidate_mask, [rows, positions], [begin, 0])
+                    chunk_topk = pl.slice(topk_indices, [rows, INDEX_TOPK], [begin, 0])
+                    chunk_scores = pl.slice(scores, [rows, score_width], [0, 0])
+                    chunk_count = pl.cast(rows, pl.INT32)
+                    topk_tid = paged_indexer_chunk(
+                        chunk_x, chunk_latent, chunk_requests, chunk_lens,
+                        index_cache, index_cache_scale, index_block_table,
+                        chunk_cos, chunk_sin, index_wq_b, index_wq_b_scale,
+                        index_weights_proj, chunk_candidates, chunk_scores, chunk_topk,
+                        chunk_count, completion[0],
+                    )
+                    if use_candidates:
+                        completion[0] = topk_tid
+                    else:
+                        candidate_tid = hierarchical_sparse_indexer(chunk_scores, chunk_lens, chunk_candidates)
+                        # Join both score readers before the next chunk overwrites the arena.
+                        completion[0] = pl.system.task_dummy(deps=[topk_tid, candidate_tid])
+        return completion[0]
 
     return paged_indexer
 
