@@ -580,7 +580,8 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
                     if use_candidates:
                         completion[0] = topk_tid
                     else:
-                        candidate_tid = hierarchical_sparse_indexer(chunk_scores, chunk_lens, chunk_candidates)
+                        candidate_scores = pl.slice(chunk_scores, [rows, positions], [0, 0])
+                        candidate_tid = hierarchical_sparse_indexer(candidate_scores, chunk_lens, chunk_candidates)
                         # Join both score readers before the next chunk overwrites the arena.
                         completion[0] = pl.system.task_dummy(deps=[topk_tid, candidate_tid])
         return completion[0]
