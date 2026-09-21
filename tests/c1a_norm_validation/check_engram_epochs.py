@@ -21,6 +21,7 @@ from models.deepseek_v4_1_flash import engram as E
 from models.deepseek_v4_1_flash.engram import engram_tp
 
 TP, T, EPOCHS = E.TP_SIZE, 3, 3
+WINDOW_TOKENS = E.TP_MAX_TOKENS
 N, ROWS, HD, K, V, H, D = E.N_HASH_COLS, E.ROWS_PER_RANK, E.HEAD_DIM, E.ENGRAM_K, E.KV_OUT, E.HC_MULT, E.D
 
 
@@ -33,7 +34,7 @@ def rank_entry(
     x: pl.Tensor[[EPOCHS, T, H, D], pl.BF16],
     delay_map: pl.Tensor[[2], pl.INT32],
     out: pl.Out[pl.Tensor[[EPOCHS, T, H, D], pl.BF16]],
-    window: pld.DistributedTensor[[E.TP_MAX_TOKENS, K], pl.BF16],
+    window: pld.DistributedTensor[[WINDOW_TOKENS, K], pl.BF16],
     signal: pld.DistributedTensor[[TP, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
 ):
@@ -63,10 +64,10 @@ def host(
     delay_map: pl.Tensor[[TP, 2], pl.INT32],
     out: pl.Out[pl.Tensor[[TP, EPOCHS, T, H, D], pl.BF16]],
 ):
-    window_buf = pld.alloc_window_buffer([E.TP_MAX_TOKENS, K], dtype=pl.BF16)
+    window_buf = pld.alloc_window_buffer([WINDOW_TOKENS, K], dtype=pl.BF16)
     signal_buf = pld.alloc_window_buffer([TP, 1], dtype=pl.INT32)
     for rank in pl.range(TP):
-        window = pld.window(window_buf, [E.TP_MAX_TOKENS, K], dtype=pl.BF16)
+        window = pld.window(window_buf, [WINDOW_TOKENS, K], dtype=pl.BF16)
         signal = pld.window(signal_buf, [TP, 1], dtype=pl.INT32)
         rank_entry(ids[rank], table[rank], wkv[rank], weight[rank], x[rank], delay_map[rank],
                    out[rank], window, signal, rank, device=rank)
