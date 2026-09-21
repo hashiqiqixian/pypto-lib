@@ -187,12 +187,28 @@ if args.cpu_only:
     assert compare_candidates(expected["candidate_mask"], expected["candidate_mask"])
     print("CPU reference and tie-aware exact selection checks passed")
 else:
+    def validate_topk(actual, expected, **kwargs):
+        ok = compare_topk(actual, expected, **kwargs)
+        if not ok:
+            torch.save({"actual": actual, "expected": expected, "scores": reference_scores},
+                       ROOT_OUTPUT / f"topk-{args.mode}.pt")
+        return bool(ok), "exact scores with tie-equivalent Top-K and padding checks"
+
+    def validate_candidates(actual, expected, **kwargs):
+        ok = compare_candidates(actual, expected, **kwargs)
+        if not ok:
+            torch.save({"actual": actual, "expected": expected, "scores": reference_scores},
+                       ROOT_OUTPUT / f"candidates-{args.mode}.pt")
+        return bool(ok), "exact block scores with tie-equivalent candidate and padding checks"
+
+    ROOT_OUTPUT = Path("build_output/query_chunk_validation")
+    ROOT_OUTPUT.mkdir(parents=True, exist_ok=True)
     specs = [TensorSpec(k, list(v.shape), v.dtype, init_value=v) for k, v in values.items()]
     specs.append(ScalarSpec("num_tokens", torch.int32, args.active))
     result = run(
         fn=entry, specs=specs, golden_fn=golden, compile_only=args.compile_only,
         config={"platform": "a5", "device_id": args.device, "enable_dep_gen": args.dep_gen},
-        compare_fn={"topk_indices": compare_topk, "candidate_mask": compare_candidates},
+        compare_fn={"topk_indices": validate_topk, "candidate_mask": validate_candidates},
     )
     print(f"RESULT mode={args.mode} active={args.active} budget={args.budget}: {result}")
     if not result.passed:
