@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("-d", default="0")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--reference-only", action="store_true")
     args = parser.parse_args()
     active = args.active
     values = F.build_hc_validation_values(args.mode, args.tokens, 2, seed=37)
@@ -70,13 +71,17 @@ def main():
         "candidate_mask": F.exact_bytes,
     }
     for name, scale, slots, group, fmt in (
-        ("window_cache", "window_cache_scale", "window_slots", F.WINDOW_CACHE_GROUP, "e8m0"),
+        ("window_cache", "window_cache_scale", "window_slots", None, None),
         ("compressed_cache", "compressed_cache_scale", "compressed_slots", F.COMPRESSED_CACHE_GROUP, "e4m3"),
         ("index_cache", "index_cache_scale", "compressed_slots", F.INDEX_CACHE_GROUP, "e8m0"),
     ):
         if name not in host.param_names:
             continue
-        base = F.quantized_cache_compare(name, scale, slots, F.MXFP4_CACHE_MAX_RELATIVE_L2,
+        if args.mode != "full" and name != "window_cache":
+            comparisons[name] = comparisons[scale] = F.exact_bytes
+            continue
+        budget = F.CACHE_MAX_RELATIVE_L2 if group is None else F.MXFP4_CACHE_MAX_RELATIVE_L2
+        base = F.quantized_cache_compare(name, scale, slots, budget,
                                         group_size=group, scale_format=fmt)
         def checked(actual, expected, _base=base, **kwargs):
             inputs = dict(kwargs.get("inputs", {}))
@@ -86,6 +91,16 @@ def main():
             kwargs["inputs"] = inputs
             return _base(actual, expected, **kwargs)
         comparisons[name] = comparisons[scale] = checked
+    if args.reference_only:
+        expected = {n: v.clone() for n, v in values.items()}
+        reference(expected)
+        for name, compare in comparisons.items():
+            if name in expected:
+                ok, detail = compare(expected[name], expected[name], actual_outputs=expected,
+                                     expected_outputs=expected, inputs=values, rtol=1e-3, atol=1e-3)
+                assert ok, detail
+        print("Reference and comparison callback checks passed")
+        return
     specs = [TensorSpec(n, list(values[n].shape), values[n].dtype,
                         init_value=lambda n=n: values[n].clone()) for n in host.param_names]
     result = run(fn=host, specs=specs, golden_fn=reference, compile_only=args.compile_only,
