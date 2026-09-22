@@ -127,6 +127,10 @@ def golden(tensors):
         tensors["index_wq_b_scale"], tensors["index_weights_proj"], tensors["rope_cos"][:n], tensors["rope_sin"][:n],
         candidates=tensors["candidate_mask"][:n] if use_candidates else None,
     )
+    if scores.shape[1] < tensors["candidate_mask"].shape[1]:
+        scores = torch.nn.functional.pad(
+            scores, (0, tensors["candidate_mask"].shape[1] - scores.shape[1]), value=-torch.inf,
+        )
     reference_scores = scores
     tensors["topk_indices"][:n].copy_(physical)
     if not use_candidates:
