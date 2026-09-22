@@ -42,10 +42,11 @@ def make_case(mode):
                 pl.store(pl.maximum(scores_left, 0.0), [block, 0], output_left)
             else:
                 if physical_transpose:
-                    key_transposed = pl.tile.transpose(key_tile, 0, 1)
+                    key_materialized = pl.tile.transpose(key_tile, 0, 1)
+                    scores = pl.matmul(query_tile, key_materialized)
                 else:
                     key_transposed = pl.tile.transpose_view(key_tile)
-                scores = pl.matmul(query_tile, key_transposed)
+                    scores = pl.matmul(query_tile, key_transposed)
                 if epilogue:
                     pl.store(pl.maximum(scores, 0.0), [block, 0], output)
                 else:
@@ -59,6 +60,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("c2v", "v2c", "both", "left", "transpose"), required=True)
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(2)
     torch.manual_seed(712)
@@ -71,6 +73,11 @@ if __name__ == "__main__":
     if args.mode != "v2c":
         expected = expected.relu()
     kernel = make_case(args.mode)
+    if args.compile_only:
+        kernel.compile(keys, keys.to(torch.bfloat16), query, output, output_left,
+                       config=RunConfig(platform="a5"))
+        print(f"COMPILE PASS {args.mode}", flush=True)
+        raise SystemExit(0)
     kernel(keys, keys.to(torch.bfloat16), query, output, output_left,
            config=RunConfig(platform="a5", device_id=args.device))
     actual = output_left.T if args.mode == "left" else output
