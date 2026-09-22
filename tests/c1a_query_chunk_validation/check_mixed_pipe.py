@@ -30,6 +30,7 @@ def make_case(mode):
         output_left: pl.Out[pl.Tensor[[64, 32], pl.FP32]],
     ):
         with pl.spmd(1, name_hint="mixed_pipe_probe"):
+            block = pl.tile.get_block_idx()
             if prepare:
                 key_values = pl.load(keys, [0, 0], [64, 128])
                 key_tile = pl.cast(key_values, pl.BF16, mode="rint")
@@ -38,7 +39,7 @@ def make_case(mode):
             query_tile = pl.load(query, [0, 0], [32, 128])
             if left:
                 scores_left = pl.matmul(key_tile, pl.tile.transpose_view(query_tile))
-                pl.store(pl.maximum(scores_left, 0.0), [0, 0], output_left)
+                pl.store(pl.maximum(scores_left, 0.0), [block, 0], output_left)
             else:
                 if physical_transpose:
                     key_transposed = pl.tile.transpose(key_tile, 0, 1)
@@ -46,9 +47,9 @@ def make_case(mode):
                     key_transposed = pl.tile.transpose_view(key_tile)
                 scores = pl.matmul(query_tile, key_transposed)
                 if epilogue:
-                    pl.store(pl.maximum(scores, 0.0), [0, 0], output)
+                    pl.store(pl.maximum(scores, 0.0), [block, 0], output)
                 else:
-                    pl.store(scores, [0, 0], output)
+                    pl.store(scores, [block, 0], output)
         return output, output_left
 
     return entry
