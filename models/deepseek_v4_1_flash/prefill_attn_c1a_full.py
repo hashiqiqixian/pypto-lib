@@ -296,7 +296,7 @@ def make_prefill_attn_c1a_full(indexer):
 
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
-        indexer(
+        indexer_completion = indexer(
             x,
             query_latent,
             request_ids,
