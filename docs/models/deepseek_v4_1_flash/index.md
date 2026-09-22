@@ -71,9 +71,9 @@ Reuse consumes the source layer's physical Top-K rows and has no compressor or
 indexer weights. The hierarchical indexer first selects 2,048 blocks of eight
 compressed positions at layer 20; later reindex layers select their final 512
 positions only inside that candidate mask.
-The prefill paged indexer decodes at most 256 tiles of 64 keys per wave,
-using a fixed 4 MiB BF16 scratch buffer. Each wave waits for the preceding
-score reads before reusing it. Queries are additionally split by a 512 MiB
+The prefill paged indexer reads packed FP4 keys and decodes each 64-key
+tile inside the scoring task, without a decoded-key GM arena or separate
+decode-wave dispatches. Queries are split by a 512 MiB
 FP32 score budget, including Top-K row padding. Each chunk completes Top-K
 and, for Full, candidate-mask selection before the next chunk overwrites the
 shared score buffer. Reindex reads the supplied candidate-mask slice. The

@@ -28,7 +28,6 @@ from models.deepseek_v4_1_flash.hierarchical_sparse_indexer import _hierarchical
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5
 INDEX_PAGE = 128
 INDEX_SCORE_TILE = 64
-INDEX_SCORE_WAVE = 256
 INDEX_MAX_LOGITS_BYTES = 512 * 1024 * 1024
 INDEX_PACKED_ELEMENTS = INDEX_SCORE_TILE * INDEX_DIM // 2
 TOPK_LEAF = 8192
@@ -193,183 +192,153 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
             scale_flat = pl.reshape(index_cache_scale, [cache_rows, INDEX_DIM // INDEX_CACHE_GROUP])
             query_flat = pl.reshape(index_query, [tokens * INDEX_H, INDEX_DIM])
             pages = (positions + INDEX_SCORE_TILE - 1) // INDEX_SCORE_TILE
-            decoded_keys = pl.create_tensor(
-                [INDEX_SCORE_WAVE, INDEX_SCORE_TILE, INDEX_DIM],
-                dtype=pl.BF16,
-            )
-            # Bound dequantization scratch independently of token/history capacity.
-            # A later decode must wait for the previous score's scratch reads (WAR).
-            for wave_begin in pl.range(0, num_tokens * pages, INDEX_SCORE_WAVE):
-                wave_blocks = pl.min(INDEX_SCORE_WAVE, num_tokens * pages - wave_begin)
-                # Work around pypto#2829: finish weights before decode reuses the paired Vector UB.
-                with pl.spmd(wave_blocks, name_hint="c1a_index_decode",
-                             deps=[score_completion[0], weights_tid]) as decode_tid:
-                    slot = pl.tile.get_block_idx()
-                    block = wave_begin + slot
-                    token = block // pages
-                    page = block % pages
-                    logical_begin = page * INDEX_SCORE_TILE
-                    visible = pl.read(compressed_lens, [token])
-                    if logical_begin < visible:
-                        request = pl.read(request_ids, [token])
-                        logical_page = logical_begin // INDEX_PAGE
-                        physical_block_i32 = pl.read(index_block_table, [request, logical_page])
-                        if physical_block_i32 >= 0:
-                            physical_block = pl.cast(physical_block_i32, pl.INDEX)
-                            physical_row = physical_block * INDEX_PAGE + logical_begin % INDEX_PAGE
-                            payload_bytes = pl.load(
-                                cache_flat,
-                                [physical_row, 0],
-                                [INDEX_SCORE_TILE, INDEX_DIM // 2],
+            # Read packed keys and score in one task, without a decoded-key GM arena.
+            with pl.spmd(num_tokens * pages, name_hint="c1a_index_score",
+                         deps=[score_completion[0], weights_tid]) as score_tid:
+                block = pl.tile.get_block_idx()
+                token = block // pages
+                page = block % pages
+                logical_begin = page * INDEX_SCORE_TILE
+                empty_score = pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30)
+                pl.store(empty_score, [token, logical_begin], scores)
+                visible = pl.read(compressed_lens, [token])
+                if logical_begin < visible:
+                    request = pl.read(request_ids, [token])
+                    logical_page = logical_begin // INDEX_PAGE
+                    physical_block_i32 = pl.read(index_block_table, [request, logical_page])
+                    if physical_block_i32 >= 0:
+                        physical_block = pl.cast(physical_block_i32, pl.INDEX)
+                        physical_row = physical_block * INDEX_PAGE + logical_begin % INDEX_PAGE
+                        payload_bytes = pl.load(
+                            cache_flat,
+                            [physical_row, 0],
+                            [INDEX_SCORE_TILE, INDEX_DIM // 2],
+                        )
+                        payload_signed = pl.reinterpret_view(payload_bytes, pl.INT8)
+                        payload_i32 = pl.ands(pl.cast(payload_signed, pl.INT32), 255)
+                        low = pl.ands(payload_i32, 15)
+                        high = pl.ands(pl.shrs(payload_i32, 4), 15)
+                        low = pl.reshape(low, [1, INDEX_PACKED_ELEMENTS])
+                        high = pl.reshape(high, [1, INDEX_PACKED_ELEMENTS])
+                        combined_codes = pl.concat(low, high)
+                        output_ids = pl.tile.arange(
+                            0,
+                            [1, INDEX_SCORE_TILE * INDEX_DIM],
+                            dtype=pl.INT32,
+                        )
+                        pair_ids = pl.shrs(output_ids, 1)
+                        parity = pl.ands(output_ids, 1)
+                        code_indices = pl.add(pair_ids, pl.mul(parity, INDEX_PACKED_ELEMENTS))
+                        code_tmp = pl.create_tile([1, INDEX_SCORE_TILE * INDEX_DIM], dtype=pl.INT32)
+                        payload_codes = pl.tile.gather(combined_codes, code_indices, code_tmp)
+                        payload_codes = pl.reshape(
+                            payload_codes,
+                            [INDEX_SCORE_TILE, INDEX_DIM],
+                        )
+                        magnitude_codes = pl.ands(payload_codes, 7)
+                        magnitude = pl.mul(pl.cast(magnitude_codes, pl.FP32), 0.5)
+                        extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 4), 0), 1)
+                        magnitude = pl.add(
+                            magnitude,
+                            pl.mul(pl.cast(extra, pl.FP32), 0.5),
+                        )
+                        extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 5), 0), 1)
+                        magnitude = pl.add(
+                            magnitude,
+                            pl.mul(pl.cast(extra, pl.FP32), 0.5),
+                        )
+                        extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 6), 0), 1)
+                        magnitude = pl.add(
+                            magnitude,
+                            pl.mul(pl.cast(extra, pl.FP32), 1.5),
+                        )
+                        sign = pl.cast(pl.ands(pl.shrs(payload_codes, 3), 1), pl.FP32)
+                        sign_value = pl.add(pl.mul(sign, -2.0), 1.0)
+                        decoded_payload = pl.mul(magnitude, sign_value)
+                        payload_fp32 = pl.reshape(
+                            decoded_payload,
+                            [INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP), INDEX_CACHE_GROUP],
+                        )
+                        scale_rows = pl.load(
+                            scale_flat,
+                            [physical_row, 0],
+                            [INDEX_SCORE_TILE, 32],
+                            valid_shape=[INDEX_SCORE_TILE, INDEX_DIM // INDEX_CACHE_GROUP],
+                        )
+                        scale_rows = pl.tile.set_validshape(
+                            pl.tile.fillpad(scale_rows, pad_value=pl.PadValue.zero),
+                            INDEX_SCORE_TILE,
+                            32,
+                        )
+                        raw_codes = pl.reinterpret_view(scale_rows, pl.UINT8)
+                        signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
+                        codes = pl.ands(signed_codes, 255)
+                        scale_bits = pl.maximum(pl.shls(codes, 23), 4194304)
+                        scale_values = pl.reinterpret_view(scale_bits, pl.FP32)
+                        scale_flattened = pl.reshape(scale_values, [1, INDEX_SCORE_TILE * 32])
+                        group_ids = pl.tile.arange(
+                            0,
+                            [1, INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP)],
+                            dtype=pl.INT32,
+                        )
+                        group_rows = pl.cast(
+                            pl.div(pl.cast(group_ids, pl.FP32), INDEX_DIM // INDEX_CACHE_GROUP),
+                            pl.INT32,
+                            mode="trunc",
+                        )
+                        group_columns = pl.sub(
+                            group_ids,
+                            pl.mul(group_rows, INDEX_DIM // INDEX_CACHE_GROUP),
+                        )
+                        scale_indices = pl.add(
+                            pl.mul(group_rows, 32),
+                            group_columns,
+                        )
+                        gather_tmp = pl.create_tile([1, INDEX_SCORE_TILE * 4], dtype=pl.INT32)
+                        scale_vector = pl.tile.gather(scale_flattened, scale_indices, gather_tmp)
+                        payload_transposed = pl.tile.transpose(payload_fp32, 0, 1)
+                        scaled_transposed = pl.col_expand_mul(payload_transposed, scale_vector)
+                        key_fp32 = pl.tile.transpose(scaled_transposed, 0, 1)
+                        keys = pl.cast(pl.reshape(key_fp32, [INDEX_SCORE_TILE, INDEX_DIM]), pl.BF16, mode="rint")
+                        query_row = token * INDEX_H
+                        query = pl.load(query_flat, [query_row, 0], [INDEX_H, INDEX_DIM])
+                        dot = pl.matmul(query, pl.tile.transpose_view(keys), out_dtype=pl.FP32)
+                        head_scores = pl.cast(dot, pl.BF16, mode="rint")
+                        head_scores = pl.maximum(pl.cast(head_scores, pl.FP32), 0.0)
+                        weights = pl.reshape(
+                            pl.load(index_weights, [token, 0], [1, INDEX_H]),
+                            [INDEX_H, 1],
+                        )
+                        weighted = pl.row_expand_mul(head_scores, pl.cast(weights, pl.FP32))
+                        weighted = pl.cast(weighted, pl.BF16, mode="rint")
+                        reduced = pl.col_sum(pl.cast(weighted, pl.FP32))
+                        rounded_score = pl.cast(reduced, pl.BF16, mode="rint")
+                        computed_score = pl.reshape(pl.cast(rounded_score, pl.FP32), [1, INDEX_SCORE_TILE])
+                        if use_candidates:
+                            candidate_u8 = pl.load(
+                                candidate_mask,
+                                [token, logical_begin],
+                                [1, INDEX_SCORE_TILE],
                             )
-                            payload_signed = pl.reinterpret_view(payload_bytes, pl.INT8)
-                            payload_i32 = pl.ands(pl.cast(payload_signed, pl.INT32), 255)
-                            low = pl.ands(payload_i32, 15)
-                            high = pl.ands(pl.shrs(payload_i32, 4), 15)
-                            low = pl.reshape(low, [1, INDEX_PACKED_ELEMENTS])
-                            high = pl.reshape(high, [1, INDEX_PACKED_ELEMENTS])
-                            combined_codes = pl.concat(low, high)
-                            output_ids = pl.tile.arange(
-                                0,
-                                [1, INDEX_SCORE_TILE * INDEX_DIM],
-                                dtype=pl.INT32,
+                            candidate_i8 = pl.reinterpret_view(candidate_u8, pl.INT8)
+                            candidate = pl.cast(pl.cast(candidate_i8, pl.INT32), pl.FP32)
+                            filtered_score = pl.add(
+                                computed_score,
+                                pl.mul(pl.sub(candidate, 1.0), 1e30),
                             )
-                            pair_ids = pl.shrs(output_ids, 1)
-                            parity = pl.ands(output_ids, 1)
-                            code_indices = pl.add(pair_ids, pl.mul(parity, INDEX_PACKED_ELEMENTS))
-                            code_tmp = pl.create_tile([1, INDEX_SCORE_TILE * INDEX_DIM], dtype=pl.INT32)
-                            payload_codes = pl.tile.gather(combined_codes, code_indices, code_tmp)
-                            payload_codes = pl.reshape(
-                                payload_codes,
-                                [INDEX_SCORE_TILE, INDEX_DIM],
-                            )
-                            magnitude_codes = pl.ands(payload_codes, 7)
-                            magnitude = pl.mul(pl.cast(magnitude_codes, pl.FP32), 0.5)
-                            extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 4), 0), 1)
-                            magnitude = pl.add(
-                                magnitude,
-                                pl.mul(pl.cast(extra, pl.FP32), 0.5),
-                            )
-                            extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 5), 0), 1)
-                            magnitude = pl.add(
-                                magnitude,
-                                pl.mul(pl.cast(extra, pl.FP32), 0.5),
-                            )
-                            extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 6), 0), 1)
-                            magnitude = pl.add(
-                                magnitude,
-                                pl.mul(pl.cast(extra, pl.FP32), 1.5),
-                            )
-                            sign = pl.cast(pl.ands(pl.shrs(payload_codes, 3), 1), pl.FP32)
-                            sign_value = pl.add(pl.mul(sign, -2.0), 1.0)
-                            decoded_payload = pl.mul(magnitude, sign_value)
-                            payload_fp32 = pl.reshape(
-                                decoded_payload,
-                                [INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP), INDEX_CACHE_GROUP],
-                            )
-                            scale_rows = pl.load(
-                                scale_flat,
-                                [physical_row, 0],
-                                [INDEX_SCORE_TILE, 32],
-                                valid_shape=[INDEX_SCORE_TILE, INDEX_DIM // INDEX_CACHE_GROUP],
-                            )
-                            scale_rows = pl.tile.set_validshape(
-                                pl.tile.fillpad(scale_rows, pad_value=pl.PadValue.zero),
-                                INDEX_SCORE_TILE,
-                                32,
-                            )
-                            raw_codes = pl.reinterpret_view(scale_rows, pl.UINT8)
-                            signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                            codes = pl.ands(signed_codes, 255)
-                            scale_bits = pl.maximum(pl.shls(codes, 23), 4194304)
-                            scale_values = pl.reinterpret_view(scale_bits, pl.FP32)
-                            scale_flattened = pl.reshape(scale_values, [1, INDEX_SCORE_TILE * 32])
-                            group_ids = pl.tile.arange(
-                                0,
-                                [1, INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP)],
-                                dtype=pl.INT32,
-                            )
-                            group_rows = pl.cast(
-                                pl.div(pl.cast(group_ids, pl.FP32), INDEX_DIM // INDEX_CACHE_GROUP),
-                                pl.INT32,
-                                mode="trunc",
-                            )
-                            group_columns = pl.sub(
-                                group_ids,
-                                pl.mul(group_rows, INDEX_DIM // INDEX_CACHE_GROUP),
-                            )
-                            scale_indices = pl.add(
-                                pl.mul(group_rows, 32),
-                                group_columns,
-                            )
-                            gather_tmp = pl.create_tile([1, INDEX_SCORE_TILE * 4], dtype=pl.INT32)
-                            scale_vector = pl.tile.gather(scale_flattened, scale_indices, gather_tmp)
-                            payload_transposed = pl.tile.transpose(payload_fp32, 0, 1)
-                            scaled_transposed = pl.col_expand_mul(payload_transposed, scale_vector)
-                            key_fp32 = pl.tile.transpose(scaled_transposed, 0, 1)
-                            keys = pl.cast(pl.reshape(key_fp32, [INDEX_SCORE_TILE, INDEX_DIM]), pl.BF16, mode="rint")
-                            pl.store(keys, [slot, 0, 0], decoded_keys)
-
-                with pl.spmd(wave_blocks, name_hint="c1a_index_score", deps=[decode_tid]) as score_tid:
-                    slot = pl.tile.get_block_idx()
-                    block = wave_begin + slot
-                    token = block // pages
-                    page = block % pages
-                    logical_begin = page * INDEX_SCORE_TILE
-                    empty_score = pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30)
-                    pl.store(empty_score, [token, logical_begin], scores)
-                    visible = pl.read(compressed_lens, [token])
-                    if logical_begin < visible:
-                        request = pl.read(request_ids, [token])
-                        logical_page = logical_begin // INDEX_PAGE
-                        physical_block_i32 = pl.read(index_block_table, [request, logical_page])
-                        if physical_block_i32 >= 0:
-                            key_rows = pl.load(
-                                decoded_keys,
-                                [slot, 0, 0],
-                                [1, INDEX_SCORE_TILE, INDEX_DIM],
-                                target_memory=pl.MemorySpace.Mat,
-                            )
-                            keys = pl.reshape(key_rows, [INDEX_SCORE_TILE, INDEX_DIM])
-                            query_row = token * INDEX_H
-                            query = pl.load(query_flat, [query_row, 0], [INDEX_H, INDEX_DIM])
-                            dot = pl.matmul(query, pl.tile.transpose_view(keys), out_dtype=pl.FP32)
-                            head_scores = pl.cast(dot, pl.BF16, mode="rint")
-                            head_scores = pl.maximum(pl.cast(head_scores, pl.FP32), 0.0)
-                            weights = pl.reshape(
-                                pl.load(index_weights, [token, 0], [1, INDEX_H]),
-                                [INDEX_H, 1],
-                            )
-                            weighted = pl.row_expand_mul(head_scores, pl.cast(weights, pl.FP32))
-                            weighted = pl.cast(weighted, pl.BF16, mode="rint")
-                            reduced = pl.col_sum(pl.cast(weighted, pl.FP32))
-                            rounded_score = pl.cast(reduced, pl.BF16, mode="rint")
-                            computed_score = pl.reshape(pl.cast(rounded_score, pl.FP32), [1, INDEX_SCORE_TILE])
-                            if use_candidates:
-                                candidate_u8 = pl.load(
-                                    candidate_mask,
-                                    [token, logical_begin],
-                                    [1, INDEX_SCORE_TILE],
-                                )
-                                candidate_i8 = pl.reinterpret_view(candidate_u8, pl.INT8)
-                                candidate = pl.cast(pl.cast(candidate_i8, pl.INT32), pl.FP32)
-                                filtered_score = pl.add(
-                                    computed_score,
-                                    pl.mul(pl.sub(candidate, 1.0), 1e30),
-                                )
-                            else:
-                                filtered_score = computed_score
-                            valid_count = pl.min(INDEX_SCORE_TILE, visible - logical_begin)
-                            valid_score = pl.fillpad(
-                                pl.set_validshape(filtered_score, 1, valid_count),
-                                pad_value=pl.PadValue.min,
-                            )
-                            stored_score = pl.maximum(
-                                valid_score,
-                                pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30),
-                            )
-                            pl.store(stored_score, [token, logical_begin], scores)
-                score_completion[0] = score_tid
+                        else:
+                            filtered_score = computed_score
+                        valid_count = pl.min(INDEX_SCORE_TILE, visible - logical_begin)
+                        valid_score = pl.fillpad(
+                            pl.set_validshape(filtered_score, 1, valid_count),
+                            pad_value=pl.PadValue.min,
+                        )
+                        stored_score = pl.maximum(
+                            valid_score,
+                            pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30),
+                        )
+                        pl.store(stored_score, [token, logical_begin], scores)
+            score_completion[0] = score_tid
 
         if direct_topk:
             with pl.spmd(num_tokens, name_hint="c1a_index_topk_direct", deps=[score_completion[0]]) as direct_tid:
