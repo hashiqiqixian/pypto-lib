@@ -302,7 +302,9 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
                         keys = pl.cast(pl.reshape(key_fp32, [INDEX_SCORE_TILE, INDEX_DIM]), pl.BF16, mode="rint")
                         query_row = token * INDEX_H
                         query = pl.load(query_flat, [query_row, 0], [INDEX_H, INDEX_DIM])
-                        dot = pl.matmul(query, pl.tile.transpose_view(keys), out_dtype=pl.FP32)
+                        # Materialize ND layout before the A5 vector-to-cube NZ transfer.
+                        keys_transposed = pl.tile.transpose(keys, 0, 1)
+                        dot = pl.matmul(query, keys_transposed, out_dtype=pl.FP32)
                         head_scores = pl.cast(dot, pl.BF16, mode="rint")
                         head_scores = pl.maximum(pl.cast(head_scores, pl.FP32), 0.0)
                         weights = pl.reshape(
