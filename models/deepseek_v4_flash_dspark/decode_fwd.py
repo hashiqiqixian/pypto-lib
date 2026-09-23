@@ -1131,35 +1131,23 @@ def _decode_fwd(
     # No pl.scope() here: the branches write pl.Out params, and a scope would
     # confine their phi to it, out of reach of a caller that inlines this body.
     if group_tokens > 0:
-        target_hc_stack = pl.create_tensor([MOE_TOKENS * 3, HC_MULT, D], dtype=pl.FP32)
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_pack_target_hc"):
-            if token < local_t:
-                target_row = token * 3
-                pong_row = x_pong[token : token + 1, 0 : HC_MULT, 0 : D]
-                target_hc_stack[target_row : target_row + 1, 0 : HC_MULT, 0 : D] = pong_row
-                ping_row = x_ping[token : token + 1, 0 : HC_MULT, 0 : D]
-                target_hc_stack[target_row + 1 : target_row + 2, 0 : HC_MULT, 0 : D] = ping_row
-                hidden_out_row = pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D]
-                target_hc_stack[target_row + 2 : target_row + 3, 0 : HC_MULT, 0 : D] = hidden_out_row
-        target_rows = local_t * 3
-        target_hc_active = pl.slice(target_hc_stack, [target_rows, HC_MULT, D], [0, 0, 0])
-        target_hidden_stack = pl.create_tensor([MOE_TOKENS * 3, D], dtype=pl.BF16)
-        target_hidden_active = pl.slice(target_hidden_stack, [target_rows, D], [0, 0])
-        hc_head(target_hc_active, hc_head_fn, hc_head_scale, hc_head_base, target_hidden_active)
+        # Auxiliary taps use the HC mean, not the learned final-output head.
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_target_hidden"):
             if token < local_t:
-                target_row = token * 3
-                target_hidden_l40 = target_hidden_stack[target_row : target_row + 1, 0:D]
-                target_hidden_l41 = target_hidden_stack[target_row + 1 : target_row + 2, 0:D]
-                target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
-                dspark_target_hidden[token : token + 1, 0:D] = target_hidden_l40
-                dspark_target_hidden[token : token + 1, D : 2 * D] = target_hidden_l41
-                dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = target_hidden_l42
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_store_final_hidden"):
-            if token < local_t:
-                target_row = token * 3
-                target_hidden_l42 = target_hidden_stack[target_row + 2 : target_row + 3, 0:D]
-                hidden_workspace[token : token + 1, 0:D] = target_hidden_l42
+                pong_row = x_pong[token : token + 1, 0 : HC_MULT, 0 : D]
+                target_hidden_l40 = pl.mul(pl.col_sum(pl.reshape(pong_row, [HC_MULT, D])), 1.0 / HC_MULT)
+                dspark_target_hidden[token : token + 1, 0:D] = pl.cast(target_hidden_l40, pl.BF16, mode="rint")
+                ping_row = x_ping[token : token + 1, 0 : HC_MULT, 0 : D]
+                target_hidden_l41 = pl.mul(pl.col_sum(pl.reshape(ping_row, [HC_MULT, D])), 1.0 / HC_MULT)
+                dspark_target_hidden[token : token + 1, D : 2 * D] = pl.cast(
+                    target_hidden_l41, pl.BF16, mode="rint",
+                )
+                hidden_out_row = pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D]
+                target_hidden_l42 = pl.mul(pl.col_sum(pl.reshape(hidden_out_row, [HC_MULT, D])), 1.0 / HC_MULT)
+                dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = pl.cast(
+                    target_hidden_l42, pl.BF16, mode="rint",
+                )
+        hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
         final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
         lm_head(
             x_out,

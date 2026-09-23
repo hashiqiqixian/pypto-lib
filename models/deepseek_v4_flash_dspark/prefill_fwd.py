@@ -252,7 +252,7 @@ def _copy_target_hc_row(
     source: pl.Tensor,
     target: pl.Out[pl.Tensor],
 ):
-    """Copy one post-layer HC row into the fused target-head input."""
+    """Preserve one auxiliary HC row before the next layer overwrites it."""
     token = pl.tile.get_block_idx()
     row = pl.load(source, [token, 0, 0], [1, HC_MULT, D])
     target = pl.store(row, [token, 0, 0], target)
@@ -614,10 +614,9 @@ def prefill_fwd(
     group_rows = pl.tensor.dim(x_hc, 0)
     local_tokens = pl.tensor.dim(input_ids, 0)
     local_start = pl.cast(tp_rank, pl.INDEX) * pl.cast(local_tokens, pl.INDEX)
-    target_l40_start = pl.cast(group_rows, pl.INDEX)
-    target_l41_start = target_l40_start + pl.cast(local_tokens, pl.INDEX)
-    target_head_rows = group_rows + 2 * local_tokens
-    target_hc_stack = pl.create_tensor([target_head_rows, HC_MULT, D], dtype=pl.FP32)
+    target_l41_start = pl.cast(local_tokens, pl.INDEX)
+    target_hc_rows = 2 * local_tokens
+    target_hc_stack = pl.create_tensor([target_hc_rows, HC_MULT, D], dtype=pl.FP32)
 
     # Layers 2-41: CSA/HCA pairs.
     for pair_order in pl.range(HCA_NUM_LAYERS):
@@ -786,7 +785,7 @@ def prefill_fwd(
                         target_hc_l40 = pl.slice(
                             target_hc_stack,
                             [local_tokens, HC_MULT, D],
-                            [target_l40_start, 0, 0],
+                            [0, 0, 0],
                         )
                         with pl.spmd(local_tokens, name_hint="prefill_fwd_capture_target_hc_l40"):
                             target_hc_l40 = _copy_target_hc_row(target_x_hc_l40, target_hc_l40)
@@ -1087,37 +1086,29 @@ def prefill_fwd(
                 group_base, tp_rank, pl.const(43, pl.INT32),
             )
 
-    # Project the full layer-42 group and local layer-40/41 rows in one
-    # target-head launch.
+    # Auxiliary taps use HC means; only the main output uses the learned head.
     with pl.scope():
         if group_tokens > 0:
-            target_hc_l42 = pl.slice(
-                target_hc_stack,
-                [group_rows, HC_MULT, D],
-                [0, 0, 0],
-            )
-            with pl.spmd(group_rows, name_hint="prefill_fwd_capture_target_hc_l42"):
-                target_hc_l42 = _copy_target_hc_row(x_hc, target_hc_l42)
-            target_hidden_stack = pl.create_tensor([target_head_rows, D], dtype=pl.BF16)
-            target_hidden_stack = hc_head(
-                target_hc_stack,
-                hc_head_fn, hc_head_scale, hc_head_base,
-                target_hidden_stack,
-            )
-            layer42_hidden = pl.slice(target_hidden_stack, [group_rows, D], [0, 0])
             for token in pl.spmd(local_tokens, name_hint="prefill_fwd_store_target_hidden"):
-                target_l40_row = target_l40_start + token
                 target_l41_row = target_l41_start + token
                 target_l42_row = local_start + token
-                dspark_target_hidden[token : token + 1, 0:D] = target_hidden_stack[
-                    target_l40_row : target_l40_row + 1, 0:D,
+                target_hc_l40 = target_hc_stack[token : token + 1, 0 : HC_MULT, 0:D]
+                target_hidden_l40 = pl.mul(pl.col_sum(pl.reshape(target_hc_l40, [HC_MULT, D])), 1.0 / HC_MULT)
+                dspark_target_hidden[token : token + 1, 0:D] = pl.cast(target_hidden_l40, pl.BF16, mode="rint")
+                target_hc_l41 = target_hc_stack[
+                    target_l41_row : target_l41_row + 1, 0 : HC_MULT, 0:D,
                 ]
-                dspark_target_hidden[token : token + 1, D : 2 * D] = target_hidden_stack[
-                    target_l41_row : target_l41_row + 1, 0:D,
-                ]
-                dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = target_hidden_stack[
-                    target_l42_row : target_l42_row + 1, 0:D,
-                ]
+                target_hidden_l41 = pl.mul(pl.col_sum(pl.reshape(target_hc_l41, [HC_MULT, D])), 1.0 / HC_MULT)
+                dspark_target_hidden[token : token + 1, D : 2 * D] = pl.cast(
+                    target_hidden_l41, pl.BF16, mode="rint",
+                )
+                target_hc_l42 = x_hc[target_l42_row : target_l42_row + 1, 0 : HC_MULT, 0:D]
+                target_hidden_l42 = pl.mul(pl.col_sum(pl.reshape(target_hc_l42, [HC_MULT, D])), 1.0 / HC_MULT)
+                dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = pl.cast(
+                    target_hidden_l42, pl.BF16, mode="rint",
+                )
+            layer42_hidden = pl.create_tensor([group_rows, D], dtype=pl.BF16)
+            layer42_hidden = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, layer42_hidden)
             final_norm_tid = rms_norm(layer42_hidden, final_norm_w, x_out)
             lm_head(
                 x_out, lm_head_weight, logit_row_indices, logits,
@@ -2089,9 +2080,8 @@ def x_out_compare(actual, _expected, **kwargs):
 
 
 def dspark_target_hidden_compare(actual, _expected, **kwargs):
-    """Validate all taps are written and the layer-42 local projection is exact."""
+    """Validate all taps are written and layer 42 is the local HC mean."""
     import torch
-    from hc_head import golden_hc_head
 
     inputs = kwargs.get("inputs", {})
     device_x_hc = kwargs.get("actual_outputs", {}).get("x_hc")
@@ -2116,14 +2106,8 @@ def dspark_target_hidden_compare(actual, _expected, **kwargs):
             if bool(active_rows.any()) and not bool(torch.count_nonzero(part[active_rows])):
                 return False, f"    rank {rank} target layer {TARGET_LAYER_IDS[slot]} was not written"
 
-        expected_l42 = torch.empty(local_tokens, D, dtype=torch.bfloat16)
-        golden_hc_head({
-            "x_hc": device_x_hc[rank, local_start : local_start + local_tokens].cpu(),
-            "hc_head_fn": inputs["hc_head_fn"][rank],
-            "hc_head_scale": inputs["hc_head_scale"][rank],
-            "hc_head_base": inputs["hc_head_base"][rank],
-            "y": expected_l42,
-        })
+        expected_l42 = device_x_hc[rank, local_start : local_start + local_tokens].cpu().float().mean(dim=1)
+        expected_l42 = expected_l42.to(torch.bfloat16)
         actual_l42 = actual[rank, :, 2 * D : 3 * D].float()
         expected_l42 = expected_l42.float()
         tolerance = 1e-4 + (1.0 / 128) * expected_l42.abs()
