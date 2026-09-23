@@ -1094,18 +1094,18 @@ def prefill_fwd(
             for token in pl.spmd(local_tokens, name_hint="prefill_fwd_store_target_hidden"):
                 target_l41_row = target_l41_start + token
                 target_l42_row = local_start + token
-                target_hc_l40 = target_hc_stack[token : token + 1, 0 : HC_MULT, 0:D]
-                target_hidden_l40 = pl.mul(pl.col_sum(pl.reshape(target_hc_l40, [HC_MULT, D])), 1.0 / HC_MULT)
+                target_hc_l40_row = target_hc_stack[token : token + 1, 0 : HC_MULT, 0:D]
+                target_hidden_l40 = pl.mul(pl.col_sum(pl.reshape(target_hc_l40_row, [HC_MULT, D])), 1.0 / HC_MULT)
                 dspark_target_hidden[token : token + 1, 0:D] = pl.cast(target_hidden_l40, pl.BF16, mode="rint")
-                target_hc_l41 = target_hc_stack[
+                target_hc_l41_row = target_hc_stack[
                     target_l41_row : target_l41_row + 1, 0 : HC_MULT, 0:D,
                 ]
-                target_hidden_l41 = pl.mul(pl.col_sum(pl.reshape(target_hc_l41, [HC_MULT, D])), 1.0 / HC_MULT)
+                target_hidden_l41 = pl.mul(pl.col_sum(pl.reshape(target_hc_l41_row, [HC_MULT, D])), 1.0 / HC_MULT)
                 dspark_target_hidden[token : token + 1, D : 2 * D] = pl.cast(
                     target_hidden_l41, pl.BF16, mode="rint",
                 )
-                target_hc_l42 = x_hc[target_l42_row : target_l42_row + 1, 0 : HC_MULT, 0:D]
-                target_hidden_l42 = pl.mul(pl.col_sum(pl.reshape(target_hc_l42, [HC_MULT, D])), 1.0 / HC_MULT)
+                target_hc_l42_row = x_hc[target_l42_row : target_l42_row + 1, 0 : HC_MULT, 0:D]
+                target_hidden_l42 = pl.mul(pl.col_sum(pl.reshape(target_hc_l42_row, [HC_MULT, D])), 1.0 / HC_MULT)
                 dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = pl.cast(
                     target_hidden_l42, pl.BF16, mode="rint",
                 )
