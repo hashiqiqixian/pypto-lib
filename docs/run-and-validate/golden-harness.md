@@ -5,8 +5,8 @@ correctness-validation path. Its public entry points are exported from
 [`golden/__init__.py`](../../golden/__init__.py):
 
 - `TensorSpec` and `ScalarSpec` describe ordered kernel arguments;
-- `run` drives a `@pl.program` program;
-- `run_jit` drives a module-level `@pl.jit` function;
+- `run` drives a kernel of either form — a module-level `@pl.jit` function or
+  a `@pl.program` program;
 - validation helpers provide output-specific comparison policies.
 
 ## Describe the arguments
@@ -21,7 +21,6 @@ TensorSpec(
     shape,
     dtype,
     init_value=None,
-    is_output=False,
 )
 ```
 
@@ -38,9 +37,13 @@ TensorSpec(
 Random input is therefore explicit: use `init_value=torch.randn` or another
 random factory. `init_value=None` does not generate random values.
 
-Set `is_output=True` for every tensor that validation must compare. An output
-with a non-`None` initializer is an input/output state tensor: its initial
-value is supplied to the runtime and its final value is validated.
+A spec does not declare a direction. The harness reads each parameter's
+`In` / `Out` / `InOut` from the compiled artifact and stamps it onto the spec
+before any tensor is allocated, so the kernel signature is the single source of
+truth: every `pl.Out` / `pl.InOut` parameter is validated, and a `pl.InOut`
+tensor's `init_value` is uploaded as its initial state. A pure `pl.Out`
+parameter's host buffer is never uploaded, so an `init_value` there reaches only
+the golden reference, not the device.
 
 ### ScalarSpec
 
@@ -49,9 +52,9 @@ represents a scalar kernel argument. The harness stores it as a
 zero-dimensional PyTorch tensor and converts it to the runtime ABI form during
 dispatch. The name and position must still match the kernel signature.
 
-`run_jit` normally specializes scalar values into the artifact. Set
+A `@pl.jit` kernel normally specializes scalar values into the artifact. Set
 `compile_runtime=True` when dispatches must supply different values to the same
-artifact. If any scalar is marked, `run_jit` compiles from the JIT function's
+artifact. If any scalar is marked, `run` compiles from the JIT function's
 fully annotated signature, passes marked scalars as `pl.RUNTIME`, and keeps
 unmarked scalars specialized to their `value`. Every tensor parameter therefore
 needs a complete `pl.Tensor[[shape...], dtype]` annotation on this path.
@@ -62,7 +65,7 @@ warmup launches, receives `value + i * benchmark_step`. Stepped scalars
 require resident specs: L2 benchmarks and the non-resident L3 benchmark both
 reject them, because those paths repeat one argument list per launch instead
 of providing the persistent-window contract. A
-stepped scalar compiled through `run_jit` must also use `compile_runtime=True`;
+stepped scalar on a `@pl.jit` kernel must also use `compile_runtime=True`;
 otherwise the compiler is allowed to fold the initial value into the artifact.
 Stepped scalars cannot be combined with `runtime_cfg={"enable_chip_swimlane":
 True}` (nor its pre-rename spelling `enable_l2_swimlane`): that mode may
@@ -94,12 +97,12 @@ def golden_hello_world(values):
 The harness gives the golden function cloned inputs and separate zero-filled
 pure outputs, so runtime writes cannot mutate the already computed reference.
 
-## Choose run or run_jit
+## Pass either kernel form
 
-Use `run_jit` for a module-level `@pl.jit` function:
+`run` takes the kernel itself. A module-level `@pl.jit` function:
 
 ```python
-result = run_jit(
+result = run(
     fn=hello_world,
     specs=build_specs(),
     golden_fn=golden_hello_world,
@@ -112,11 +115,11 @@ result = run_jit(
 )
 ```
 
-Use `run` for a built `@pl.program`:
+A built `@pl.program`:
 
 ```python
 result = run(
-    program=build_program(),
+    fn=build_program(),
     specs=build_specs(),
     golden_fn=golden_fn,
     runtime_cfg={
@@ -126,9 +129,9 @@ result = run(
 )
 ```
 
-Both entry points perform the same input, golden, runtime, and validation
-stages after their respective compile path. The detailed sequence and
-configuration groups are documented in
+`run` picks the compile path from the kernel it is handed, then performs the
+same input, golden, runtime, and validation stages either way. The detailed
+sequence and configuration groups are documented in
 [Compile and Runtime Workflow](compile-runtime-workflow.md).
 
 ## Validation
@@ -154,7 +157,7 @@ a correctness check.
 
 ## Handle RunResult
 
-`run` and `run_jit` return:
+`run` returns:
 
 ```python
 RunResult(

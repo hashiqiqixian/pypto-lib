@@ -105,7 +105,6 @@ D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_HEAD_DIM = M.qk_rope_head_dim
-NOPE_HEAD_DIM = M.nope_head_dim
 Q_LORA = M.q_lora_rank
 WIN = M.sliding_window
 SOFTMAX_SCALE = M.softmax_scale
@@ -114,8 +113,7 @@ MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 HC_SINKHORN_ITER = M.hc_sinkhorn_iters
 HC_EPS = M.hc_eps
-# HCA-local context ceiling. The global Flash model ceiling remains unchanged.
-MAX_SEQ_LEN = 1_048_576
+MAX_SEQ_LEN = M.max_position_embeddings
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
@@ -292,24 +290,21 @@ def decode_hca(
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
-        (
-            stream_heads,
-            rope_cos_il, rope_sin_signed, rope_swap_idx,
-            stream_heads_tid, rope_swap_tid, rope_cs_tid,
-        ) = sparse_attn_hca(
-            q, kv_cache, window_swa_indices,
+        attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
+        attention_grouped, heads_tid = sparse_attn_hca(
+            q, kv_cache, window_swa_indices, window_swa_lens,
             cmp_kv, cmp_block_table,
             position_ids_local, kv_seq_lens,
             attn_sink, freqs_cos_local, freqs_sin_local,
+            attention_grouped,
             cache_ready_dep,
         )
 
-        attention_grouped = pl.create_tensor([O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], dtype=pl.BF16)
         pack_work_count = (t_dim // ATTENTION_PUBLISH_T_TILE) * (H // H_TILE)
         with pl.spmd(
             ATTENTION_PUBLISH_WORKERS,
-            name_hint="hca_stream_pack_publish",
-            deps=[stream_heads_tid, rope_swap_tid, rope_cs_tid],
+            name_hint="hca_stream_publish",
+            deps=[heads_tid],
         ) as publish_tid:
             worker = pl.tile.get_block_idx()
             for pack_work in pl.range(worker, pack_work_count, ATTENTION_PUBLISH_WORKERS):
@@ -320,32 +315,6 @@ def decode_hca(
                 global_group0 = stream_h0 // HEADS_PER_GROUP
                 destination_rank = global_group0 // LOCAL_O_GROUPS
                 local_group0 = global_group0 - destination_rank * LOCAL_O_GROUPS
-
-                for stream_dt in pl.unroll(ATTENTION_PUBLISH_T_TILE):
-                    stream_t = stream_t0 + stream_dt
-                    stream_state_row = stream_t * H + stream_h0
-                    stream_output = stream_heads[stream_state_row : stream_state_row + H_TILE, 0:HEAD_DIM]
-                    stream_bf16 = pl.cast(stream_output, target_type=pl.BF16, mode="rint")
-                    stream_rope = stream_output[0:H_TILE, NOPE_HEAD_DIM:HEAD_DIM]
-                    stream_cos_il = rope_cos_il[stream_t : stream_t + 1, 0:ROPE_HEAD_DIM]
-                    stream_sin_signed = rope_sin_signed[stream_t : stream_t + 1, 0:ROPE_HEAD_DIM]
-                    stream_swap_zero = pl.full([H_TILE, ROPE_HEAD_DIM], dtype=pl.INT32, value=0)
-                    stream_swap_idx = pl.col_expand_add(stream_swap_zero, rope_swap_idx[0:1, 0:ROPE_HEAD_DIM])
-                    stream_swapped = pl.gather(stream_rope, dim=-1, index=stream_swap_idx)
-                    stream_rot = pl.add(
-                        pl.col_expand_mul(stream_rope, stream_cos_il),
-                        pl.col_expand_mul(stream_swapped, stream_sin_signed),
-                    )
-                    n_rope_bf16 = pl.cast(stream_rot, target_type=pl.BF16, mode="rint")
-                    n_full_bf16 = pl.concat(stream_bf16[0:H_TILE, 0:NOPE_HEAD_DIM], n_rope_bf16)
-                    for n_hi in pl.unroll(H_TILE):
-                        n_head = stream_h0 + n_hi
-                        source_row = (n_head // HEADS_PER_GROUP) * T_PAD + stream_t
-                        source_col = (n_head % HEADS_PER_GROUP) * HEAD_DIM
-                        attention_grouped[
-                            source_row : source_row + 1,
-                            source_col : source_col + HEAD_DIM,
-                        ] = n_full_bf16[n_hi : n_hi + 1, 0:HEAD_DIM]
 
                 for group_slot in pl.unroll(PUBLISH_GROUPS):
                     source_row = (global_group0 + group_slot) * T_PAD + stream_t0
@@ -504,8 +473,8 @@ def l3_decode_hca(
     gamma_cq: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
     freqs_cos_local: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[TP_SIZE, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[TP_SIZE, T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[TP_SIZE, KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos: pl.Tensor[[TP_SIZE, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_sin: pl.Tensor[[TP_SIZE, KV_B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
@@ -691,7 +660,7 @@ def decode_hca_tp1(
     with pl.scope():
         o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
         o_packed_heads, heads_dep = sparse_attn_hca_tp1(
-            q, kv_cache, window_swa_indices,
+            q, kv_cache, window_swa_indices, window_swa_lens,
             cmp_kv, cmp_block_table,
             position_ids, kv_seq_lens,
             attn_sink, freqs_cos, freqs_sin,
@@ -1321,10 +1290,10 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
-        TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
+        TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state),
         TensorSpec("compress_state_block_table", [batch, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
-        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
-        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv, is_output=True),
+        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
+        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", list(cmp_block_table.shape), torch.int32, init_value=init_cmp_block_table),
         TensorSpec("ori_slot_mapping", [tokens], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("window_swa_indices", [tokens, WIN], torch.int32, init_value=init_window_swa_indices),
@@ -1337,7 +1306,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [tokens, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_out", [tokens, HC_MULT, D], torch.float32),
     ]
 
 
@@ -1352,7 +1321,14 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     local_batch = local_t // S
     group_batch = TP_SIZE * local_batch
     if isinstance(start_pos, (list, tuple)):
-        start_pos = list(start_pos) * TP_SIZE
+        start_pos = list(start_pos)
+        if len(start_pos) == local_batch:
+            start_pos *= TP_SIZE
+        elif len(start_pos) != group_batch:
+            raise ValueError(
+                f"distributed HCA start positions need {local_batch} local or "
+                f"{group_batch} group rows, got {len(start_pos)}",
+            )
 
     # Token rows and requests the rank owns. Everything else is either a
     # replicated weight or the group's full stream, which every rank holds.
@@ -1371,9 +1347,8 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     resident_names = frozenset({
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
         "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-        "cmp_freqs_cos", "cmp_freqs_sin",
         "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
-        "compress_state", "compress_state_block_table",
+        "compress_state",
         "kv_cache", "cmp_kv", "attn_sink",
     })
 
@@ -1381,7 +1356,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     for spec in build_tensor_specs(start_pos=start_pos, batch=group_batch):
         if spec.name == "x_out":
             specs.append(TensorSpec(
-                "x_out", [TP_SIZE, local_t, HC_MULT, D], torch.float32, is_output=True,
+                "x_out", [TP_SIZE, local_t, HC_MULT, D], torch.float32, 
             ))
             continue
 
@@ -1426,7 +1401,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
         local_name = f"{spec.name}_local" if spec.name in dual_names else spec.name
         distributed_spec = TensorSpec(
             local_name, list(rank_value.shape), spec.dtype,
-            init_value=rank_value, is_output=spec.is_output,
+            init_value=rank_value, 
         )
         if spec.name in resident_names:
             distributed_spec.resident = "stacked"
@@ -1444,7 +1419,7 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
 if __name__ == "__main__":
     import argparse
 
-    from golden import mapped_pool_ratio_allclose, ratio_reldiff, run_jit
+    from golden import mapped_pool_ratio_allclose, ratio_reldiff, run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -1500,7 +1475,7 @@ if __name__ == "__main__":
 
     for local_t in token_counts:
         if TP_SIZE == 1:
-            result = run_jit(
+            result = run(
                 fn=decode_hca_tp1_test,
                 specs=build_tensor_specs(start_pos=args.start_pos, batch=local_t // S),
                 golden_fn=golden_decode_hca_tp1,
@@ -1540,7 +1515,7 @@ if __name__ == "__main__":
             full_x_out_max_diff = 2 if args.platform == "a2a3sim" else 1
             mapping_shape = (TP_SIZE, local_t)
             full_mapping_shape = (TP_SIZE, TP_SIZE * local_t)
-            result = run_jit(
+            result = run(
                 fn=l3_decode_hca,
                 specs=build_distributed_tensor_specs(local_t, start_pos=args.start_pos),
                 golden_fn=golden_decode_hca,

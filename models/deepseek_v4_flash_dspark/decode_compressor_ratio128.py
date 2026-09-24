@@ -24,7 +24,6 @@ from config import (
     DECODE_SEQ,
     KV_CMP_BLOCK_NUM,
     FP32_NEG_INF,
-    KV_CMP_MAX_BLOCKS,
 )
 
 # Dynamic shape variables.
@@ -70,7 +69,7 @@ COMPRESS_STATE_PHYSICAL_BLOCKS = HCA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+CMP_MAX_BLOCKS = (IDX_KV_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
     raise ValueError("ratio128 compressed KV cache capacity is smaller than max compressed sequence length")
@@ -363,6 +362,9 @@ def golden_compressor(tensors):
     """
     import torch
 
+    # Rows this golden never writes stay NaN: ignored by the kv comparator.
+    tensors["kv"].fill_(float("nan"))
+
     x = tensors["x"].float()
     compress_state_block_table = tensors["compress_state_block_table"]
     position_ids = tensors["position_ids"].to(torch.int64)
@@ -467,7 +469,7 @@ def golden_compressor(tensors):
         cmp_row = int(cmp_slot_mapping[b, boundary_s].item())
         if cmp_row >= 0:
             # Kernel writes committed pooled result only to kv[:, 0, :]; leave
-            # speculative-boundary rows and kv[:, 1:, :] zero-initialized.
+            # speculative-boundary rows and kv[:, 1:, :] NaN (ignored).
             tensors["kv"][b * S : b * S + 1, :] = kv_b[0]
             cblk = cmp_row // BLOCK_SIZE
             intra_offset = cmp_row % BLOCK_SIZE
@@ -487,9 +489,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         state_slot_mapping,
     )
     from golden import TensorSpec
-    from utils import build_rope_tables, materialize_half_rope_tables
-
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    from utils import token_local_rope
 
     def init_x():
         return torch.rand(batch * S, D)
@@ -509,10 +509,6 @@ def build_tensor_specs(start_pos=None, batch=B):
         first_pos = init_position_ids().to(torch.int64)[:, 0]
         cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)
         return (first_pos + cmp_offset - COMPRESS_RATIO).to(torch.int64)
-    def init_cos():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
-    def init_sin():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
     def init_cmp_kv_cache():
         return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
     def init_compress_state_block_table():
@@ -543,6 +539,16 @@ def build_tensor_specs(start_pos=None, batch=B):
         )
     def init_position_ids():
         return position_ids_from_starts(init_start_pos(), seq=S)
+    token_freqs_cos, token_freqs_sin = token_local_rope(
+        M,
+        COMPRESS_RATIO,
+        init_rope_positions(),
+        dtype=torch.bfloat16,
+    )
+    def init_cos():
+        return token_freqs_cos[:, : ROPE_HEAD_DIM // 2].float().contiguous()
+    def init_sin():
+        return token_freqs_sin[:, : ROPE_HEAD_DIM // 2].float().contiguous()
     def init_state_slot_mapping():
         return state_slot_mapping(
             init_position_ids(),
@@ -559,8 +565,8 @@ def build_tensor_specs(start_pos=None, batch=B):
         )
     return [
         TensorSpec("x", [batch * S, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("kv", [batch * S, HEAD_DIM], torch.float32, is_output=True),
-        TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
+        TensorSpec("kv", [batch * S, HEAD_DIM], torch.float32),
+        TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state),
         TensorSpec("compress_state_block_table", [batch, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
         TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
@@ -568,7 +574,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("cos", [batch, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [batch, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec("cmp_kv_cache", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv_cache, is_output=True),
+        TensorSpec("cmp_kv_cache", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv_cache),
         TensorSpec("position_ids", [batch * S], torch.int32, init_value=lambda: init_position_ids().reshape(-1)),
         TensorSpec("cmp_slot_mapping", [batch * S], torch.int64, init_value=lambda: init_cmp_slot_mapping().reshape(-1)),
         TensorSpec("state_slot_mapping", [batch * S], torch.int64, init_value=lambda: init_state_slot_mapping().reshape(-1)),
@@ -577,7 +583,7 @@ def build_tensor_specs(start_pos=None, batch=B):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -596,7 +602,7 @@ if __name__ == "__main__":
     if args.batch < 4 or args.batch > B or args.batch % 4 != 0:
         parser.error(f"--batch must be a multiple of 4 in [4, {B}], got {args.batch}")
 
-    result = run_jit(
+    result = run(
         fn=compressor_test,
         specs=build_tensor_specs(args.start_pos, batch=args.batch),
         golden_fn=golden_compressor,
@@ -611,7 +617,7 @@ if __name__ == "__main__":
         # Precision reference: AscendC torch.ops.custom.compressor —
         # ops-transformer/experimental/attention/compressor/tests/pytest/compressor_golden.py
         compare_fn={
-            "kv":            ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "kv":            ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0, ignore_nan=True),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "cmp_kv_cache":   ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
         },

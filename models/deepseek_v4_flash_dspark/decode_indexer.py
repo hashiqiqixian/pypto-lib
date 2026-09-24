@@ -41,7 +41,7 @@ IDX_N_HEADS = M.index_n_heads
 IDX_HEAD_DIM = M.index_head_dim
 IDX_NOPE_HEAD_DIM = M.index_nope_head_dim
 WEIGHTS_SCALE = M.index_weights_scale
-MAX_SEQ_LEN = 1_048_576
+MAX_SEQ_LEN = M.max_position_embeddings
 
 # kernel-local
 COMPRESS_RATIO = 4   # the indexer only runs on ratio-4 layers
@@ -1259,11 +1259,11 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
-        TensorSpec("idx_kv_cache", [idx_physical_blocks, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_kv_i8, is_output=True),
-        TensorSpec("idx_kv_scale", [idx_physical_blocks, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: idx_kv_sc, is_output=True),
+        TensorSpec("idx_kv_cache", [idx_physical_blocks, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_kv_i8),
+        TensorSpec("idx_kv_scale", [idx_physical_blocks, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: idx_kv_sc),
         TensorSpec("idx_block_table", [batch, IDX_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
-        TensorSpec("topk_scores", [tokens, IDX_TOPK], torch.float32, is_output=True),
-        TensorSpec("topk_idxs", [tokens, IDX_TOPK], torch.int32, is_output=True),
+        TensorSpec("topk_scores", [tokens, IDX_TOPK], torch.float32),
+        TensorSpec("topk_idxs", [tokens, IDX_TOPK], torch.int32),
         TensorSpec("position_ids", [batch * S], torch.int32, init_value=lambda: init_position_ids().reshape(-1)),
         TensorSpec("idx_slot_mapping", [batch * S], torch.int64, init_value=lambda: init_idx_slot_mapping().reshape(-1)),
         TensorSpec("inner_state_slot_mapping", [batch * S], torch.int64, init_value=lambda: init_inner_state_slot_mapping().reshape(-1)),
@@ -1273,7 +1273,7 @@ def build_tensor_specs(start_pos=None, batch=B):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit, topk_pair_compare
+    from golden import ratio_allclose, run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1303,7 +1303,7 @@ if __name__ == "__main__":
             )
         start_pos = start_values[0] if len(start_values) == 1 else start_values
 
-    result = run_jit(
+    result = run(
         fn=indexer_test,
         specs=build_tensor_specs(start_pos, batch=args.batch),
         golden_fn=golden_indexer,

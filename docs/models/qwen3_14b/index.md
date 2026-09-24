@@ -3,7 +3,7 @@
 `models/qwen3_14b/` implements the HuggingFace **Qwen3-14B** checkpoint: a BF16
 prefill and decode pair with the serving contract, plus A8W8 and TurboQuant
 variants and the sampling components. Together with
-[V4-Flash MTP](../deepseek_v4_flash_mtp.md) it is one of the two trees wired up
+[V4-Flash MTP](../deepseek_v4_flash_mtp/index.md) it is one of the two trees wired up
 for full `pypto-serving` integration.
 
 ## Deployment configuration
@@ -83,7 +83,7 @@ through `pl.jit.extern`, while
 [rope_qkv_regen.py](../../../models/qwen3_14b/rope_qkv_regen.py) regenerates its
 embedded Phase-0 header. Production `decode_fwd` does not call this CCE path.
 
-The standalone [PyPTO Page Attention tutorial](paged_attention_pypto.html)
+The standalone [PyPTO Page Attention tutorial](paged_attention_pypto.md)
 walks through the native kernel in implementation order, from task/page/stack
 decomposition to the mixed AIC/AIV software pipeline.
 
@@ -124,7 +124,7 @@ constants an external runtime needs.
 
 ## How it was optimized
 
-[Qwen3-14B optimization](../../debug-and-tune/qwen3-14b-optimization.md) follows the
+[Qwen3-14B optimization](optimization.md) follows the
 tuning of this tree in order — the shape constraint that forbids the obvious
 attention fusion, the measurement surface and the pass-rate golden, the general
 task-count and tiling levers, the attention, sampling and KV-cache rewrites, and

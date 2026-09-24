@@ -42,7 +42,7 @@ HEAD_DIM = M.index_head_dim
 HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.index_nope_head_dim
-MAX_SEQ_LEN = 1_048_576
+MAX_SEQ_LEN = M.max_position_embeddings
 
 # kernel-local (ratio-4 overlapping compressor)
 COMPRESS_RATIO = 4
@@ -384,6 +384,9 @@ def golden_compressor(tensors):
     """Torch reference for Compressor.forward (decode branch, ratio=4 overlap)."""
     import torch
 
+    # Rows this golden never writes stay NaN: ignored by the kv comparator.
+    tensors["kv"].fill_(float("nan"))
+
     x = tensors["x"].float()
     compress_state = tensors["compress_state"]
     compress_state_block_table = tensors["compress_state_block_table"]
@@ -599,8 +602,8 @@ def build_tensor_specs(start_pos=None, batch=B):
 
     return [
         TensorSpec("x", [batch * S, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("kv", [batch * S, HEAD_DIM], torch.float32, is_output=True),
-        TensorSpec("compress_state", [state_block_num, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
+        TensorSpec("kv", [batch * S, HEAD_DIM], torch.float32),
+        TensorSpec("compress_state", [state_block_num, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state),
         TensorSpec("compress_state_block_table", [batch, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
         TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
@@ -609,8 +612,8 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("cos", [batch * S, ROPE_HEAD_DIM], torch.float32, init_value=init_cos),
         TensorSpec("sin", [batch * S, ROPE_HEAD_DIM], torch.float32, init_value=init_sin),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
-        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
-        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache),
+        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale),
         TensorSpec("position_ids", [batch * S], torch.int32, init_value=lambda: init_position_ids().reshape(-1)),
         TensorSpec("idx_slot_mapping", [batch * S], torch.int64, init_value=lambda: init_idx_slot_mapping().reshape(-1)),
         TensorSpec("inner_state_slot_mapping", [batch * S], torch.int64, init_value=lambda: init_inner_state_slot_mapping().reshape(-1)),
@@ -619,7 +622,7 @@ def build_tensor_specs(start_pos=None, batch=B):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -647,7 +650,7 @@ if __name__ == "__main__":
             parser.error(f"--start-pos must contain integers, got {args.start_pos!r}")
         start_pos = start_values[0] if len(start_values) == 1 else start_values
 
-    result = run_jit(
+    result = run(
         fn=compressor_test,
         specs=build_tensor_specs(start_pos, batch=args.batch),
         golden_fn=golden_compressor,
@@ -667,7 +670,7 @@ if __name__ == "__main__":
             # floor is set by that input scale, not by the cancelled output, so atol carries
             # it -- a 1e-4 floor asks small elements for a relative accuracy the bf16 inputs
             # cannot hold. rtol still bounds the large elements.
-            "kv":          ratio_allclose(atol=1e-3, rtol=1.0 / 128, max_error_ratio=0.0),
+            "kv":          ratio_allclose(atol=1e-3, rtol=1.0 / 128, max_error_ratio=0.0, ignore_nan=True),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
             "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),

@@ -91,13 +91,14 @@ Every tensor the golden test compares **must** declare an explicit direction on
 the **orchestration entry** — the `@pl.jit` entry, its `@pl.jit.host` driver, or
 the `@pl.function(type=Opaque)` / `Orchestration` method. A plain `pl.Tensor` is
 treated as `In`: the runtime skips its device→host copy-back, so the tensor
-**reads back as all-zeros on the host** and golden silently fails. The direction
-is decided by the tensor's `TensorSpec`:
+**reads back as all-zeros on the host** and golden silently fails. The
+annotation is the only place direction is declared — the harness reads it back
+off the compiled artifact, so a `TensorSpec` never restates it:
 
-| `TensorSpec` | meaning | annotation |
-|--------------|---------|------------|
-| `is_output=True`, no `init_value` | pure output (write-only) | `pl.Out[pl.Tensor[...]]` |
-| `is_output=True` **and** `init_value` | inout — read-modify-write (e.g. a paged KV cache the kernel reads history from and appends to; recurrent state) | `pl.InOut[pl.Tensor[...]]` |
+| annotation | meaning | `TensorSpec` |
+|------------|---------|--------------|
+| `pl.Out[pl.Tensor[...]]` | pure output (write-only); validated | no `init_value` needed — the host buffer is not uploaded |
+| `pl.InOut[pl.Tensor[...]]` | inout — read-modify-write (e.g. a paged KV cache the kernel reads history from and appends to; recurrent state); validated | `init_value` is the uploaded initial state |
 
 Annotate the **entry only**. `@pl.jit.inline` sub-kernels keep bare `pl.Tensor`:
 they are spliced at the call site before SSA conversion, so a parameter is
@@ -116,6 +117,27 @@ def attention_csa_test(
     attention_csa(x_hc, ..., kv_cache, x_out)           # inline params stay bare pl.Tensor
     return x_out
 ```
+
+#### A `pl.Out` region the kernel does not write is undefined
+
+The runtime allocates a pure `pl.Out` buffer from the device pool: it neither
+uploads the host placeholder nor zero-fills the buffer, so **every byte the
+kernel does not write is allocator residue** — often zero on a2a3, garbage or
+`NaN` on `a2a3sim`. The host `TensorSpec` is zero-filled, so a golden that leaves
+that region at zero asserts a value the kernel never promised and passes or fails
+by platform luck.
+
+Pick one per output:
+
+| The unwritten region is | Fix |
+|---|---|
+| padding past an active token count, and the kernel already zero-fills it (`hc_post`'s `hc_post_inactive_pad`, `gate`'s inactive-token zeroing) | nothing — keep `zero_tail=True` honest |
+| a leading prefix's tail, with the boundary a fixture constant | `ratio_allclose(..., valid_rows=N, valid_axis=A)` |
+| data-dependent (slot mappings, per-request conditions) | golden fills it `float("nan")`; comparator takes `ignore_nan=True` |
+| something the test must still assert is untouched | make it `pl.InOut` with a zero `init_value`, so the host zeros reach the device |
+
+An `InOut` has no such hole: its host contents are uploaded, so an unwritten
+region reads back as whatever was sent.
 
 ### `pl.at` scopes
 

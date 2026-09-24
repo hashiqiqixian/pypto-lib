@@ -22,9 +22,6 @@ from config import (
     TP,
     DECODE_SEQ,
     FLASH as M,
-    IDX_CACHE_MAX_BLOCKS,
-    KV_CMP_MAX_BLOCKS,
-    KV_ORI_MAX_BLOCKS,
 )
 
 
@@ -32,9 +29,11 @@ B = DECODE_BATCH // TP
 S = DECODE_SEQ
 T = B * S
 WIN = M.sliding_window
-ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-IDX_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
+MAX_SEQ_LEN = M.max_position_embeddings
+ORI_MAX_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
+CMP_MAX_ROWS = MAX_SEQ_LEN // 4
+CMP_MAX_BLOCKS = (CMP_MAX_ROWS + BLOCK_SIZE - 1) // BLOCK_SIZE
+IDX_MAX_BLOCKS = CMP_MAX_BLOCKS
 HCA_STATE_MAX_BLOCKS = 2048
 CSA_STATE_MAX_BLOCKS = 4096
 CSA_INNER_STATE_MAX_BLOCKS = 4096
@@ -467,14 +466,14 @@ def build_tensor_specs():
         ("csa_state_slot_mapping", [T], torch.int64),
         ("csa_inner_state_slot_mapping", [T], torch.int64),
     ):
-        specs.append(TensorSpec(name, shape, dtype, is_output=True))
+        specs.append(TensorSpec(name, shape, dtype))
     return specs
 
 
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -487,7 +486,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=decode_metadata,
         specs=build_tensor_specs(),
         golden_fn=golden_decode_metadata,

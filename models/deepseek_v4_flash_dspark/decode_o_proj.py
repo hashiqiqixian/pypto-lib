@@ -430,7 +430,7 @@ def build_o_group_a2a_specs(local_t=FIXTURE_LOCAL_T):
         TensorSpec("attention_grouped", attention_grouped_shape, torch.bfloat16, init_value=init_attention_grouped),
         TensorSpec(
             "attention_local_groups", attention_local_shape, torch.bfloat16,
-            init_value=FIXTURE_OUTPUT_SENTINEL, is_output=True,
+            init_value=FIXTURE_OUTPUT_SENTINEL, 
         ),
         ScalarSpec("local_t", torch.int32, local_t),
     ]
@@ -721,7 +721,7 @@ def golden_decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, tokens):
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -751,7 +751,7 @@ if __name__ == "__main__":
     if not 1 <= a2a_local_t <= LOCAL_T:
         parser.error(f"--local-t must be in [1, {LOCAL_T}], got {a2a_local_t}")
 
-    result = run_jit(
+    result = run(
         fn=l3_o_group_a2a,
         specs=build_o_group_a2a_specs(a2a_local_t),
         golden_fn=golden_o_group_a2a,

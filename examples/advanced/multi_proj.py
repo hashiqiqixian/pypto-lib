@@ -75,9 +75,9 @@ def build_tensor_specs():
         TensorSpec("wq",    [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_w),
         TensorSpec("wk",    [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_w),
         TensorSpec("wv",    [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_w),
-        TensorSpec("q_out", [BATCH, HIDDEN],  torch.float32,  is_output=True),
-        TensorSpec("k_out", [BATCH, HIDDEN],  torch.float32,  is_output=True),
-        TensorSpec("v_out", [BATCH, HIDDEN],  torch.float32,  is_output=True),
+        TensorSpec("q_out", [BATCH, HIDDEN],  torch.float32),
+        TensorSpec("k_out", [BATCH, HIDDEN],  torch.float32),
+        TensorSpec("v_out", [BATCH, HIDDEN],  torch.float32),
     ]
 
 
@@ -91,7 +91,7 @@ def golden_qkv_proj(tensors):
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -100,7 +100,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         fn=qkv_proj,
         specs=build_tensor_specs(),
         golden_fn=golden_qkv_proj,

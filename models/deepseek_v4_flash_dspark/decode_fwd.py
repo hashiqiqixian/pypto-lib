@@ -1429,11 +1429,10 @@ _HCA_SOURCES = {
     "hca_kv_seq_lens": "kv_seq_lens",
 }
 
-def _copy_spec(name, source, *, is_output=None):
+def _copy_spec(name, source):
     from golden import TensorSpec
 
-    output = source.is_output if is_output is None else is_output
-    copied = TensorSpec(name, list(source.shape), source.dtype, init_value=source.init_value, is_output=output)
+    copied = TensorSpec(name, list(source.shape), source.dtype, init_value=source.init_value)
     copied.resident = source.resident
     return copied
 
@@ -1486,7 +1485,7 @@ def _make_packed_pool_spec(name, source, layer_count, *, sentinel=False):
             packed[:, ordinal * extent : (ordinal + 1) * extent].fill_(ordinal + 1)
         return packed
 
-    spec = TensorSpec(name, shape, source.dtype, init_value=init_value, is_output=True)
+    spec = TensorSpec(name, shape, source.dtype, init_value=init_value)
     spec.resident = "stacked"
     return spec
 
@@ -1511,8 +1510,9 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
     }:
         raise ValueError(f"unknown decode forward runtime case: {runtime_case!r}")
 
-    if runtime_case == "long_context_tail" and start_pos is None:
-        start_pos = [0, 0, 0, 1048568]
+    use_default_long_context = runtime_case == "long_context_tail" and start_pos is None
+    if use_default_long_context:
+        start_pos = [0, 0, 0, config.FLASH.max_position_embeddings - config.DECODE_SEQ]
 
     if start_pos is None:
         active_batch = MOE_TOKENS // config.DECODE_SEQ
@@ -1524,9 +1524,13 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
         raise ValueError("start_pos must be None, an int, or a non-empty list/tuple")
     local_t = active_batch * config.DECODE_SEQ
 
+    attention_start_pos = start_pos
+    if use_default_long_context and TP_SIZE > 1:
+        attention_start_pos = list(start_pos) + [0] * ((TP_SIZE - 1) * active_batch)
+
     def attention_specs(module):
         specs = {}
-        for source in module.build_distributed_tensor_specs(local_t, start_pos=start_pos):
+        for source in module.build_distributed_tensor_specs(local_t, start_pos=attention_start_pos):
             if not isinstance(source, TensorSpec):
                 continue
 
@@ -1537,7 +1541,7 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
 
             spec = TensorSpec(
                 source.name, [N_RANKS, *source.shape[1:]], source.dtype,
-                init_value=init_value, is_output=source.is_output,
+                init_value=init_value, 
             )
             spec.resident = source.resident
             specs[spec.name] = spec
@@ -1603,33 +1607,33 @@ def build_tensor_specs(start_pos=None, *, weight_bank_size=RUNTIME_WEIGHT_BANK, 
             "logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32,
             init_value=lambda: build_active_logit_row_indices_host(local_t),
         ),
-        "hidden_workspace": TensorSpec("hidden_workspace", [N_RANKS, local_t, D], torch.bfloat16, is_output=True),
+        "hidden_workspace": TensorSpec("hidden_workspace", [N_RANKS, local_t, D], torch.bfloat16),
         "x_ping": TensorSpec(
             "x_ping", [N_RANKS, local_t, HC_MULT, D], torch.float32,
-            init_value=zero_active, is_output=True,
+            init_value=zero_active, 
         ),
         "x_pong": TensorSpec(
             "x_pong", [N_RANKS, local_t, HC_MULT, D], torch.float32,
-            init_value=zero_active, is_output=True,
+            init_value=zero_active, 
         ),
         "x_attn_active": TensorSpec(
             "x_attn_active", [N_RANKS, local_t, HC_MULT, D], torch.float32,
-            init_value=zero_active, is_output=True,
+            init_value=zero_active, 
         ),
         "x_moe_next": TensorSpec(
             "x_moe_next", [N_RANKS, MOE_TOKENS, HC_MULT, D], torch.float32,
-            init_value=lambda: torch.zeros(N_RANKS, MOE_TOKENS, HC_MULT, D, dtype=torch.float32), is_output=True,
+            init_value=lambda: torch.zeros(N_RANKS, MOE_TOKENS, HC_MULT, D, dtype=torch.float32), 
         ),
         "pre_hc_hidden_out": TensorSpec(
-            "pre_hc_hidden_out", [N_RANKS, local_t, HC_MULT, D], torch.float32, is_output=True,
+            "pre_hc_hidden_out", [N_RANKS, local_t, HC_MULT, D], torch.float32, 
         ),
         "dspark_target_hidden": TensorSpec(
-            "dspark_target_hidden", [N_RANKS, local_t, MAIN_HIDDEN_DIM], torch.bfloat16, is_output=True,
+            "dspark_target_hidden", [N_RANKS, local_t, MAIN_HIDDEN_DIM], torch.bfloat16,
         ),
-        "x_out": TensorSpec("x_out", [N_RANKS, local_t, D], torch.bfloat16, is_output=True),
-        "logits": TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True),
+        "x_out": TensorSpec("x_out", [N_RANKS, local_t, D], torch.bfloat16),
+        "logits": TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32),
         "sampled_ids": TensorSpec(
-            "sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32, is_output=True,
+            "sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32, 
         ),
     }
 
@@ -1743,9 +1747,28 @@ def dspark_target_hidden_compare(actual, _expected, **kwargs):
     return True, ""
 
 
-def compare_functions(specs):
+def compare_functions():
     """Validate every output for completion and the DSpark tap mathematically."""
-    compare = {spec.name: finite_tensor_compare for spec in specs if spec.is_output}
+    finite_names = {
+        "raw_kv_pool",
+        "csa_compress_state",
+        "csa_inner_compress_state",
+        "csa_cmp_kv",
+        "csa_idx_kv_cache",
+        "csa_idx_kv_scale",
+        "hca_compress_state",
+        "hca_cmp_kv",
+        "hidden_workspace",
+        "x_ping",
+        "x_pong",
+        "x_attn_active",
+        "x_moe_next",
+        "pre_hc_hidden_out",
+        "x_out",
+        "logits",
+        "sampled_ids",
+    }
+    compare = {name: finite_tensor_compare for name in finite_names}
     compare["dspark_target_hidden"] = dspark_target_hidden_compare
     return compare
 
@@ -1753,7 +1776,7 @@ def compare_functions(specs):
 def main():
     import argparse
 
-    from golden import run_jit
+    from golden import run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 D-Spark decode-forward integration")
@@ -1806,7 +1829,7 @@ def main():
 
     runtime_case = None if weight_bank_size == MAIN_LAYER_COUNT else args.runtime_case
     specs = build_tensor_specs(start_pos=start_pos, weight_bank_size=weight_bank_size, runtime_case=runtime_case)
-    result = run_jit(
+    result = run(
         fn=l3_decode_fwd,
         specs=specs,
         golden_fn=golden_decode_fwd,
@@ -1827,7 +1850,7 @@ def main():
         ),
         rtol=1e-2,
         atol=1e-2,
-        compare_fn=compare_functions(specs),
+        compare_fn=compare_functions(),
     )
     if not result.passed:
         if result.error:

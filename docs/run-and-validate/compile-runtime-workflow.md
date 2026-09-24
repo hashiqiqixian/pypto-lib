@@ -1,11 +1,11 @@
 # Compile and Runtime Workflow
 
 What usually happens when you run `python <kernel>.py -p <platform>`.
-Most examples and model harnesses use `golden.run` for `@pl.program` kernels
-or `golden.run_jit` for module-level `@pl.jit` kernels. A few specialized
-smoke, artifact-regeneration, and external-runtime drivers call PyPTO's
-compile/runtime APIs directly; their `__main__` blocks are the authority for
-what a command actually validates.
+Examples and model harnesses go through `golden.run`, which takes a kernel of
+either form — a module-level `@pl.jit` function or a `@pl.program` class — and
+picks its compile path from it. A few specialized smoke, artifact-regeneration, and
+external-runtime drivers call PyPTO's compile/runtime APIs directly; their
+`__main__` blocks are the authority for what a command actually validates.
 
 ## CLI shape
 
@@ -19,8 +19,8 @@ parser.add_argument("--enable-chip-swimlane", action="store_true")
 args = parser.parse_args()
 
 result = run(
-    program=build_qwen3_decode_program(...),  # @pl.program class
-    specs=build_tensor_specs(...),            # ordered TensorSpec / ScalarSpec list
+    fn=qwen3_decode,                          # module-level @pl.jit function
+    specs=build_tensor_specs(...),            # TensorSpec / ScalarSpec, in fn's param order
     golden_fn=golden_qwen3_decode,            # PyTorch reference
     compile_cfg=dict(dump_passes=True),
     runtime_cfg=dict(platform=args.platform, device_id=args.device,
@@ -29,11 +29,10 @@ result = run(
 )
 ```
 
-A kernel written as a module-level `@pl.jit` function calls **`run_jit`**
-instead, passing `fn=<jit_function>` in place of `program=`. Both entry points
-share tensor specs, golden computation, runtime dispatch, and validation, but
-their `compile_cfg` fields and defaults differ; see
-[Compile configuration](#compile-configuration).
+A kernel built as a `@pl.program` class passes that program as `fn=`
+instead. Both forms share tensor specs, golden computation, runtime dispatch,
+and validation; only the compile step and the accepted `compile_cfg` fields
+differ, see [Compile configuration](#compile-configuration).
 
 | Flag | Purpose |
 |------|---------|
@@ -83,10 +82,10 @@ each phase, so the console log is the authoritative trace of what ran:
 
 ### 1. Compile (pypto)
 
-Driven by the **pypto** repo. `run` calls
-`pypto.ir.compile(program, backend_type=..., **compile_cfg)` directly.
-`run_jit` builds a `pypto.runtime.RunConfig` from `compile_cfg` and calls
-`fn.compile(..., config=...)`, which specializes the JIT function before
+Driven by the **pypto** repo. For a `@pl.program` kernel, `run` calls
+`pypto.ir.compile(program, backend_type=..., **compile_cfg)` directly. For a
+`@pl.jit` kernel it builds a `pypto.runtime.RunConfig` from `compile_cfg` and
+calls `fn.compile(..., config=...)`, which specializes the JIT function before
 entering the same IR compiler. Both paths run a **pass pipeline** followed by
 a **codegen pipeline** and normally write
 `build_output/<ProgramName>_<timestamp>/`.
@@ -96,9 +95,9 @@ a **codegen pipeline** and normally write
 `PassManager.get_strategy(strategy).run_passes(program, ...)` runs an
 ordered sequence of passes that progressively rewrites the IR. The exact
 pass list changes often — consult the pypto repo for the current pipeline,
-and look at `passes_dump/` when `dump_passes` is enabled. Direct `run`
-compilation inherits `ir.compile`'s enabled default; `run_jit` inherits
-`RunConfig`'s disabled default.
+and look at `passes_dump/` when `dump_passes` is enabled. The direct
+`@pl.program` path inherits `ir.compile`'s enabled default; the `@pl.jit` path
+inherits `RunConfig`'s disabled default.
 
 The end state, regardless of which passes ran, is the same:
 
@@ -157,7 +156,8 @@ build_output/<ProgramName>_<ts>/
 
 #### Compile configuration
 
-For **`run`**, `compile_cfg` is forwarded to `ir.compile`. Common fields are:
+For a **`@pl.program`** kernel, `compile_cfg` is forwarded to `ir.compile`.
+Common fields are:
 
 | `compile_cfg` field | Purpose |
 |---|---|
@@ -173,8 +173,8 @@ The harness derives `backend_type` and `platform` from
 `runtime_cfg["platform"]` unless the direct compile configuration already
 supplies them.
 
-For **`run_jit`**, `compile_cfg` must instead contain fields accepted by
-`pypto.runtime.RunConfig`. The JIT layer maps its compile-side fields into
+For a **`@pl.jit`** kernel, `compile_cfg` must instead contain fields accepted
+by `pypto.runtime.RunConfig`. The JIT layer maps its compile-side fields into
 `ir.compile`:
 
 | `compile_cfg` field | Compiler mapping |
@@ -186,9 +186,10 @@ For **`run_jit`**, `compile_cfg` must instead contain fields accepted by
 | `distributed_config`, `analyze_auto_scopes_for_deps`, `memory_planner` | Forwarded when set. |
 
 `output_dir`, `profiling`, `skip_ptoas`, and `verification_level` are not
-`RunConfig` field names and therefore cannot be copied unchanged from a
-`run` call into `run_jit`. Unknown fields raise while constructing
-`RunConfig`; unknown direct-compiler fields raise in `ir.compile`.
+`RunConfig` field names, so a `compile_cfg` written for a `@pl.program` kernel
+cannot be copied unchanged onto a `@pl.jit` one. Unknown fields raise while
+constructing `RunConfig`; unknown direct-compiler fields raise in
+`ir.compile`.
 
 To stop after compile without touching the device, see `compile_only` under
 [Skipping phases](#skipping-phases).
@@ -198,7 +199,11 @@ To stop after compile without touching the device, see `compile_only` under
 Each entry of `specs` is a `TensorSpec` (named tensor, shape, dtype,
 direction) or a `ScalarSpec` (named scalar, dtype, value); see
 `golden/spec.py`. The list is ordered to match the parameter order of the
-top opaque function. For each entry, allocate a torch tensor:
+top opaque function — single-chip and distributed alike. The harness compares
+the spec names against the compiled artifact's parameters element by element
+and fails with `compiled parameter ABI mismatch (parameter order ...)` before
+allocating anything; it never rebinds a mis-ordered list by name. For each
+entry, allocate a torch tensor:
 
 - Pure inputs and inout initial values are filled via `spec.create_tensor()`
   (`init_value=None` creates zeros; random data requires an explicit factory
@@ -358,7 +363,7 @@ false; an uncaught compile/runtime exception is already a nonzero failure.
 
 ## Skipping phases
 
-`run` / `run_jit` knobs that short-circuit the pipeline:
+`run` knobs that short-circuit the pipeline:
 
 | Knob | Effect |
 |------|--------|

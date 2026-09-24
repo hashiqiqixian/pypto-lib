@@ -6,7 +6,7 @@ and compile time with `DEEPSEEK_V4_VARIANT=pro|flash` or `--variant pro|flash`.
 
 ## Deployment configuration
 
-The `PRO` and `FLASH` presets in [config.py](../../models/deepseek_v4_pro/config.py)
+The `PRO` and `FLASH` presets in [config.py](../../../models/deepseek_v4_pro/config.py)
 define the architecture-specific shapes and layer schedules. Pro remains the
 default so existing operator entry points and DailyCI keep their prior behavior.
 
@@ -32,8 +32,8 @@ constant if a case needs a longer context.
 
 Native MXFP8-MXFP4 is not implemented yet. The tracked kernels run an INT8
 stand-in with the same tensor split as
-[V4-Flash](deepseek_v4_flash_mtp.md#what-is-quantized): `gen_routed_weight` in
-[expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py) re-quantizes
+[V4-Flash](../deepseek_v4_flash_mtp/index.md#what-is-quantized): `gen_routed_weight` in
+[expert_routed.py](../../../models/deepseek_v4_pro/expert_routed.py) re-quantizes
 off the MXFP4 grid into INT8 rather than feeding the cube MXFP4 weights.
 
 ### Model shape and layer schedule
@@ -75,7 +75,7 @@ prefill_fwd    same schedule with prefill_attention_{hca,csa} → moe,
 ```
 
 Both forwards finish with the final norm and LM-head sampling. The standalone
-[lm_head.py](../../models/deepseek_v4_pro/lm_head.py) entry point validates that
+[lm_head.py](../../../models/deepseek_v4_pro/lm_head.py) entry point validates that
 distributed tail separately.
 
 ### One layer
@@ -124,7 +124,7 @@ prefill_mtp     mtp_projection → prefill_attention_swa → moe → hc_head →
 
 ## Real weights (Flash)
 
-`weights_flash.py` converts the released DeepSeek-V4-Flash checkpoint (hybrid
+`utils.py` converts the released DeepSeek-V4-Flash checkpoint (hybrid
 MXFP4 routed experts + block-FP8 attention/shared-expert linears) into the
 host-tensor ABI of the two forward drivers: FP4/FP8 tensors are dequantized
 and re-quantized to the kernels' INT8 + per-output-channel FP32-scale form,
@@ -132,7 +132,8 @@ per-layer tensors are stacked and EP/TP-sharded exactly like the fixture
 specs. Convert once offline, then point the drivers at the cache:
 
 ```bash
-python models/deepseek_v4_pro/utils/weights_flash.py --variant flash --ep 8 --tp 2 \
+PYTHONPATH=.:models/deepseek_v4_pro python -c 'import utils; utils.main()' \
+    --variant flash --ep 8 --tp 2 \
     --ckpt /path/to/DeepSeek-V4-Flash --out build_output/flash_weights_ep8_tp2
 python models/deepseek_v4_pro/prefill_fwd.py --variant flash --ep 8 --tp 2 \
     -p a5 -d 0,1,2,3,4,5,6,7 --weights build_output/flash_weights_ep8_tp2
@@ -173,7 +174,7 @@ follows the prompt length).
 
 ### End-to-end token generation
 
-[synthetic_token_loop.py](../../models/deepseek_v4_pro/synthetic_token_loop.py)
+[synthetic_token_loop.py](../../../models/deepseek_v4_pro/synthetic_token_loop.py)
 drives the full prompt-to-text path on real weights: the prompt is encoded
 with the checkpoint's `tokenizer.json` (BOS prepended unless `--no-bos`),
 the resident session runs one prefill plus `--decode-steps` greedy decode
@@ -195,7 +196,7 @@ python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash \
 
 The full prefill and decode programs carry runtime `num_tokens` and
 `moe_epoch_base` scalars in their compiled ABI. Their `ScalarSpec`s use
-`compile_runtime=True`, so `run_jit` passes `pl.RUNTIME` during
+`compile_runtime=True`, so `run` passes `pl.RUNTIME` during
 signature-driven compilation instead of folding the initial values into
 generated task arguments. `num_tokens` follows the real prompt/decode row
 count, while callers advance the epoch scalar by
@@ -225,7 +226,7 @@ The prefill and decode RoPE paths use fixed even/odd lane gather and scatter
 operations for adjacent-lane permutations instead of synthesizing tile-local
 index tensors.
 
-The [daily model workflow](../../.github/workflows/daily_ci.yml) runs this
+The [daily model workflow](../../../.github/workflows/daily_ci.yml) runs this
 EP8 loop nightly on the A5 runner (job `e2e-flash-a5`: real
 DeepSeek-V4-Flash weights, fixed 128-row prefill capacity with active rows set
 from the prompt, and 32 greedy decode steps from "The capital of France is") and
@@ -234,7 +235,7 @@ publishes the prompt and the generated text in the run summary under
 every day instead of a pass/fail tick. The runner finds the checkpoint
 through `PYPTO_DSV4_FLASH_CKPT_DIR` in its `.env` (falling back to the A5
 host's `/home/pyptouser/models/DeepSeek-V4-Flash-0731`). The
-`weights_flash.py` cache (ep8/tp2) is resolved in this order:
+`utils.py` cache (ep8/tp2) is resolved in this order:
 `PYPTO_DSV4_FLASH_WEIGHTS_DIR` from the runner's `.env` if set, else the
 shared cache next to the checkpoint (`pypto-weights-cache/flash_ep8_tp2`),
 else the runner's own `CI_CACHE_ROOT/dsv4-flash-weights/flash_ep8_tp2`,
@@ -254,19 +255,19 @@ as exactly what it was.
 
 | Group | Files |
 | --- | --- |
-| Full forward | [decode_fwd.py](../../models/deepseek_v4_pro/decode_fwd.py), [prefill_fwd.py](../../models/deepseek_v4_pro/prefill_fwd.py) |
-| Layer composition | [decode_layer.py](../../models/deepseek_v4_pro/decode_layer.py), [prefill_layer.py](../../models/deepseek_v4_pro/prefill_layer.py) |
-| MTP | [decode_mtp.py](../../models/deepseek_v4_pro/decode_mtp.py), [prefill_mtp.py](../../models/deepseek_v4_pro/prefill_mtp.py), [mtp_projection.py](../../models/deepseek_v4_pro/mtp_projection.py) |
-| Decode attention orchestration | [decode_attention_swa.py](../../models/deepseek_v4_pro/decode_attention_swa.py), [decode_attention_csa.py](../../models/deepseek_v4_pro/decode_attention_csa.py), [decode_attention_hca.py](../../models/deepseek_v4_pro/decode_attention_hca.py) |
-| Decode sparse attention (fused o-proj) | [decode_sparse_attn.py](../../models/deepseek_v4_pro/decode_sparse_attn.py), [decode_sparse_attn_swa.py](../../models/deepseek_v4_pro/decode_sparse_attn_swa.py), [decode_sparse_attn_hca.py](../../models/deepseek_v4_pro/decode_sparse_attn_hca.py) |
-| Decode compressors and indexer | [decode_compressor_ratio4.py](../../models/deepseek_v4_pro/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../models/deepseek_v4_pro/decode_compressor_ratio128.py), [decode_indexer.py](../../models/deepseek_v4_pro/decode_indexer.py), [decode_indexer_compressor.py](../../models/deepseek_v4_pro/decode_indexer_compressor.py) |
-| Prefill attention and cache | [prefill_attention_swa.py](../../models/deepseek_v4_pro/prefill_attention_swa.py), [prefill_attention_csa.py](../../models/deepseek_v4_pro/prefill_attention_csa.py), [prefill_attention_hca.py](../../models/deepseek_v4_pro/prefill_attention_hca.py), [prefill_sparse_attn.py](../../models/deepseek_v4_pro/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../models/deepseek_v4_pro/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../models/deepseek_v4_pro/prefill_compressor_ratio128.py), [prefill_indexer.py](../../models/deepseek_v4_pro/prefill_indexer.py), [prefill_indexer_compressor.py](../../models/deepseek_v4_pro/prefill_indexer_compressor.py) |
-| Shared transforms | [rmsnorm.py](../../models/deepseek_v4_pro/rmsnorm.py), [qkv_proj_rope.py](../../models/deepseek_v4_pro/qkv_proj_rope.py), [hc_pre.py](../../models/deepseek_v4_pro/hc_pre.py), [hc_post.py](../../models/deepseek_v4_pro/hc_post.py), [hc_head.py](../../models/deepseek_v4_pro/hc_head.py) |
-| MoE and output | [moe.py](../../models/deepseek_v4_pro/moe.py), [gate.py](../../models/deepseek_v4_pro/gate.py), [expert_shared.py](../../models/deepseek_v4_pro/expert_shared.py), [expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py), [lm_head.py](../../models/deepseek_v4_pro/lm_head.py) |
-| Metadata and host helpers | [config.py](../../models/deepseek_v4_pro/config.py), [decode_metadata.py](../../models/deepseek_v4_pro/decode_metadata.py), [rope_tables.py](../../models/deepseek_v4_pro/rope_tables.py) |
-| Real-weight loading | [weights_flash.py](../../models/deepseek_v4_pro/utils/weights_flash.py) |
-| Token loop | [synthetic_token_loop.py](../../models/deepseek_v4_pro/synthetic_token_loop.py) |
+| Full forward | [decode_fwd.py](../../../models/deepseek_v4_pro/decode_fwd.py), [prefill_fwd.py](../../../models/deepseek_v4_pro/prefill_fwd.py) |
+| Layer composition | [decode_layer.py](../../../models/deepseek_v4_pro/decode_layer.py), [prefill_layer.py](../../../models/deepseek_v4_pro/prefill_layer.py) |
+| MTP | [decode_mtp.py](../../../models/deepseek_v4_pro/decode_mtp.py), [prefill_mtp.py](../../../models/deepseek_v4_pro/prefill_mtp.py), [mtp_projection.py](../../../models/deepseek_v4_pro/mtp_projection.py) |
+| Decode attention orchestration | [decode_attention_swa.py](../../../models/deepseek_v4_pro/decode_attention_swa.py), [decode_attention_csa.py](../../../models/deepseek_v4_pro/decode_attention_csa.py), [decode_attention_hca.py](../../../models/deepseek_v4_pro/decode_attention_hca.py) |
+| Decode sparse attention (fused o-proj) | [decode_sparse_attn.py](../../../models/deepseek_v4_pro/decode_sparse_attn.py), [decode_sparse_attn_swa.py](../../../models/deepseek_v4_pro/decode_sparse_attn_swa.py), [decode_sparse_attn_hca.py](../../../models/deepseek_v4_pro/decode_sparse_attn_hca.py) |
+| Decode compressors and indexer | [decode_compressor_ratio4.py](../../../models/deepseek_v4_pro/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../../models/deepseek_v4_pro/decode_compressor_ratio128.py), [decode_indexer.py](../../../models/deepseek_v4_pro/decode_indexer.py), [decode_indexer_compressor.py](../../../models/deepseek_v4_pro/decode_indexer_compressor.py) |
+| Prefill attention and cache | [prefill_attention_swa.py](../../../models/deepseek_v4_pro/prefill_attention_swa.py), [prefill_attention_csa.py](../../../models/deepseek_v4_pro/prefill_attention_csa.py), [prefill_attention_hca.py](../../../models/deepseek_v4_pro/prefill_attention_hca.py), [prefill_sparse_attn.py](../../../models/deepseek_v4_pro/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../../models/deepseek_v4_pro/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../../models/deepseek_v4_pro/prefill_compressor_ratio128.py), [prefill_indexer.py](../../../models/deepseek_v4_pro/prefill_indexer.py), [prefill_indexer_compressor.py](../../../models/deepseek_v4_pro/prefill_indexer_compressor.py) |
+| Shared transforms | [rmsnorm.py](../../../models/deepseek_v4_pro/rmsnorm.py), [qkv_proj_rope.py](../../../models/deepseek_v4_pro/qkv_proj_rope.py), [hc_pre.py](../../../models/deepseek_v4_pro/hc_pre.py), [hc_post.py](../../../models/deepseek_v4_pro/hc_post.py), [hc_head.py](../../../models/deepseek_v4_pro/hc_head.py) |
+| MoE and output | [moe.py](../../../models/deepseek_v4_pro/moe.py), [gate.py](../../../models/deepseek_v4_pro/gate.py), [expert_shared.py](../../../models/deepseek_v4_pro/expert_shared.py), [expert_routed.py](../../../models/deepseek_v4_pro/expert_routed.py), [lm_head.py](../../../models/deepseek_v4_pro/lm_head.py) |
+| Metadata and host helpers | [config.py](../../../models/deepseek_v4_pro/config.py), [decode_metadata.py](../../../models/deepseek_v4_pro/decode_metadata.py), [rope_tables.py](../../../models/deepseek_v4_pro/rope_tables.py) |
+| Real-weight loading | [utils.py](../../../models/deepseek_v4_pro/utils.py) |
+| Token loop | [synthetic_token_loop.py](../../../models/deepseek_v4_pro/synthetic_token_loop.py) |
 
 `config.py`, `decode_metadata.py`, and `rope_tables.py` have no `__main__`
 block and are imported rather than run. Which entry points CI schedules is
-defined by the [daily model workflow](../../.github/workflows/daily_ci.yml).
+defined by the [daily model workflow](../../../.github/workflows/daily_ci.yml).
