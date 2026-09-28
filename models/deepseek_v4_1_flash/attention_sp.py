@@ -170,10 +170,11 @@ def prefill_sp_post(
             value = pl.full([1, 256], dtype=pl.FP32, value=0.0)
             if tp_rank * tokens + row < num_tokens:
                 hidden = pl.cast(sublayer[row:row + 1, col:col + 256], pl.FP32)
-                value = pl.mul(hidden, pl.read(post_mix, [row, out_h]))
+                update = pl.mul(hidden, pl.read(post_mix, [row, out_h]))
                 for in_h in pl.unroll(HC_MULT):
                     lane = residual_flat[row:row + 1, in_h * D + col:in_h * D + col + 256]
                     value = pl.add(value, pl.mul(lane, pl.read(mix_flat, [row, in_h * HC_MULT + out_h])))
+                value = pl.add(update, value)
             output_flat[row:row + 1, out_h * D + col:out_h * D + col + 256] = pl.cast(
                 pl.cast(value, pl.BF16, mode="rint"), pl.FP32,
             )

@@ -91,8 +91,8 @@ def mhc_pre(
             y2 = pl.row_expand_mul(x2, pre2)
             y3 = pl.row_expand_mul(x3, pre3)
             y01 = pl.add(y0, y1)
-            y23 = pl.add(y2, y3)
-            y_tile = pl.add(y01, y23)
+            y012 = pl.add(y01, y2)
+            y_tile = pl.add(y012, y3)
             y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
             pl.store(pl.set_validshape(y_bf16, valid_rows, 256), [t0, d0], output)
     return output
