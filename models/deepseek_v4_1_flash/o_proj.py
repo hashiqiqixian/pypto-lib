@@ -23,6 +23,8 @@ from models.deepseek_v4_1_flash.config import (
     T_DYN,
 )
 
+from models.deepseek_v4_1_flash.qkv_proj_rope import _make_prefill_group32_projection
+
 
 _PREFILL_WORKERS = 64
 
@@ -189,7 +191,8 @@ _prefill_rotate_output = make_rope(
 )
 
 o_proj = _make_o_proj(_rotate_output, grouped_output, _project_ob)
-prefill_o_proj = _make_o_proj(_prefill_rotate_output, prefill_grouped_output, _project_ob)
+_prefill_project_ob = _make_prefill_group32_projection(LOCAL_O_WIDTH, D, "prefill_attention_o_b", pl.FP32)
+prefill_o_proj = _make_o_proj(_prefill_rotate_output, prefill_grouped_output, _prefill_project_ob)
 
 
 __all__ = [
