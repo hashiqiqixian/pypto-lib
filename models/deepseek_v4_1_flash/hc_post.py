@@ -43,13 +43,15 @@ def mhc_post(
         out_h = block % HC_MULT
         for d0 in pl.pipeline(0, D, 256, stage=2):
             x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + 256], target_type=pl.FP32)
-            value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
+            update = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
+            value = pl.full([1, 256], dtype=pl.FP32, value=0.0)
             for in_h in pl.unroll(HC_MULT):
                 residual_tile = residual_flat[t : t + 1, in_h * D + d0 : in_h * D + d0 + 256]
                 value = pl.add(
                     value,
                     pl.mul(residual_tile, pl.read(residual_mix_flat, [t, in_h * HC_MULT + out_h])),
                 )
+            value = pl.add(update, value)
             output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + 256] = pl.cast(
                 pl.cast(value, target_type=pl.BF16, mode="rint"),
                 target_type=pl.FP32,
