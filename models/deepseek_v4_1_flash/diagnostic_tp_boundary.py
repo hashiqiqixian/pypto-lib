@@ -1,0 +1,114 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Replay captured FP32 partials through the unmodified TP output collective.
+
+This diagnostic checks a two-addend sum and one BF16 conversion, not model
+accuracy. It loads no model weights and does not change an acceptance budget.
+"""
+# ci: no-sim
+# ci: a5
+import argparse
+from pathlib import Path
+import sys
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import torch
+import pypto.language as pl
+import pypto.language.distributed as pld
+from pypto.ir import DistributedConfig
+from golden import TensorSpec, run
+from models.deepseek_v4_1_flash.config import D, TP_SIZE, PREFILL_MAX_TOKENS, T_DYN
+from models.deepseek_v4_1_flash.attention_sp import SP_T_DYN, prefill_sp_output_reduce_scatter
+
+
+def make_program(world, capacity):
+    @pl.jit
+    def replay_rank(
+        partial: pl.Tensor[[T_DYN, D], pl.FP32],
+        output: pl.Out[pl.Tensor[[SP_T_DYN, D], pl.BF16]],
+        window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+        arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+        rank: pl.Scalar[pl.INT32],
+    ):
+        partial.bind_dynamic(0, T_DYN)
+        output.bind_dynamic(0, SP_T_DYN)
+        tokens = pl.tensor.dim(partial, 0)
+        prefill_sp_output_reduce_scatter(
+            partial, window, arrived, output, rank // TP_SIZE * TP_SIZE,
+            rank % TP_SIZE, tokens, 1,
+        )
+        return output
+
+    @pl.jit.host
+    def replay_group(
+        partial: pl.Tensor[[world, T_DYN, D], pl.FP32],
+        output: pl.Out[pl.Tensor[[world, SP_T_DYN, D], pl.BF16]],
+    ):
+        partial.bind_dynamic(1, T_DYN)
+        output.bind_dynamic(1, SP_T_DYN)
+        data_buf = pld.alloc_window_buffer([capacity, D], dtype=pl.FP32)
+        signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+        for rank in pl.range(pld.world_size()):
+            data = pld.window(data_buf, [capacity, D], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            replay_rank(partial[rank], output[rank], data, signal, rank, device=rank)
+    return replay_group
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trace", required=True, help="Directory containing rankN-tp-boundaries.pt")
+    parser.add_argument("--devices", default="0,1,2,3")
+    parser.add_argument("--tp", type=int, default=2)
+    parser.add_argument("--ep", type=int, default=4)
+    parser.add_argument("--artifact", required=True)
+    parser.add_argument("--build-dir", required=True)
+    args = parser.parse_args()
+    devices = [int(d) for d in args.devices.split(",")]
+    if TP_SIZE != 2 or args.tp != 2 or len(devices) != 4 or args.ep != 4:
+        parser.error("this captured diagnostic requires TP2/DP2/EP4")
+    if len(set(devices)) != len(devices):
+        parser.error("devices must be distinct")
+    torch.set_num_threads(4)
+    values = [torch.load(Path(args.trace) / f"rank{rank}-tp-boundaries.pt", weights_only=True)
+              for rank in range(4)]
+    partial = torch.stack([v["published"] for v in values])
+    if partial.dtype != torch.float32 or partial.shape != (4, 32, D) or not torch.isfinite(partial).all():
+        raise ValueError("expected finite FP32 captured partials [4,32,D]")
+    def golden(tensors):
+        for base in (0, 2):
+            total = (tensors["partial"][base] + tensors["partial"][base + 1]).bfloat16()
+            tensors["output"][base:base + 2].copy_(total.reshape(2, 16, D))
+    def compare(actual, expected, **kwargs):
+        artifact = Path(args.artifact)
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        if artifact.exists():
+            raise FileExistsError("refusing to overwrite diagnostic result")
+        torch.save(dict(partial=partial, actual=actual, expected=expected), artifact)
+        coords = (actual != expected).nonzero()
+        for rank, row, col in coords[:20].tolist():
+            print("MISMATCH",rank,row,col,float(actual[rank,row,col]),float(expected[rank,row,col]),flush=True)
+        print("TP REPLAY mismatches",len(coords),flush=True)
+        return not len(coords), "exact two-addend sum followed by BF16 rounding"
+    result = run(fn=make_program(4, 32), specs=[
+        TensorSpec("partial", [4, 32, D], torch.float32, init_value=partial, resident="stacked"),
+        TensorSpec("output", [4, 16, D], torch.bfloat16, resident="stacked"),
+    ], golden_fn=golden, compare_fn={"output": compare}, config=dict(
+        platform="a5", distributed_config=DistributedConfig(device_ids=devices),
+        ring_heap=512 << 20, save_kernels=True, save_kernels_dir=args.build_dir,
+    ))
+    print("TP REPLAY",result.passed,result.work_dir,flush=True)
+    if not result.passed:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
