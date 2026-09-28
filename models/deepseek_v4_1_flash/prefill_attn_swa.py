@@ -269,6 +269,9 @@ def prefill_attn_swa_partial(
     selected = pl.create_tensor([QUERY_TILE, 128, HEAD_DIM], dtype=pl.BF16)
     attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.FP32)
+    pl.dump_tag(qr)
+    pl.dump_tag(q)
+    pl.dump_tag(attended)
 
     for start in pl.range(0, num_tokens, QUERY_TILE):
         active = pl.min(QUERY_TILE, num_tokens - start)

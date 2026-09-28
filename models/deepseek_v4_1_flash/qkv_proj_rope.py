@@ -118,6 +118,7 @@ def _make_q_proj_rope(project, rotate):
     ):
         tokens = pl.tensor.dim(query_latent, 0)
         expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        pl.dump_tag(expanded)
         project(query_latent, wq_b, wq_b_scale, expanded, num_tokens)
         rotate(expanded, rope_cos, rope_sin, query, num_tokens)
         return query
