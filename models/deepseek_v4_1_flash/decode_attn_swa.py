@@ -381,7 +381,7 @@ def official_rope(x, cos, sin, inverse=False):
     return value.to(torch.bfloat16)
 
 
-def official_reference(tensors):
+def official_reference(tensors, *, attention_dtype=torch.float32):
     """CPU transcription of group-32 FP8 GEMM and block-64 online attention.
 
     DeepSeek-V4.1-Flash inference/kernel.py and model.py, revision
@@ -413,12 +413,12 @@ def official_reference(tensors):
     idx = t["window_indices"].long()
     selected = values.reshape(-1, head_dim)[idx.clamp_min(0)].to(torch.bfloat16)
     selected = selected.masked_fill((idx < 0)[..., None], 0)
-    maximum = torch.full(q.shape[:2], -1e30)
+    maximum = torch.full(q.shape[:2], -1e30, dtype=attention_dtype)
     denominator = torch.zeros_like(maximum)
-    numerator = torch.zeros_like(q, dtype=torch.float32)
+    numerator = torch.zeros_like(q, dtype=attention_dtype)
     for start in range(0, idx.shape[-1], 64):
-        keys = selected[:, start:start + 64].float()
-        logits = torch.einsum("thd,tkd->thk", q.float(), keys) * head_dim ** -0.5
+        keys = selected[:, start:start + 64].to(attention_dtype)
+        logits = torch.einsum("thd,tkd->thk", q.to(attention_dtype), keys) * head_dim ** -0.5
         valid = idx[:, start:start + 64] >= 0
         logits = logits.masked_fill(~valid[:, None], -torch.inf)
         new_maximum = torch.maximum(maximum, logits.amax(-1))
@@ -426,7 +426,7 @@ def official_reference(tensors):
         probabilities = (logits - new_maximum[..., None]).exp()
         denominator = denominator * correction + probabilities.sum(-1)
         numerator = numerator * correction[..., None] + torch.einsum(
-            "thk,tkd->thd", probabilities.to(torch.bfloat16).float(), keys)
+            "thk,tkd->thd", probabilities.to(torch.bfloat16).to(attention_dtype), keys)
         maximum = new_maximum
     final_max = torch.maximum(maximum, t["attn_sink"][None])
     correction = (maximum - final_max).exp()
