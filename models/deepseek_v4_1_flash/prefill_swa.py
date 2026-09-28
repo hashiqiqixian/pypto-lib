@@ -114,6 +114,8 @@ def prefill_swa(
     )
     group_tokens = pl.tensor.dim(hidden, 0)
     partial = pl.create_tensor([group_tokens, D], dtype=pl.FP32)
+    pl.dump_tag(partial)
+    pl.dump_tag(attn_out)
     if num_tokens > 0:
         prefill_attn_swa_partial(
             hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,

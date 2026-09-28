@@ -287,6 +287,7 @@ def prefill_attn_swa_partial(
         prefill_gather_window(window_cache, window_cache_scale, chunk_indices, selected, active)
         prefill_attend_window(q, selected, chunk_indices, attn_sink, attended, active)
         prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
+        pl.dump_tag(chunk_partial)
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):
