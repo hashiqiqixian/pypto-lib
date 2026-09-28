@@ -24,13 +24,14 @@ _PREFILL_WORKERS = 64
 _PREFILL_PROJECTION_K_TILE = 32
 
 
-def _make_prefill_group32_projection(width, output_width, name_hint):
+def _make_prefill_group32_projection(width, output_width, name_hint, output_dtype=pl.BF16):
+    fp32_output = output_dtype == pl.FP32
     @pl.jit.inline
     def project(
         x: pl.Tensor[[T_DYN, width], pl.BF16],
         weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
         scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], pl.BF16],
+        output: pl.Tensor[[T_DYN, output_width], output_dtype],
         num_tokens: pl.Scalar[pl.INT32],
     ):
         """Apply group-32 scaling before sequential FP32 accumulation."""
@@ -81,7 +82,10 @@ def _make_prefill_group32_projection(width, output_width, name_hint):
                         )
                         part = pl.col_expand_mul(pl.row_expand_mul(pl.matmul(a, b), sa), sb)
                         acc = pl.add(acc, part)
-                result = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, N_TILE)
+                if fp32_output:
+                    result = pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE)
+                else:
+                    result = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, N_TILE)
                 output = pl.store(result, [t0, n0], output)
         return output
 

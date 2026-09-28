@@ -181,6 +181,9 @@ def make_o_proj_with_deps(rotate, grouped, project):
     return o_proj_with_deps
 
 
+from models.deepseek_v4_1_flash.qkv_proj_rope import _make_prefill_group32_projection
+
+_prefill_project_ob = _make_prefill_group32_projection(LOCAL_O_WIDTH, D, "prefill_attention_o_b", pl.FP32)
 _project_ob = make_mx_projection(LOCAL_O_WIDTH, D, pl.FP32, name_hint="attention_o_b")
 _rotate_output = make_rope(LOCAL_H, inverse=True, name_hint="attention_o_rope")
 _prefill_rotate_output = make_rope(
@@ -191,7 +194,7 @@ _prefill_rotate_output = make_rope(
 )
 
 o_proj = _make_o_proj(_rotate_output, grouped_output, _project_ob)
-prefill_o_proj = _make_o_proj(_prefill_rotate_output, prefill_grouped_output, _project_ob)
+prefill_o_proj = _make_o_proj(_prefill_rotate_output, prefill_grouped_output, _prefill_project_ob)
 
 
 __all__ = [
