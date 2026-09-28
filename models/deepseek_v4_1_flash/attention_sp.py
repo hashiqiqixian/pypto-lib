@@ -111,7 +111,7 @@ def prefill_sp_output_reduce_scatter(
             pld.tensor.put(
                 dst=output_window, peer=group_base + tp_rank, src=partial,
                 dst_offsets=[0, 0], src_offsets=[0, 0], shape=[num_tokens, D],
-                chunk_rows=1, chunk_cols=D_TILE, pipeline=True,
+                chunk_rows=1, chunk_cols=D_TILE, pipeline=False,
             )
         for peer in pl.range(TP_SIZE):
             pld.system.notify(output_arrived, peer=group_base + peer, offsets=[tp_rank, 0],
