@@ -97,6 +97,7 @@ def _make_q_proj_qr(project, normalize):
     ):
         tokens = pl.tensor.dim(x, 0)
         projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+        pl.dump_tag(projected)
         project(x, wq_a, wq_a_scale, projected, num_tokens)
         normalize(projected, q_norm_weight, query_latent, num_tokens)
         return query_latent
