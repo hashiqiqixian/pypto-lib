@@ -97,6 +97,11 @@ def prefill_sp_output_reduce_scatter(
 ):
     """Sum FP32 head-TP contributions for this rank's token rows, then cast once."""
     local_tokens = pl.tensor.dim(output, 0)
+    debug_rows = local_tokens * TP_SIZE
+    debug_reads = pl.create_tensor([debug_rows, D], dtype=pl.FP32)
+    debug_sum = pl.create_tensor([local_tokens, D], dtype=pl.FP32)
+    pl.dump_tag(debug_reads)
+    pl.dump_tag(debug_sum)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_reuse", allow_early_resolve=False) as reuse_tid:
         for peer in pl.range(TP_SIZE):
             pld.system.wait(output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
@@ -127,7 +132,9 @@ def prefill_sp_output_reduce_scatter(
                 for peer in pl.range(TP_SIZE):
                     value = pld.tile.remote_load(output_window, peer=group_base + peer,
                                                  offsets=[row, col], shape=[1, D_TILE])
+                    debug_reads = pl.store(value, [peer * local_tokens + local_row, col], debug_reads)
                     acc = pl.add(acc, value)
+            debug_sum = pl.store(acc, [local_row, col], debug_sum)
             result = pl.cast(acc, pl.BF16, mode="rint")
             output = pl.store(result, [local_row, col], output)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_release", deps=[reduce_tid]) as release_tid:
