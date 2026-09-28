@@ -104,6 +104,7 @@ def _make_q_proj_qr(project, normalize):
     ):
         tokens = pl.tensor.dim(x, 0)
         projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+        pl.dump_tag(projected)
         project(x, wq_a, wq_a_scale, projected, num_tokens)
         normalize(projected, q_norm_weight, query_latent, num_tokens)
         return query_latent
@@ -124,6 +125,7 @@ def _make_q_proj_rope(project, rotate):
     ):
         tokens = pl.tensor.dim(query_latent, 0)
         expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        pl.dump_tag(expanded)
         project(query_latent, wq_b, wq_b_scale, expanded, num_tokens)
         rotate(expanded, rope_cos, rope_sin, query, num_tokens)
         return query
@@ -170,6 +172,7 @@ def prefill_kv_proj_rope(
     tokens = pl.tensor.dim(x, 0)
     _project_kv(x, wkv, wkv_scale, projected, num_tokens)
     normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    pl.dump_tag(normalized)
     _prefill_normalize_kv(projected, kv_norm_weight, normalized, num_tokens)
     _prefill_rotate_kv(normalized, rope_cos, rope_sin, window_kv, num_tokens)
     return window_kv

@@ -265,6 +265,9 @@ def decode_swa_partial(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    pl.dump_tag(qr)
+    pl.dump_tag(q)
+    pl.dump_tag(kv)
     qkv_proj_rope(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, rope_cos, rope_sin, qr, q, kv, num_tokens,
@@ -273,6 +276,8 @@ def decode_swa_partial(
     selected = pl.create_tensor([tokens, 128, HEAD_DIM], dtype=pl.BF16)
     cache_consumed = gather_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    pl.dump_tag(attended)
+    pl.dump_tag(output)
     attend_window(q, selected, window_indices, attn_sink, attended, num_tokens)
     o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
     return cache_consumed

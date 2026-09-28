@@ -255,6 +255,8 @@ def prefill_attn_swa_partial(
         for row in pl.range(worker, num_tokens, WORKER_TILE):
             kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    pl.dump_tag(kv_projection)
+    pl.dump_tag(kv)
     prefill_kv_proj_rope(
         x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens
     )
@@ -269,6 +271,10 @@ def prefill_attn_swa_partial(
     selected = pl.create_tensor([QUERY_TILE, 128, HEAD_DIM], dtype=pl.BF16)
     attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.FP32)
+    pl.dump_tag(qr)
+    pl.dump_tag(q)
+    pl.dump_tag(attended)
+    pl.dump_tag(chunk_partial)
 
     for start in pl.range(0, num_tokens, QUERY_TILE):
         active = pl.min(QUERY_TILE, num_tokens - start)
