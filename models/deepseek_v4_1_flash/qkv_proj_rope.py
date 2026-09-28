@@ -83,10 +83,11 @@ def _make_prefill_group32_projection(width, output_width, name_hint, output_dtyp
                         part = pl.col_expand_mul(pl.row_expand_mul(pl.matmul(a, b), sa), sb)
                         acc = pl.add(acc, part)
                 if fp32_output:
-                    result = pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE)
+                    wide_result = pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE)
+                    output = pl.store(wide_result, [t0, n0], output)
                 else:
-                    result = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, N_TILE)
-                output = pl.store(result, [t0, n0], output)
+                    narrow_result = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, N_TILE)
+                    output = pl.store(narrow_result, [t0, n0], output)
         return output
 
     return project
