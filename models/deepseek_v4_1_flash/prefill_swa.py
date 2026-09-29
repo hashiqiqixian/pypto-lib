@@ -108,6 +108,8 @@ def prefill_swa(
         x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
         collapsed, local_hidden, next_pre_mix, tokens,
     )
+    pl.dump_tag(post_mix)
+    pl.dump_tag(residual_mix)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, hidden,
         group_base, tp_rank, num_tokens, attention_epoch,
