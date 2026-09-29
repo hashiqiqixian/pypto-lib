@@ -24,7 +24,7 @@ _PREFILL_WORKERS = 64
 _PREFILL_PROJECTION_K_TILE = 32
 
 
-def _make_prefill_group32_projection(width, output_width, name_hint):
+def _make_prefill_group32_projection(width, output_width, name_hint, compensated=False):
     @pl.jit.inline
     def project(
         x: pl.Tensor[[T_DYN, width], pl.BF16],
@@ -41,6 +41,7 @@ def _make_prefill_group32_projection(width, output_width, name_hint):
                 n0 = block * N_TILE
                 rows = pl.min(MX_M_TILE, num_tokens - t0)
                 acc = pl.tile.full([MX_M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+                correction = pl.tile.full([MX_M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
                 for kb in pl.range(width // (2 * _PREFILL_PROJECTION_K_TILE)):
                     raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
                     raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
@@ -80,7 +81,13 @@ def _make_prefill_group32_projection(width, output_width, name_hint):
                             pl.load(weight, [k0, n0], [_PREFILL_PROJECTION_K_TILE, N_TILE]), pl.BF16
                         )
                         part = pl.col_expand_mul(pl.row_expand_mul(pl.matmul(a, b), sa), sb)
-                        acc = pl.add(acc, part)
+                        if compensated:
+                            adjusted = pl.sub(part, correction)
+                            total = pl.add(acc, adjusted)
+                            correction = pl.sub(pl.sub(total, acc), adjusted)
+                            acc = total
+                        else:
+                            acc = pl.add(acc, part)
                 result = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, N_TILE)
                 output = pl.store(result, [t0, n0], output)
         return output
@@ -88,7 +95,7 @@ def _make_prefill_group32_projection(width, output_width, name_hint):
     return project
 
 
-_prefill_project_qa = _make_prefill_group32_projection(D, Q_LORA, "prefill_attention_q_a")
+_prefill_project_qa = _make_prefill_group32_projection(D, Q_LORA, "prefill_attention_q_a", compensated=True)
 _prefill_project_qb = _make_prefill_group32_projection(Q_LORA, LOCAL_H * HEAD_DIM, "prefill_attention_q_b")
 
 
