@@ -180,6 +180,7 @@ def make_prefill_attn_c1a_reuse(reducer=prefill_tp_output_all_reduce, output_tok
         """Read published ratio-1 Top-K rows and compute packed-prefill C1A."""
         tokens = pl.tensor.dim(x, 0)
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        pl.dump_tag(partial)
         if num_tokens > 0:
             query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
             prefill_q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)

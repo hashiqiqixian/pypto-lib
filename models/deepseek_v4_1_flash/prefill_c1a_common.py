@@ -467,6 +467,8 @@ def prefill_c1a_partial(
     """Compute one TP rank's ratio-1 compressed-attention output."""
     tokens = pl.tensor.dim(x, 0)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    pl.dump_tag(query_latent)
+    pl.dump_tag(query)
     q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens)
@@ -481,6 +483,7 @@ def prefill_c1a_partial(
     )
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    pl.dump_tag(attended)
     attend_sparse_cache(
         query,
         window_indices,
