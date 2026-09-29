@@ -36,7 +36,7 @@ from models.deepseek_v4_1_flash.prefill_c1a_common import (
     publish_index_cache,
 )
 from models.deepseek_v4_1_flash.attention_ops import make_bf16_projection_staged, make_norm, make_rope
-from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr
+from models.deepseek_v4_1_flash.qkv_proj_rope import prefill_q_proj_qr
 from models.deepseek_v4_1_flash.prefill_c1a_indexer import make_paged_indexer
 from models.deepseek_v4_1_flash.attention_common import (
     AttentionGoldenResult,
@@ -296,7 +296,7 @@ def make_prefill_attn_c1a_full(indexer, reducer=prefill_tp_output_all_reduce, ou
             )
 
             query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-            q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
+            prefill_q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
             indexer_completion = indexer(
                 x,
                 query_latent,

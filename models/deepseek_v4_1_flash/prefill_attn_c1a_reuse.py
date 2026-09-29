@@ -31,7 +31,7 @@ import torch
 
 from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.prefill_c1a_common import prefill_c1a_partial
-from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr
+from models.deepseek_v4_1_flash.qkv_proj_rope import prefill_q_proj_qr
 from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
     CASE_DEFAULT,
     CASE_MAX_TOKENS,
@@ -182,7 +182,7 @@ def make_prefill_attn_c1a_reuse(reducer=prefill_tp_output_all_reduce, output_tok
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
         if num_tokens > 0:
             query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-            q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
+            prefill_q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
             prefill_c1a_partial(
                 x,
                 query_latent,

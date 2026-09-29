@@ -31,7 +31,7 @@ import torch
 
 from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash.prefill_c1a_common import prefill_c1a_partial
-from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr
+from models.deepseek_v4_1_flash.qkv_proj_rope import prefill_q_proj_qr
 from models.deepseek_v4_1_flash.prefill_c1a_indexer import make_paged_indexer
 from models.deepseek_v4_1_flash.prefill_c1a_test_utils import (
     CASE_DEFAULT,
@@ -219,7 +219,7 @@ def make_prefill_attn_c1a_reindex(indexer, reducer=prefill_tp_output_all_reduce,
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
         if num_tokens > 0:
             query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-            q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
+            prefill_q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
             cache_ready = pl.system.task_dummy(deps=[])
             indexer_completion = indexer(
                 x,
