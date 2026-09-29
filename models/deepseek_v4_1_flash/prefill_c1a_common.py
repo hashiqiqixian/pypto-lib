@@ -320,7 +320,7 @@ def attend_sparse_cache(
             probability_lo = pl.cast(
                 pl.sub(probability, pl.cast(probability_hi, pl.FP32)), pl.BF16, mode="rint"
             )
-            weighted = pl.matmul(probability_hi, kv)
+            weighted = pl.matmul(probability_hi, kv, out_dtype=pl.FP32)
             weighted = pl.matmul_acc(weighted, probability_lo, kv)
             # Recompute the first A5 PV output vector on Vec before overwriting it below.
             patch_products = pl.row_expand_mul(
@@ -409,7 +409,7 @@ def attend_sparse_cache(
             probability_lo = pl.cast(
                 pl.sub(probability, pl.cast(probability_hi, pl.FP32)), pl.BF16, mode="rint"
             )
-            weighted = pl.matmul(probability_hi, kv)
+            weighted = pl.matmul(probability_hi, kv, out_dtype=pl.FP32)
             weighted = pl.matmul_acc(weighted, probability_lo, kv)
             # Recompute the first A5 PV output vector on Vec before overwriting it below.
             patch_products = pl.row_expand_mul(
