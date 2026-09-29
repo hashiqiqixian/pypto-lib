@@ -31,7 +31,7 @@ from models.deepseek_v4_1_flash.attention_sp import (
 )
 
 
-def make_program(world, capacity, with_gather=False):
+def make_program(world, capacity, with_gather=False, signal_bytes=8):
     @pl.jit
     def replay_rank(
         partial: pl.Tensor[[T_DYN, D], pl.FP32],
@@ -66,9 +66,9 @@ def make_program(world, capacity, with_gather=False):
         partial.bind_dynamic(1, T_DYN)
         output.bind_dynamic(1, SP_T_DYN)
         input_buf = pld.alloc_window_buffer([capacity, D], dtype=pl.BF16)
-        input_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+        input_signal_buf = pld.alloc_window_buffer(signal_bytes)
         data_buf = pld.alloc_window_buffer([capacity, D], dtype=pl.FP32)
-        signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+        signal_buf = pld.alloc_window_buffer(signal_bytes)
         for rank in pl.range(pld.world_size()):
             input_data = pld.window(input_buf, [capacity, D], dtype=pl.BF16)
             input_signal = pld.window(input_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
@@ -88,12 +88,16 @@ def main():
     parser.add_argument("--artifact", required=True)
     parser.add_argument("--build-dir", required=True)
     parser.add_argument("--with-gather", action="store_true", help="Precede reduction with the SWA input collective")
+    parser.add_argument("--signal-bytes", type=int, default=8,
+                        help="Reserved bytes per signal buffer; varies placement, not the signal view")
     args = parser.parse_args()
     devices = [int(d) for d in args.devices.split(",")]
     if TP_SIZE != 2 or args.tp != 2 or len(devices) != 4 or args.ep != 4:
         parser.error("this captured diagnostic requires TP2/DP2/EP4")
     if len(set(devices)) != len(devices):
         parser.error("devices must be distinct")
+    if args.signal_bytes < 8 or args.signal_bytes % 4:
+        parser.error("signal-bytes must be a multiple of four and at least eight")
     torch.set_num_threads(4)
     values = [torch.load(Path(args.trace) / f"rank{rank}-tp-boundaries.pt", weights_only=True)
               for rank in range(4)]
@@ -119,7 +123,7 @@ def main():
         print("TP REPLAY mismatches",len(coords),flush=True)
         return not len(coords), "exact two-addend sum followed by BF16 rounding"
     torch.manual_seed(20260929)
-    result = run(fn=make_program(4, 32, args.with_gather), specs=[
+    result = run(fn=make_program(4, 32, args.with_gather, args.signal_bytes), specs=[
         TensorSpec("partial", [4, 32, D], torch.float32, init_value=partial, resident="stacked"),
         TensorSpec("local_input", [4, 16, D], torch.bfloat16,
                    init_value=torch.randn(4, 16, D).bfloat16(), resident="stacked"),
