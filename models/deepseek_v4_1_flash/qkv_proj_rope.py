@@ -32,7 +32,7 @@ def _prefill_project_qa(
     output: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Preserve the scale-corrected group-32 Prefill SWA Q projection."""
+    """Preserve group-32 scales with compensated FP32 Q-A accumulation."""
     scale_storage = pl.tensor.view(scale, [Q_LORA // 16, D // 2], layout=pl.ND)
     for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
         t0 = mt * MX_M_TILE
@@ -40,6 +40,7 @@ def _prefill_project_qa(
             n0 = block * N_TILE
             rows = pl.min(MX_M_TILE, num_tokens - t0)
             acc = pl.tile.full([MX_M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+            correction = pl.tile.full([MX_M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
             for kb in pl.range(D // (2 * _PREFILL_PROJECTION_K_TILE)):
                 raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
                 raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
@@ -79,7 +80,10 @@ def _prefill_project_qa(
                         pl.load(weight, [k0, n0], [_PREFILL_PROJECTION_K_TILE, N_TILE]), pl.BF16
                     )
                     part = pl.col_expand_mul(pl.row_expand_mul(pl.matmul(a, b), sa), sb)
-                    acc = pl.add(acc, part)
+                    adjusted = pl.sub(part, correction)
+                    total = pl.add(acc, adjusted)
+                    correction = pl.sub(pl.sub(total, acc), adjusted)
+                    acc = total
             result = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, N_TILE)
             output = pl.store(result, [t0, n0], output)
     return output
