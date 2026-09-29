@@ -123,7 +123,7 @@ def mhc_mixes(
             pl.mul(pl.row_expand_mul(mixes_raw[t0 : t0 + T_TILE, 0:HC_PAD], inv), scale0),
             pl.col_expand(mixes_raw[t0 : t0 + T_TILE, 0:HC_PAD], pre_base),
         )
-        pre_value = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
+        pre_value = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0), high_precision=True), HC_EPS)
         post_base = pl.reshape(base[HC_MULT : HC_MULT + HC_PAD], [1, HC_PAD])
         post_logits = pl.add(
             pl.mul(
@@ -132,7 +132,7 @@ def mhc_mixes(
             ),
             pl.col_expand(mixes_raw[t0 : t0 + T_TILE, HC_MULT : HC_MULT + HC_PAD], post_base),
         )
-        post_value = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
+        post_value = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0), high_precision=True), 2.0)
         pre_tile = pl.slice(pre_value, [T_TILE, HC_PAD], [0, 0], valid_shape=[valid_rows, HC_MULT])
         post_tile = pl.slice(post_value, [T_TILE, HC_PAD], [0, 0], valid_shape=[valid_rows, HC_MULT])
         pre_mix[t0 : t0 + T_TILE, 0:HC_MULT] = pre_tile
@@ -241,10 +241,10 @@ def mhc_mixes(
         row3 = pl.fillpad(pl.set_validshape(row3, valid_rows, HC_MULT), pad_value=pl.PadValue.zero)
         col_sum = pl.add(pl.add(row0, row1), pl.add(row2, row3))
         col_sum = pl.add(col_sum, HC_EPS)
-        row0 = pl.div(row0, col_sum)
-        row1 = pl.div(row1, col_sum)
-        row2 = pl.div(row2, col_sum)
-        row3 = pl.div(row3, col_sum)
+        row0 = pl.div(row0, col_sum, high_precision=True)
+        row1 = pl.div(row1, col_sum, high_precision=True)
+        row2 = pl.div(row2, col_sum, high_precision=True)
+        row3 = pl.div(row3, col_sum, high_precision=True)
         sinkhorn_sum_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
         for _ in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
             row0 = pl.row_expand_div(row0, pl.add(pl.row_sum(row0, sinkhorn_sum_tmp), HC_EPS))
@@ -253,10 +253,10 @@ def mhc_mixes(
             row3 = pl.row_expand_div(row3, pl.add(pl.row_sum(row3, sinkhorn_sum_tmp), HC_EPS))
             col_sum = pl.add(pl.add(row0, row1), pl.add(row2, row3))
             col_sum = pl.add(col_sum, HC_EPS)
-            row0 = pl.div(row0, col_sum)
-            row1 = pl.div(row1, col_sum)
-            row2 = pl.div(row2, col_sum)
-            row3 = pl.div(row3, col_sum)
+            row0 = pl.div(row0, col_sum, high_precision=True)
+            row1 = pl.div(row1, col_sum, high_precision=True)
+            row2 = pl.div(row2, col_sum, high_precision=True)
+            row3 = pl.div(row3, col_sum, high_precision=True)
         pl.store(pl.set_validshape(row0, valid_rows, HC_MULT), [t0, 0 * HC_MULT], residual_mix_flat)
         pl.store(pl.set_validshape(row1, valid_rows, HC_MULT), [t0, 1 * HC_MULT], residual_mix_flat)
         pl.store(pl.set_validshape(row2, valid_rows, HC_MULT), [t0, 2 * HC_MULT], residual_mix_flat)
