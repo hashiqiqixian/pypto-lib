@@ -249,6 +249,8 @@ def make_prefill_attn_c1a_full(indexer, reducer=prefill_tp_output_all_reduce, ou
         """Publish ratio-1 caches, select sparse rows, and compute packed C1A."""
         tokens = pl.tensor.dim(x, 0)
         partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        pl.dump_tag(partial)
+        pl.dump_tag(topk_indices)
         if num_tokens > 0:
             compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
             project_compressed(x, compressor_wkv, compressed_projection, num_tokens)

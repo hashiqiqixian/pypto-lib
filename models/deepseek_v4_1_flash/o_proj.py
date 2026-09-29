@@ -144,8 +144,10 @@ def _make_o_proj(rotate, grouped, project):
     ):
         tokens = pl.tensor.dim(attended, 0)
         unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        pl.dump_tag(unrotated)
         rotate(attended, rope_cos, rope_sin, unrotated, num_tokens)
         latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
+        pl.dump_tag(latent)
         grouped(unrotated, wo_a, latent, num_tokens)
         project(latent, wo_b, wo_b_scale, output, num_tokens)
         return output
