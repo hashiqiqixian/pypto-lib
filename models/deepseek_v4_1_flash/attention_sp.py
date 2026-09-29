@@ -169,6 +169,7 @@ def prefill_sp_post(
     tokens = pl.tensor.dim(residual, 0)
     residual_flat = pl.reshape(residual, [tokens, HC_MULT * D])
     mix_flat = pl.reshape(residual_mix, [tokens, HC_MULT * HC_MULT])
+    pl.dump_tag(mix_flat)
     output_flat = pl.reshape(output, [tokens, HC_MULT * D])
     for block in pl.spmd(tokens * HC_MULT, name_hint="sp_mhc_post"):
         row = block // HC_MULT
