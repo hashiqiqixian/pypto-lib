@@ -315,7 +315,13 @@ def attend_sparse_cache(
                 pl.mul(denominator, correction),
                 pl.reshape(pl.row_sum(probability), [1, M_TILE]),
             )
-            weighted = pl.matmul(pl.cast(probability, pl.BF16, mode="rint"), kv)
+            # Retain the probability's rounding residual before the FP8 output projection.
+            probability_hi = pl.cast(probability, pl.BF16, mode="rint")
+            probability_lo = pl.cast(
+                pl.sub(probability, pl.cast(probability_hi, pl.FP32)), pl.BF16, mode="rint"
+            )
+            weighted = pl.matmul(probability_hi, kv)
+            weighted = pl.matmul_acc(weighted, probability_lo, kv)
             # Recompute the first A5 PV output vector on Vec before overwriting it below.
             patch_products = pl.row_expand_mul(
                 pl.cast(kv[:, :16], pl.FP32),
@@ -398,7 +404,13 @@ def attend_sparse_cache(
                 pl.mul(denominator, correction),
                 pl.reshape(pl.row_sum(probability), [1, M_TILE]),
             )
-            weighted = pl.matmul(pl.cast(probability, pl.BF16, mode="rint"), kv)
+            # Use the same compensated PV accumulation for compressed and window rows.
+            probability_hi = pl.cast(probability, pl.BF16, mode="rint")
+            probability_lo = pl.cast(
+                pl.sub(probability, pl.cast(probability_hi, pl.FP32)), pl.BF16, mode="rint"
+            )
+            weighted = pl.matmul(probability_hi, kv)
+            weighted = pl.matmul_acc(weighted, probability_lo, kv)
             # Recompute the first A5 PV output vector on Vec before overwriting it below.
             patch_products = pl.row_expand_mul(
                 pl.cast(kv[:, :16], pl.FP32),
