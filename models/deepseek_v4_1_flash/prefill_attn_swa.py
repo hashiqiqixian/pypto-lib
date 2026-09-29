@@ -172,7 +172,12 @@ def prefill_attend_window(
                 probability_sum = pl.reshape(pl.row_sum(probabilities), [1, M_TILE])
                 denominator = pl.add(corrected_denominator, probability_sum)
                 weights = pl.cast(probabilities, pl.BF16, mode="rint")
+                # Preserve softmax rounding residuals through the quantized output projection.
+                weights_lo = pl.cast(
+                    pl.sub(probabilities, pl.cast(weights, pl.FP32)), pl.BF16, mode="rint"
+                )
                 weighted = pl.matmul(weights, kv)
+                weighted = pl.matmul_acc(weighted, weights_lo, kv)
                 numerator = pl.add(pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])), weighted)
                 maximum = next_max
             sinks = pl.reshape(sink[h:h + M_TILE], [1, M_TILE])
