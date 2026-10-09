@@ -38,6 +38,7 @@ def make_final_output_program(tp_size: int, dp_size: int):
     vocab_per_tp = lm.VOCAB_PER_TP
     sampled_pad = lm.SAMPLED_IDS_PAD
     group_logit_rows = lm.GROUP_LOGIT_ROWS
+    head_entry = lm.lm_head_with_sampling_test
 
     @pl.jit
     def final_norm_rank(
@@ -73,7 +74,7 @@ def make_final_output_program(tp_size: int, dp_size: int):
             hidden_done = pld.window(hidden_done_buf, [tp_size, 1], dtype=pl.INT32)
             logits_window = pld.window(logits_window_buf, [rows, vocab], dtype=pl.FP32)
             logits_done = pld.window(logits_done_buf, [tp_size, 1], dtype=pl.INT32)
-            lm.lm_head_with_sampling_test(
+            head_entry(
                 normed[rank], head_weight[rank], logit_row_indices[rank], logits[rank], sampled_ids[rank],
                 hidden_window, hidden_done, logits_window, logits_done,
                 rank // tp_size * tp_size, rank % tp_size, done_epoch, device=rank,
