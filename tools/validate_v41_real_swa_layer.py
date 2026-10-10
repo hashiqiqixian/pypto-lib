@@ -2,6 +2,7 @@
 
 import argparse
 from dataclasses import replace
+from pathlib import Path
 
 import torch
 
@@ -10,16 +11,23 @@ from models.deepseek_v4_1_flash import config as C
 from models.deepseek_v4_1_flash import decode_attn_swa, decode_common, decode_layer
 
 
-def real_weight_specs(checkpoint, layer_id, seed):
+def real_weight_specs(checkpoint, layer_id, seed, *, prepared=None, save_prepared=None):
     from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology
     from pypto_serving.model.deepseek_v41.swa_weights import load_swa_layer_weights
 
-    attention, moe = load_swa_layer_weights(
-        checkpoint, layer_id, SegmentTopology(tp=C.TP_SIZE, dp=C.EP_SIZE // C.TP_SIZE)
-    )
-    weights = dict(attention)
-    weights.update({"ffn_norm_weight" if key == "norm_weight" else key: value
-                    for key, value in moe.items()})
+    checkpoint = str(Path(checkpoint).resolve())
+    if prepared is None:
+        attention, moe = load_swa_layer_weights(
+            checkpoint, layer_id, SegmentTopology(tp=C.TP_SIZE, dp=C.EP_SIZE // C.TP_SIZE)
+        )
+        weights = dict(attention)
+        weights.update({"ffn_norm_weight" if key == "norm_weight" else key: value
+                        for key, value in moe.items()})
+    else:
+        bundle = torch.load(prepared, map_location="cpu", weights_only=True)
+        if bundle["checkpoint"] != checkpoint or bundle["layer_id"] != layer_id:
+            raise ValueError("prepared weight bundle has a different checkpoint or layer")
+        weights = bundle["weights"]
     specs = decode_layer.build_tensor_specs(layer_id, seed)
     names = {spec.name for spec in specs if isinstance(spec, TensorSpec)}
     missing = sorted(set(weights) - names)
@@ -38,6 +46,13 @@ def real_weight_specs(checkpoint, layer_id, seed):
             )
         result.append(replace(spec, init_value=lambda value=value: value.clone()))
     print(f"[REAL WEIGHTS] layer={layer_id} bound={len(weights)} ABI tensors", flush=True)
+    if save_prepared is not None:
+        target = Path(save_prepared)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".tmp")
+        torch.save({"checkpoint": checkpoint, "layer_id": layer_id, "weights": weights}, temporary)
+        temporary.replace(target)
+        print(f"[REAL WEIGHTS] saved prepared bundle: {target}", flush=True)
     return result
 
 
@@ -47,9 +62,16 @@ def main():
     parser.add_argument("--layer-id", type=int, default=0, choices=(0, 1))
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--save-prepared", type=Path)
+    parser.add_argument("--prepared", type=Path)
     parser.add_argument("--device", default=",".join(map(str, range(C.EP_SIZE))))
     args = parser.parse_args()
-    specs = real_weight_specs(args.checkpoint, args.layer_id, args.seed)
+    if args.save_prepared is not None and (args.prepared is not None or not args.prepare_only):
+        parser.error("--save-prepared requires --prepare-only and cannot combine with --prepared")
+    specs = real_weight_specs(
+        args.checkpoint, args.layer_id, args.seed,
+        prepared=args.prepared, save_prepared=args.save_prepared,
+    )
     if args.prepare_only:
         return
 
