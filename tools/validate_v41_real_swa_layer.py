@@ -92,7 +92,7 @@ def main():
         golden_fn=decode_layer.golden_l3_decode_layer,
         config=dict(
             platform="a5",
-            ring_heap=args.ring_heap_mib << 20,
+            ring_heap=(0, 0, 0, args.ring_heap_mib << 20),
             enable_scope_stats=args.enable_scope_stats,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
         ),
