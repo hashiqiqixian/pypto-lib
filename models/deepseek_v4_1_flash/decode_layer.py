@@ -1132,6 +1132,7 @@ def validate(argv=None):
         runtime_dir=args.runtime_dir,
         config=dict(
             platform=args.platform,
+            ring_heap=1 << 30,
             dump_passes=args.dump_passes,
             enable_chip_swimlane=args.enable_chip_swimlane,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
