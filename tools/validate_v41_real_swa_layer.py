@@ -64,9 +64,11 @@ def main():
         fn=decode_layer.l3_decode_layer,
         specs=specs,
         golden_fn=decode_layer.golden_l3_decode_layer,
-        config=dict(platform="a5", distributed_config=DistributedConfig(
-            device_ids=devices, num_sub_workers=0,
-        )),
+        config=dict(
+            platform="a5",
+            ring_heap=1 << 30,
+            distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
+        ),
         compare_fn={
             "window_cache": decode_attn_swa.compare_distributed_cache,
             "window_cache_scale": decode_attn_swa.compare_scales,
