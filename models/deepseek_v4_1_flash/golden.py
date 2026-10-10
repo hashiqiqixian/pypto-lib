@@ -455,7 +455,11 @@ def expert(
 
 def hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     """Collapse four Hyper-Connection streams into one sublayer input."""
-    return (x.float() * pre_mix.float().unsqueeze(-1)).sum(dim=-2).to(x.dtype)
+    value = x.float()
+    mix = pre_mix.float()
+    first = value[..., 0, :] * mix[..., 0, None] + value[..., 1, :] * mix[..., 1, None]
+    second = value[..., 2, :] * mix[..., 2, None] + value[..., 3, :] * mix[..., 3, None]
+    return (first + second).to(x.dtype)
 
 
 def identity_pre_mix(x_hc: torch.Tensor) -> torch.Tensor:

@@ -28,6 +28,7 @@ import torch
 
 from golden import ScalarSpec, TensorSpec, run
 from models.deepseek_v4_1_flash import config as C
+from models.deepseek_v4_1_flash.attention_ops import K_TILE
 from models.deepseek_v4_1_flash.metadata import window_metadata
 from models.deepseek_v4_1_flash.o_proj import o_proj
 from models.deepseek_v4_1_flash.qkv_proj_rope import qkv_proj_rope
@@ -376,6 +377,16 @@ def official_rope(x, cos, sin, inverse=False):
     return value.to(torch.bfloat16)
 
 
+def official_grouped_o_a(grouped, weight):
+    """Match the device Wo-A four-step FP32 accumulation and BF16 output."""
+    accumulated = torch.zeros(*grouped.shape[:2], weight.shape[-2], dtype=torch.float32)
+    for start in range(0, grouped.shape[-1], K_TILE):
+        part = torch.einsum("tgd,grd->tgr", grouped[..., start:start + K_TILE].float(),
+                            weight[..., start:start + K_TILE].float())
+        accumulated += part
+    return accumulated.to(torch.bfloat16)
+
+
 def official_reference(tensors):
     """CPU transcription of group-32 FP8 GEMM and block-64 online attention.
 
@@ -408,12 +419,17 @@ def official_reference(tensors):
     idx = t["window_indices"].long()
     selected = values.reshape(-1, head_dim)[idx.clamp_min(0)].to(torch.bfloat16)
     selected = selected.masked_fill((idx < 0)[..., None], 0)
-    maximum = torch.full(q.shape[:2], -1e30)
+    # CPU FP32 reductions can flip BF16 rounding at the attention boundary.
+    # Keep the kernel's block-64 and BF16 probability contract, but compute its
+    # independent numerical reference in FP64.
+    q_ref = q.double()
+    selected_ref = selected.double()
+    maximum = torch.full(q.shape[:2], -1e30, dtype=torch.float64, device=q.device)
     denominator = torch.zeros_like(maximum)
-    numerator = torch.zeros_like(q, dtype=torch.float32)
+    numerator = torch.zeros_like(q_ref)
     for start in range(0, idx.shape[-1], 64):
-        keys = selected[:, start:start + 64].float()
-        logits = torch.einsum("thd,tkd->thk", q.float(), keys) * head_dim ** -0.5
+        keys = selected_ref[:, start:start + 64]
+        logits = torch.einsum("thd,tkd->thk", q_ref, keys) * head_dim ** -0.5
         valid = idx[:, start:start + 64] >= 0
         logits = logits.masked_fill(~valid[:, None], -torch.inf)
         new_maximum = torch.maximum(maximum, logits.amax(-1))
@@ -421,15 +437,16 @@ def official_reference(tensors):
         probabilities = (logits - new_maximum[..., None]).exp()
         denominator = denominator * correction + probabilities.sum(-1)
         numerator = numerator * correction[..., None] + torch.einsum(
-            "thk,tkd->thd", probabilities.to(torch.bfloat16).float(), keys)
+            "thk,tkd->thd", probabilities.to(torch.bfloat16).double(), keys)
         maximum = new_maximum
-    final_max = torch.maximum(maximum, t["attn_sink"][None])
+    sink = t["attn_sink"].double()[None]
+    final_max = torch.maximum(maximum, sink)
     correction = (maximum - final_max).exp()
-    denominator = denominator * correction + (t["attn_sink"][None] - final_max).exp()
+    denominator = denominator * correction + (sink - final_max).exp()
     attended = (numerator * (correction / denominator)[..., None]).to(torch.bfloat16)
     attended = official_rope(attended, t["rope_cos"], t["rope_sin"], inverse=True)
     grouped = attended.reshape(-1, groups, group_in)
-    latent = torch.einsum("tgd,grd->tgr", grouped.float(), t["wo_a"].float()).to(torch.bfloat16)
+    latent = official_grouped_o_a(grouped, t["wo_a"])
     output = official_linear(latent.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=True)
     return output, cache, cache_scale
 

@@ -14,7 +14,6 @@ from models.deepseek_v4_1_flash.attention_ops import (
     MX_M_TILE,
     N_TILE,
     make_norm,
-    make_mx_projection,
     make_rope,
 )
 from models.deepseek_v4_1_flash.config import D, HEAD_DIM, LOCAL_H, Q_LORA, ROPE_DIM, T_DYN
@@ -22,6 +21,68 @@ from models.deepseek_v4_1_flash.config import D, HEAD_DIM, LOCAL_H, Q_LORA, ROPE
 
 _PREFILL_WORKERS = 64
 _PREFILL_PROJECTION_K_TILE = 32
+
+
+def _make_groupwise_projection(width, output_width, name_hint):
+    """Preserve group-32 scale boundaries before FP32 accumulation."""
+
+    @pl.jit.inline
+    def project(
+        x: pl.Tensor[[T_DYN, width], pl.BF16],
+        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
+        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
+        output: pl.Tensor[[T_DYN, output_width], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        scale_storage = pl.tensor.view(scale, [output_width // 16, width // 2], layout=pl.ND)
+        for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
+            t0 = mt * MX_M_TILE
+            for block in pl.spmd(output_width // N_TILE, name_hint=name_hint):
+                n0 = block * N_TILE
+                rows = pl.min(MX_M_TILE, num_tokens - t0)
+                acc = pl.tile.full([MX_M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+                for kb in pl.range(width // (2 * _PREFILL_PROJECTION_K_TILE)):
+                    raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
+                    raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
+                    codes = pl.ands(pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32), 255)
+                    scale_pair = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
+                    for half in pl.unroll(2):
+                        k0 = (kb * 2 + half) * _PREFILL_PROJECTION_K_TILE
+                        if half == 0:
+                            gathered_scale = pl.tile.gather_mask(
+                                scale_pair, mask_pattern=pl.tile.MaskPattern.P0101
+                            )
+                        else:
+                            gathered_scale = pl.tile.gather_mask(
+                                scale_pair, mask_pattern=pl.tile.MaskPattern.P1010
+                            )
+                        sb = pl.reshape(gathered_scale, [1, N_TILE])
+                        source = pl.load(
+                            x, [t0, k0], [MX_M_TILE, _PREFILL_PROJECTION_K_TILE],
+                            valid_shape=[rows, _PREFILL_PROJECTION_K_TILE],
+                        )
+                        source = pl.set_validshape(
+                            pl.fillpad(source, pad_value=pl.PadValue.zero),
+                            MX_M_TILE, _PREFILL_PROJECTION_K_TILE,
+                        )
+                        value = pl.cast(source, pl.FP32)
+                        reduce_tmp = pl.create_tile([MX_M_TILE, _PREFILL_PROJECTION_K_TILE], dtype=pl.FP32)
+                        maximum = pl.maximum(pl.row_max(pl.abs(value), tmp_tile=reduce_tmp), 1e-4)
+                        bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
+                        exponent = pl.shrs(pl.add(bits, 8388607), 23)
+                        sa = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+                        payload = pl.cast(pl.row_expand_div(value, sa), pl.FP8E4M3FN, mode="rint")
+                        a = pl.cast(payload, pl.BF16)
+                        b = pl.cast(
+                            pl.load(weight, [k0, n0], [_PREFILL_PROJECTION_K_TILE, N_TILE]), pl.BF16
+                        )
+                        part = pl.col_expand_mul(pl.row_expand_mul(pl.matmul(a, b), sa), sb)
+                        acc = pl.add(acc, part)
+                result = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, N_TILE)
+                output = pl.store(result, [t0, n0], output)
+        return output
+
+    return project
 
 
 @pl.jit.inline
@@ -239,9 +300,9 @@ def make_qkv_proj_rope_with_deps(
     return qkv_proj_rope_with_deps
 
 
-_project_qa = make_mx_projection(D, Q_LORA, name_hint="attention_q_a")
-_project_qb = make_mx_projection(Q_LORA, LOCAL_H * HEAD_DIM, name_hint="attention_q_b")
-_project_kv = make_mx_projection(D, HEAD_DIM, name_hint="attention_kv")
+_project_qa = _make_groupwise_projection(D, Q_LORA, "attention_q_a_groupwise")
+_project_qb = _make_groupwise_projection(Q_LORA, LOCAL_H * HEAD_DIM, "attention_q_b_groupwise")
+_project_kv = _make_groupwise_projection(D, HEAD_DIM, "attention_kv_groupwise")
 _normalize_q = make_norm(Q_LORA, name_hint="attention_q_norm")
 _normalize_kv = make_norm(HEAD_DIM, name_hint="attention_kv_norm")
 _rotate_q = make_rope(LOCAL_H, name_hint="attention_q_rope")

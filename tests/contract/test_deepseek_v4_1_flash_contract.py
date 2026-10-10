@@ -57,6 +57,21 @@ def _top_level_functions(name: str) -> set[str]:
     return {node.name for node in _tree(name).body if isinstance(node, ast.FunctionDef)}
 
 
+@requires_pypto
+def test_hc_pre_golden_preserves_device_pairwise_sum():
+    from models.deepseek_v4_1_flash.golden import hc_pre
+
+    generator = torch.Generator().manual_seed(17)
+    value = torch.randn(4, 4, 5120, generator=generator)
+    mix = torch.randn(4, 4, generator=generator)
+    first = value[:, 0] * mix[:, 0, None] + value[:, 1] * mix[:, 1, None]
+    second = value[:, 2] * mix[:, 2, None] + value[:, 3] * mix[:, 3, None]
+    expected = first + second
+
+    assert torch.equal(hc_pre(value, mix), expected)
+    assert not torch.equal(expected, (value * mix[..., None]).sum(dim=-2))
+
+
 def _string_list_assignment(name: str, variable: str) -> set[str]:
     tree = _tree(name)
     assignment = next(
