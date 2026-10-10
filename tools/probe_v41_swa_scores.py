@@ -19,6 +19,8 @@ def score_tile(
     scores: pl.Out[pl.Tensor[[M_TILE, 64], pl.FP32]],
     weights: pl.Out[pl.Tensor[[M_TILE, 64], pl.BF16]],
     weighted: pl.Out[pl.Tensor[[M_TILE, C.HEAD_DIM], pl.FP32]],
+    factor: pl.Out[pl.Tensor[[M_TILE, 1], pl.FP32]],
+    precast: pl.Out[pl.Tensor[[M_TILE, C.HEAD_DIM], pl.FP32]],
     attended: pl.Out[pl.Tensor[[M_TILE, C.HEAD_DIM], pl.BF16]],
 ):
     for _ in pl.spmd(1):
@@ -40,13 +42,14 @@ def score_tile(
         final_denominator = pl.add(
             pl.mul(denominator, correction), pl.exp(pl.sub(sinks, final_max))
         )
-        result = pl.row_expand_mul(
-            numerator, pl.reshape(pl.div(correction, final_denominator), [M_TILE, 1])
-        )
+        multiplier = pl.reshape(pl.div(correction, final_denominator), [M_TILE, 1])
+        factor[:, :] = multiplier
+        result = pl.row_expand_mul(numerator, multiplier)
+        precast[:, :] = result
         scores[:, :] = raw
         weights[:, :] = weights_local
         attended[:, :] = pl.cast(result, pl.BF16, mode="rint")
-    return scores, weights, weighted, attended
+    return scores, weights, weighted, factor, precast, attended
 
 
 def golden_score(values):
@@ -64,9 +67,11 @@ def golden_score(values):
     final_max = torch.maximum(maximum, sink)
     correction = (maximum - final_max).exp()
     final_denominator = probability.sum(-1) * correction + (sink - final_max).exp()
-    values["attended"].copy_(
-        (weighted * (correction / final_denominator)[:, None]).bfloat16()
-    )
+    multiplier = (correction / final_denominator)[:, None]
+    values["factor"].copy_(multiplier.float())
+    precast = weighted * multiplier
+    values["precast"].copy_(precast.float())
+    values["attended"].copy_(precast.bfloat16())
 
 
 def compare(actual, expected, *, inputs, **_):
@@ -111,6 +116,22 @@ def compare_attended(actual, expected, **_):
     return bool(torch.isfinite(actual.float()).all() and torch.isfinite(expected.float()).all()), "finite attended values"
 
 
+def compare_factor(actual, expected, **_):
+    delta = (actual - expected).abs()
+    print(f"[FACTOR] max_abs={delta.max().item():.9g} "
+          f"head1_device={actual[1, 0].item():.12g} "
+          f"head1_fp64={expected[1, 0].item():.12g}", flush=True)
+    return bool(torch.isfinite(actual).all() and torch.isfinite(expected).all()), "finite factor"
+
+
+def compare_precast(actual, expected, **_):
+    delta = (actual - expected).abs()
+    print(f"[PRECAST] max_abs={delta.max().item():.9g} "
+          f"head1_dim445_device={actual[1, 445].item():.12g} "
+          f"head1_dim445_fp64={expected[1, 445].item():.12g}", flush=True)
+    return bool(torch.isfinite(actual).all() and torch.isfinite(expected).all()), "finite precast"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("capture")
@@ -146,6 +167,8 @@ def main():
         TensorSpec("scores", [M_TILE, 64], torch.float32),
         TensorSpec("weights", [M_TILE, 64], torch.bfloat16),
         TensorSpec("weighted", [M_TILE, C.HEAD_DIM], torch.float32),
+        TensorSpec("factor", [M_TILE, 1], torch.float32),
+        TensorSpec("precast", [M_TILE, C.HEAD_DIM], torch.float32),
         TensorSpec("attended", [M_TILE, C.HEAD_DIM], torch.bfloat16),
     ]
     print(f"[SCORE] token={args.token} heads={head_start}:{head_start + M_TILE} "
@@ -154,6 +177,7 @@ def main():
                  config=dict(platform="a5", device_id=args.device),
                  compare_fn={"scores": compare, "weights": compare_weights,
                              "weighted": compare_weighted,
+                             "factor": compare_factor, "precast": compare_precast,
                              "attended": compare_attended})
     if not result.passed:
         raise SystemExit(result.error or 1)
