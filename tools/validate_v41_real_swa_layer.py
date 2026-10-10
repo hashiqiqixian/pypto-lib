@@ -65,6 +65,8 @@ def main():
     parser.add_argument("--save-prepared", type=Path)
     parser.add_argument("--prepared", type=Path)
     parser.add_argument("--device", default=",".join(map(str, range(C.EP_SIZE))))
+    parser.add_argument("--ring-heap-mib", type=int, default=1024)
+    parser.add_argument("--enable-scope-stats", action="store_true")
     args = parser.parse_args()
     if args.save_prepared is not None and (args.prepared is not None or not args.prepare_only):
         parser.error("--save-prepared requires --prepare-only and cannot combine with --prepared")
@@ -81,6 +83,8 @@ def main():
     devices = [int(value) for value in args.device.split(",")]
     if len(devices) != C.EP_SIZE or len(set(devices)) != C.EP_SIZE:
         parser.error(f"need {C.EP_SIZE} distinct A5 devices")
+    if args.ring_heap_mib < 1 or args.ring_heap_mib & (args.ring_heap_mib - 1):
+        parser.error("--ring-heap-mib must be a positive power of two")
     counts = torch.full((C.EP_SIZE,), C.MOE_TOKENS, dtype=torch.int32)
     result = run(
         fn=decode_layer.l3_decode_layer,
@@ -88,7 +92,8 @@ def main():
         golden_fn=decode_layer.golden_l3_decode_layer,
         config=dict(
             platform="a5",
-            ring_heap=1 << 30,
+            ring_heap=args.ring_heap_mib << 20,
+            enable_scope_stats=args.enable_scope_stats,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
         ),
         compare_fn={

@@ -18,4 +18,5 @@ fi
 
 exec "$base/.venv-v41-m0/bin/python" tools/validate_v41_real_swa_layer.py \
     /mnt/old-root/srv/models/DeepSeek-V4.1-Flash --layer-id 0 --seed 17 \
-    --device 0,1,2,3,4,5,6,7 "${options[@]}"
+    --device 0,1,2,3,4,5,6,7 --ring-heap-mib 2048 --enable-scope-stats \
+    "${options[@]}"
