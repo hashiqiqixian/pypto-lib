@@ -80,6 +80,80 @@ def split_product_error(left, right, product):
             left_low * right_high) + left_low * right_low
 
 
+def pair_add(left_hi, left_lo, right_hi, right_lo):
+    high, error = two_sum(left_hi, right_hi)
+    return two_sum(high, error + left_lo + right_lo)
+
+
+def pair_mul(left_hi, left_lo, right_hi, right_lo):
+    high = left_hi * right_hi
+    low = (split_product_error(left_hi, right_hi, high) +
+           left_hi * right_lo + left_lo * right_hi + left_lo * right_lo)
+    return two_sum(high, low)
+
+
+def exp_parts(value, exact_exp):
+    high = value.float()
+    if exact_exp:
+        result = value.exp()
+        result_hi = result.float()
+        return result_hi, (result - result_hi.double()).float()
+    result_hi = high.exp()
+    return result_hi, result_hi * (value - high.double()).float()
+
+
+def replay_pair_online(query, keys, indices, sink, exact_exp, exact_weighted):
+    maximum = torch.tensor(-1e30, dtype=torch.float64)
+    denominator_hi = torch.tensor(0.0, dtype=torch.float32)
+    denominator_lo = torch.tensor(0.0, dtype=torch.float32)
+    numerator_hi = torch.zeros_like(query, dtype=torch.float32)
+    numerator_lo = torch.zeros_like(numerator_hi)
+    for start in (0, 64):
+        selected = keys[start:start + 64]
+        dot_hi, dot_lo = compensated_dot(query, selected)
+        scores = (dot_hi.double() + dot_lo.double()) * query.numel() ** -0.5
+        valid = indices[start:start + 64] >= 0
+        scores[~valid] = -torch.inf
+        next_maximum = torch.maximum(maximum, scores.max())
+        correction_hi, correction_lo = exp_parts(maximum - next_maximum, exact_exp)
+        probability_hi, probability_lo = exp_parts(scores - next_maximum, exact_exp)
+        probability_hi[~valid] = 0
+        probability_lo[~valid] = 0
+        weighted_bf16 = (probability_hi.double() + probability_lo.double()).bfloat16()
+        block_hi = torch.tensor(0.0, dtype=torch.float32)
+        block_lo = torch.tensor(0.0, dtype=torch.float32)
+        for high, low in zip(probability_hi, probability_lo):
+            block_hi, block_lo = pair_add(block_hi, block_lo, high, low)
+        denominator_hi, denominator_lo = pair_add(
+            *pair_mul(denominator_hi, denominator_lo, correction_hi, correction_lo),
+            block_hi, block_lo,
+        )
+        if exact_weighted:
+            weighted = weighted_bf16.double() @ selected.double()
+            weighted_hi = weighted.float()
+            weighted_lo = (weighted - weighted_hi.double()).float()
+        else:
+            weighted_hi = weighted_bf16.float() @ selected.float()
+            weighted_lo = torch.zeros_like(weighted_hi)
+        numerator_hi, numerator_lo = pair_add(
+            *pair_mul(numerator_hi, numerator_lo, correction_hi, correction_lo),
+            weighted_hi, weighted_lo,
+        )
+        maximum = next_maximum
+    final_maximum = torch.maximum(maximum, sink.double())
+    correction_hi, correction_lo = exp_parts(maximum - final_maximum, exact_exp)
+    sink_hi, sink_lo = exp_parts(sink.double() - final_maximum, exact_exp)
+    denominator_hi, denominator_lo = pair_add(
+        *pair_mul(denominator_hi, denominator_lo, correction_hi, correction_lo),
+        sink_hi, sink_lo,
+    )
+    numerator_hi, numerator_lo = pair_mul(
+        numerator_hi, numerator_lo, correction_hi, correction_lo,
+    )
+    return ((numerator_hi.double() + numerator_lo.double()) /
+            (denominator_hi.double() + denominator_lo.double())).bfloat16()
+
+
 def exp_pair(high, low):
     base = high.exp()
     return base + base * low
@@ -218,6 +292,20 @@ def main():
             print(f"compensated_logits dot_fp32_pair={use_compensated_dot} "
                   f"wide_online={wide_online} fixed={fixed}/{int(changed.sum())} "
                   f"introduced={introduced}", flush=True)
+
+    for exact_exp in (False, True):
+        for exact_weighted in (False, True):
+            fixed = introduced = 0
+            for token, head in pairs:
+                candidate = replay_pair_online(
+                    query[token, head], data["selected"][token], data["indices"][token],
+                    data["sink"][head], exact_exp, exact_weighted,
+                )
+                mismatch = changed[token, head]
+                fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
+                introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
+            print(f"fp32_pair_online exact_exp={exact_exp} exact_weighted={exact_weighted} "
+                  f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
 
     for compensated_qk in (False, True):
         fixed = introduced = 0
