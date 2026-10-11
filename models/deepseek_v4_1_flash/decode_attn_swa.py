@@ -60,7 +60,7 @@ from models.deepseek_v4_1_flash.config import (
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
 
 # Tiling.
-M_TILE = 8
+M_TILE = 16
 
 
 @pl.jit.inline
@@ -162,7 +162,7 @@ def attend_window(
             k0 = t * 128 + part * 64
             q = qflat[q0:q0 + M_TILE, :]
             kv = kflat[k0:k0 + 64, :]
-            scores = pl.matmul(pl.cast(q, pl.FP32), pl.cast(kv, pl.FP32), b_trans=True)
+            scores = pl.matmul(q, kv, b_trans=True)
             scores = pl.mul(scores, SOFTMAX_SCALE)
             idx = pl.cast(indices[t:t + 1, part * 64:part * 64 + 64], pl.FP32)
             valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
