@@ -116,6 +116,38 @@ def test_decode_layer_schedule_resolves_cache_sources(composition):
         config(40)
 
 
+@requires_pypto
+@pytest.mark.parametrize("independent_error", [False, True])
+def test_decode_layer_requires_independent_x_next_accuracy(composition, monkeypatch, independent_error):
+    from models.deepseek_v4_1_flash import moe
+
+    counts = torch.ones(composition.C.EP_SIZE, dtype=torch.int32)
+    actual = torch.zeros(composition.C.EP_SIZE, 1, 1, 20)
+    expected = torch.zeros_like(actual)
+    if independent_error:
+        actual[0, 0, 0, :2] = 1.0
+
+    monkeypatch.setattr(moe, "golden_moe", lambda state: state["x_next"].copy_(actual))
+    compare = composition._compare_moe_from_actual_attention(counts)
+    outputs = {
+        "attention_hidden": torch.zeros_like(actual),
+        "attention_pre_mix": torch.zeros(composition.C.EP_SIZE, 1, 1),
+        "next_pre_mix": torch.zeros(composition.C.EP_SIZE, 1, 1),
+        "x_mixed": torch.zeros(composition.C.EP_SIZE, 1, 20),
+    }
+    inputs = {
+        "ffn_norm_weight": torch.zeros(composition.C.EP_SIZE, 20),
+        "moe_num_tokens": counts,
+    }
+    passed, detail = compare(
+        actual, expected, actual_outputs=outputs, expected_outputs={}, inputs=inputs,
+        rtol=0.01, atol=0.001,
+    )
+    assert passed is not independent_error
+    if independent_error:
+        assert "independent Block" in detail
+
+
 def test_decode_layer_has_no_duplicate_plan_module():
     assert not (MODEL_DIR / "decode_layer_plan.py").exists()
 

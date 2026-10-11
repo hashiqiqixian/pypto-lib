@@ -1053,10 +1053,14 @@ def _compare_active_rows_per_rank(compare, counts):
 
 
 def _compare_moe_from_actual_attention(counts):
-    """Validate MoE against the actual, already-validated Attention boundary."""
+    """Validate both the independent Block output and the same-input MoE."""
+    from golden import ratio_reldiff
     from models.deepseek_v4_1_flash.moe import _local_mhc_compare, golden_moe
 
     compare_moe = _local_mhc_compare(counts)
+    compare_block = _compare_active_rows_per_rank(
+        ratio_reldiff(diff_thd=0.01, pct_thd=0.05), counts,
+    )
 
     def compare(actual, expected, *, actual_outputs, inputs, **kwargs):
         actual_f = actual.float()
@@ -1077,12 +1081,18 @@ def _compare_moe_from_actual_attention(counts):
         conditioned["x_mixed"] = torch.empty_like(actual_outputs["x_mixed"])
         conditioned["x_next"] = torch.empty_like(actual)
         golden_moe(conditioned)
-        return compare_moe(
+        block_passed, block_detail = compare_block(
+            actual, expected, actual_outputs=actual_outputs, inputs=inputs, **kwargs,
+        )
+        moe_passed, moe_detail = compare_moe(
             actual,
             conditioned["x_next"],
             actual_outputs=actual_outputs,
             inputs={"num_tokens": inputs["moe_num_tokens"]},
             **kwargs,
+        )
+        return block_passed and moe_passed, (
+            f"independent Block: {block_detail}; conditioned MoE: {moe_detail}"
         )
 
     return compare
