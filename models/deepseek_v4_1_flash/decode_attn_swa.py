@@ -191,7 +191,8 @@ def attend_window(
             bias = pl.mul(pl.sub(valid, 1.0), 1e30)
             scores = pl.col_expand_add(scores, bias)
             block_max = pl.reshape(pl.row_max(scores), [1, M_TILE])
-            matches = pl.cmp(scores, pl.reshape(block_max, [M_TILE, 1]), cmp_type=0)
+            matches = pl.cmp(pl.row_expand_sub(scores, pl.reshape(block_max, [M_TILE, 1])),
+                             0.0, cmp_type=0)
             block_low = pl.reshape(pl.row_max(
                 pl.add(score_low, pl.mul(pl.sub(matches, 1.0), 1e30))), [1, M_TILE])
             choose_block = pl.minimum(
