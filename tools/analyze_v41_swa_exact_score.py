@@ -85,7 +85,19 @@ def exp_pair(high, low):
     return base + base * low
 
 
-def replay_fp32_pair(query, keys, indices, sink, compensated_qk=True):
+def round_bf16_pair(high, low):
+    """Round a positive FP32 high/low pair without first discarding its low part."""
+    rounded = high.bfloat16()
+    upward = torch.nextafter(rounded, torch.full_like(rounded, torch.inf))
+    downward = torch.nextafter(rounded, torch.zeros_like(rounded))
+    lower = torch.where(rounded.float() > high, downward, rounded)
+    upper = torch.where(rounded.float() > high, rounded, upward)
+    midpoint = (lower.float() + upper.float()) * 0.5
+    return torch.where(high - midpoint + low > 0, upper, lower)
+
+
+def replay_fp32_pair(query, keys, indices, sink, compensated_qk=True,
+                     precise_probability_rounding=False):
     scale_hi = torch.tensor(query.numel() ** -0.5, dtype=torch.float32)
     scale_lo = torch.tensor(query.numel() ** -0.5 - float(scale_hi), dtype=torch.float32)
     maximum_hi = torch.tensor(-1e30, dtype=torch.float32)
@@ -117,9 +129,17 @@ def replay_fp32_pair(query, keys, indices, sink, compensated_qk=True):
         correction = exp_pair(correction_hi, correction_err + maximum_lo - next_lo)
         centered_hi, centered_err = two_sum(score_hi, -next_hi)
         centered_lo = torch.where(valid, centered_err + score_lo - next_lo, 0.0)
-        probability = torch.where(valid, exp_pair(centered_hi, centered_lo), 0.0)
+        probability_base = centered_hi.exp()
+        probability_low = probability_base * centered_lo
+        probability = torch.where(valid, probability_base + probability_low, 0.0)
+        if precise_probability_rounding:
+            probability_bf16 = torch.where(
+                valid, round_bf16_pair(probability_base, probability_low), 0.0,
+            )
+        else:
+            probability_bf16 = probability.bfloat16()
         denominator = denominator * correction + probability.sum()
-        numerator = numerator * correction + probability.bfloat16().float() @ selected.float()
+        numerator = numerator * correction + probability_bf16.float() @ selected.float()
         maximum_hi, maximum_lo = next_hi, next_lo
     if sink.float() > maximum_hi or (sink.float() == maximum_hi and -maximum_lo > 0):
         final_hi, final_lo = sink.float(), torch.tensor(0.0, dtype=torch.float32)
@@ -213,16 +233,20 @@ def main():
               f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
 
     for compensated_qk in (False, True):
-        fixed = introduced = 0
-        for token, head in pairs:
-            candidate = replay_fp32_pair(query[token, head], data["selected"][token],
-                                         data["indices"][token], data["sink"][head],
-                                         compensated_qk=compensated_qk)
-            mismatch = changed[token, head]
-            fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
-            introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
-        print(f"fp32_pair_pipeline compensated_qk={compensated_qk} "
-              f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
+        for precise_probability_rounding in (False, True):
+            fixed = introduced = 0
+            for token, head in pairs:
+                candidate = replay_fp32_pair(
+                    query[token, head], data["selected"][token], data["indices"][token],
+                    data["sink"][head], compensated_qk=compensated_qk,
+                    precise_probability_rounding=precise_probability_rounding,
+                )
+                mismatch = changed[token, head]
+                fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
+                introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
+            print(f"fp32_pair_pipeline compensated_qk={compensated_qk} "
+                  f"precise_probability_rounding={precise_probability_rounding} "
+                  f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
 
 if __name__ == "__main__":
     main()
