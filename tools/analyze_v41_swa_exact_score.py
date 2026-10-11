@@ -50,21 +50,6 @@ def replay(query, keys, indices, sink, score_dtype, online_dtype, numerator_dtyp
     return (numerator * factor.to(numerator_dtype)).bfloat16()
 
 
-def replay_global_max(query, keys, indices, sink, score_dtype):
-    scores = (keys.double() @ query.double()).to(score_dtype)
-    scores = scores.float() * query.numel() ** -0.5
-    scores[indices < 0] = -torch.inf
-    maximum = torch.maximum(scores.max(), sink.float())
-    denominator = torch.tensor(0.0, dtype=torch.float32)
-    numerator = torch.zeros_like(query, dtype=torch.float32)
-    for start in (0, 64):
-        probability = (scores[start:start + 64] - maximum).exp()
-        denominator += probability.sum()
-        numerator += probability.bfloat16().float() @ keys[start:start + 64].float()
-    denominator += (sink.float() - maximum).exp()
-    return (numerator / denominator).bfloat16()
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("capture")
@@ -104,17 +89,6 @@ def main():
               f"round_probability={round_probability} round_denominator={round_denominator} "
               f"round_correction={round_correction} fp32_factor={fp32_factor} "
               f"fixed={fixed}/{int(changed.sum())} "
-              f"introduced={introduced}", flush=True)
-
-    for score_dtype in (torch.float32, torch.float64):
-        fixed = introduced = 0
-        for token, head in pairs:
-            candidate = replay_global_max(query[token, head], data["selected"][token],
-                                          data["indices"][token], data["sink"][head], score_dtype)
-            mismatch = changed[token, head]
-            fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
-            introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
-        print(f"global_max score={score_dtype} fixed={fixed}/{int(changed.sum())} "
               f"introduced={introduced}", flush=True)
 
 if __name__ == "__main__":
