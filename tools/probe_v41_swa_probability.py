@@ -28,9 +28,11 @@ def probe_probability(
     weights_out: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
 ):
     with pl.at(level=pl.Level.CORE_GROUP):
-        q_first = pl.reshape(q[:, :16 * 256], [16, 256])
-        q_second = pl.reshape(q[:, 16 * 256:], [16, 256])
-        kv = pl.reshape(selected[:, :64, :], [64, HEAD_DIM])
+        query = pl.reshape(q, [16, HEAD_DIM])
+        q_first = query[:, :256]
+        q_second = query[:, 256:]
+        selected_rows = pl.reshape(selected, [128, HEAD_DIM])
+        kv = selected_rows[:64, :]
         kv_first = kv[:, :256]
         kv_second = kv[:, 256:]
         scores = pl.add(
