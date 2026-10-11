@@ -61,6 +61,10 @@ from models.deepseek_v4_1_flash.config import (
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
 SOFTMAX_SCALE_HI = struct.unpack("f", struct.pack("f", SOFTMAX_SCALE))[0]
 SOFTMAX_SCALE_LO = SOFTMAX_SCALE - SOFTMAX_SCALE_HI
+_SCALE_SPLIT = struct.unpack("f", struct.pack("f", SOFTMAX_SCALE_HI * 4097.0))[0]
+_SCALE_SPLIT_DIFF = struct.unpack("f", struct.pack("f", _SCALE_SPLIT - SOFTMAX_SCALE_HI))[0]
+SOFTMAX_SCALE_HIGH = struct.unpack("f", struct.pack("f", _SCALE_SPLIT - _SCALE_SPLIT_DIFF))[0]
+SOFTMAX_SCALE_LOW = SOFTMAX_SCALE_HI - SOFTMAX_SCALE_HIGH
 
 # Tiling.
 M_TILE = 16
@@ -171,15 +175,12 @@ def attend_window(
             raw_split = pl.mul(raw, 4097.0)
             raw_high = pl.sub(raw_split, pl.sub(raw_split, raw))
             raw_low = pl.sub(raw, raw_high)
-            scale_split = pl.mul(SOFTMAX_SCALE_HI, 4097.0)
-            scale_high = pl.sub(scale_split, pl.sub(scale_split, SOFTMAX_SCALE_HI))
-            scale_low = pl.sub(SOFTMAX_SCALE_HI, scale_high)
             score_low = pl.add(
                 pl.add(
-                    pl.add(pl.sub(pl.mul(raw_high, scale_high), scores),
-                           pl.mul(raw_high, scale_low)),
-                    pl.mul(raw_low, scale_high)),
-                pl.add(pl.mul(raw_low, scale_low), pl.mul(raw, SOFTMAX_SCALE_LO)))
+                    pl.add(pl.sub(pl.mul(raw_high, SOFTMAX_SCALE_HIGH), scores),
+                           pl.mul(raw_high, SOFTMAX_SCALE_LOW)),
+                    pl.mul(raw_low, SOFTMAX_SCALE_HIGH)),
+                pl.add(pl.mul(raw_low, SOFTMAX_SCALE_LOW), pl.mul(raw, SOFTMAX_SCALE_LO)))
             scaled = pl.add(scores, score_low)
             carried = pl.sub(scaled, scores)
             score_low = pl.add(pl.sub(scores, pl.sub(scaled, carried)),
@@ -197,7 +198,7 @@ def attend_window(
                 pl.add(pl.cmp(block_max, maximum, cmp_type=4),
                        pl.mul(pl.cmp(block_max, maximum, cmp_type=0),
                               pl.cmp(block_low, maximum_low, cmp_type=4))), 1.0)
-            choose_old = pl.sub(1.0, choose_block)
+            choose_old = pl.neg(pl.sub(choose_block, 1.0))
             next_max = pl.add(pl.mul(choose_block, block_max), pl.mul(choose_old, maximum))
             next_low = pl.add(pl.mul(choose_block, block_low), pl.mul(choose_old, maximum_low))
             correction_hi = pl.sub(maximum, next_max)
@@ -229,7 +230,7 @@ def attend_window(
             pl.add(pl.cmp(sinks, maximum, cmp_type=4),
                    pl.mul(pl.cmp(sinks, maximum, cmp_type=0),
                           pl.cmp(pl.neg(maximum_low), 0.0, cmp_type=4))), 1.0)
-        choose_old = pl.sub(1.0, choose_sink)
+        choose_old = pl.neg(pl.sub(choose_sink, 1.0))
         final_max = pl.add(pl.mul(choose_sink, sinks), pl.mul(choose_old, maximum))
         final_low = pl.mul(choose_old, maximum_low)
         correction_hi = pl.sub(maximum, final_max)
