@@ -43,6 +43,13 @@ def compare(actual, expected, **_):
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-12)
     print(f"[FROZEN SWA] changed={int(changed.sum())}/{actual.numel()} "
           f"relative_l2={relative_l2.item():.9g}", flush=True)
+    per_pair = changed.reshape(actual.shape[0], C.LOCAL_H, C.HEAD_DIM).sum(dim=-1)
+    for flat in per_pair.flatten().argsort(descending=True)[:8].tolist():
+        count = int(per_pair.flatten()[flat])
+        if count == 0:
+            break
+        token, head = divmod(flat, C.LOCAL_H)
+        print(f"[FROZEN SWA] token={token} head={head} changed={count}", flush=True)
     return bool(torch.isfinite(actual.float()).all()), "finite attention output"
 
 
