@@ -165,10 +165,10 @@ def attend_window(
             q_part1 = qflat[q0:q0 + M_TILE, 128:256]
             q_part2 = qflat[q0:q0 + M_TILE, 256:384]
             q_part3 = qflat[q0:q0 + M_TILE, 384:]
-            kv_part0 = kv[:, :128]
-            kv_part1 = kv[:, 128:256]
-            kv_part2 = kv[:, 256:384]
-            kv_part3 = kv[:, 384:]
+            kv_part0 = kflat[k0:k0 + 64, :128]
+            kv_part1 = kflat[k0:k0 + 64, 128:256]
+            kv_part2 = kflat[k0:k0 + 64, 256:384]
+            kv_part3 = kflat[k0:k0 + 64, 384:]
             scores = pl.add(
                 pl.add(pl.matmul(q_part0, kv_part0, b_trans=True),
                        pl.matmul(q_part1, kv_part1, b_trans=True)),
