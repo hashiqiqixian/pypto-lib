@@ -87,6 +87,12 @@ def main():
             expected_payload, _ = official_quantize(expected_mixed[rank])
             payload_row_changes = (actual_payload.view(torch.uint8) !=
                                    expected_payload.view(torch.uint8)).reshape(actual.shape[0], -1).sum(-1)
+            for label, rows in (("unchanged", payload_row_changes == 0),
+                                ("changed", payload_row_changes > 0)):
+                if rows.any():
+                    print(f"x_next rank={rank} fp8_payload_{label}_rows={int(rows.sum())} "
+                          f"bad_ratio={bad[rows].float().mean().item():.8g} "
+                          f"mean_row_rel_l2={attention_row_error[rows].mean().item():.8g}")
             top = torch.topk(row_bad, min(8, row_bad.numel())).indices
             causes = [(int(row), round(float(attention_row_error[row]), 7),
                        int(payload_row_changes[row]), round(float(row_bad[row]), 6))
