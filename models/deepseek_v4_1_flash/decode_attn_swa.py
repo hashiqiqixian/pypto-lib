@@ -174,8 +174,10 @@ def attend_window(
             raw = pl.full([M_TILE, 64], dtype=pl.FP32, value=0.0)
             dot_low = pl.full([M_TILE, 64], dtype=pl.FP32, value=0.0)
             for k_part in pl.range(HEAD_DIM // SCORE_K_TILE):
-                q_part = q[:, k_part * SCORE_K_TILE:(k_part + 1) * SCORE_K_TILE]
-                kv_part = kv[:, k_part * SCORE_K_TILE:(k_part + 1) * SCORE_K_TILE]
+                q_part = qflat[q0:q0 + M_TILE,
+                               k_part * SCORE_K_TILE:(k_part + 1) * SCORE_K_TILE]
+                kv_part = kflat[k0:k0 + 64,
+                                k_part * SCORE_K_TILE:(k_part + 1) * SCORE_K_TILE]
                 partial = pl.matmul(q_part, kv_part, b_trans=True)
                 summed = pl.add(raw, partial)
                 carried = pl.sub(summed, raw)
