@@ -50,13 +50,27 @@ def replay(query, keys, indices, sink, score_dtype, online_dtype, numerator_dtyp
     return (numerator * factor.to(numerator_dtype)).bfloat16()
 
 
-def replay_compensated_logits(query, keys, indices, sink):
+def compensated_dot(query, keys):
+    high = torch.zeros(keys.shape[0], dtype=torch.float32)
+    low = torch.zeros_like(high)
+    for column in range(query.numel()):
+        product = keys[:, column].float() * query[column].float()
+        total = high + product
+        carried = total - high
+        low += (high - (total - carried)) + (product - carried)
+        high = total
+    return high.double() + low.double()
+
+
+def replay_compensated_logits(query, keys, indices, sink, use_compensated_dot=False):
     maximum = torch.tensor(-1e30, dtype=torch.float64)
     denominator = torch.tensor(0.0, dtype=torch.float32)
     numerator = torch.zeros_like(query, dtype=torch.float32)
     for start in (0, 64):
         selected = keys[start:start + 64]
-        exact = (selected.double() @ query.double()) * query.numel() ** -0.5
+        dot = (compensated_dot(query, selected) if use_compensated_dot else
+               selected.double() @ query.double())
+        exact = dot * query.numel() ** -0.5
         exact[indices[start:start + 64] < 0] = -torch.inf
         next_max = torch.maximum(maximum, exact.max())
         correction = (maximum - next_max).exp().float()
@@ -116,14 +130,17 @@ def main():
               f"fixed={fixed}/{int(changed.sum())} "
               f"introduced={introduced}", flush=True)
 
-    fixed = introduced = 0
-    for token, head in pairs:
-        candidate = replay_compensated_logits(query[token, head], data["selected"][token],
-                                              data["indices"][token], data["sink"][head])
-        mismatch = changed[token, head]
-        fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
-        introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
-    print(f"compensated_logits fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
+    for use_compensated_dot in (False, True):
+        fixed = introduced = 0
+        for token, head in pairs:
+            candidate = replay_compensated_logits(
+                query[token, head], data["selected"][token], data["indices"][token],
+                data["sink"][head], use_compensated_dot=use_compensated_dot)
+            mismatch = changed[token, head]
+            fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
+            introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
+        print(f"compensated_logits dot_fp32_pair={use_compensated_dot} "
+              f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
 
 if __name__ == "__main__":
     main()
