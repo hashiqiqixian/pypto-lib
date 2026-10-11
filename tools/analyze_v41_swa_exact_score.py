@@ -59,7 +59,73 @@ def compensated_dot(query, keys):
         carried = total - high
         low += (high - (total - carried)) + (product - carried)
         high = total
-    return high.double() + low.double()
+    return high, low
+
+
+def two_sum(left, right):
+    total = left + right
+    carried = total - left
+    return total, (left - (total - carried)) + (right - carried)
+
+
+def split_product_error(left, right, product):
+    split = 4097.0
+    left_split = split * left
+    left_high = left_split - (left_split - left)
+    left_low = left - left_high
+    right_split = split * right
+    right_high = right_split - (right_split - right)
+    right_low = right - right_high
+    return (((left_high * right_high - product) + left_high * right_low) +
+            left_low * right_high) + left_low * right_low
+
+
+def exp_pair(high, low):
+    base = high.exp()
+    return base + base * low
+
+
+def replay_fp32_pair(query, keys, indices, sink):
+    scale_hi = torch.tensor(query.numel() ** -0.5, dtype=torch.float32)
+    scale_lo = torch.tensor(query.numel() ** -0.5 - float(scale_hi), dtype=torch.float32)
+    maximum_hi = torch.tensor(-1e30, dtype=torch.float32)
+    maximum_lo = torch.tensor(0.0, dtype=torch.float32)
+    denominator = torch.tensor(0.0, dtype=torch.float32)
+    numerator = torch.zeros_like(query, dtype=torch.float32)
+    for start in (0, 64):
+        selected = keys[start:start + 64]
+        dot_hi, dot_lo = compensated_dot(query, selected)
+        product = dot_hi * scale_hi
+        product_lo = (split_product_error(dot_hi, scale_hi, product) +
+                      dot_hi * scale_lo + dot_lo * scale_hi + dot_lo * scale_lo)
+        score_hi, score_lo = two_sum(product, product_lo)
+        valid = indices[start:start + 64] >= 0
+        score_hi = torch.where(valid, score_hi, -torch.inf)
+        score_lo = torch.where(valid, score_lo, 0.0)
+        candidate_hi = score_hi.max()
+        candidate_lo = score_lo[score_hi == candidate_hi].max()
+        if (candidate_hi > maximum_hi or
+                (candidate_hi == maximum_hi and candidate_lo > maximum_lo)):
+            next_hi, next_lo = candidate_hi, candidate_lo
+        else:
+            next_hi, next_lo = maximum_hi, maximum_lo
+        correction_hi, correction_err = two_sum(maximum_hi, -next_hi)
+        correction = exp_pair(correction_hi, correction_err + maximum_lo - next_lo)
+        centered_hi, centered_err = two_sum(score_hi, -next_hi)
+        centered_lo = torch.where(valid, centered_err + score_lo - next_lo, 0.0)
+        probability = torch.where(valid, exp_pair(centered_hi, centered_lo), 0.0)
+        denominator = denominator * correction + probability.sum()
+        numerator = numerator * correction + probability.bfloat16().float() @ selected.float()
+        maximum_hi, maximum_lo = next_hi, next_lo
+    if sink.float() > maximum_hi or (sink.float() == maximum_hi and -maximum_lo > 0):
+        final_hi, final_lo = sink.float(), torch.tensor(0.0, dtype=torch.float32)
+    else:
+        final_hi, final_lo = maximum_hi, maximum_lo
+    correction_hi, correction_err = two_sum(maximum_hi, -final_hi)
+    correction = exp_pair(correction_hi, correction_err + maximum_lo - final_lo)
+    sink_hi, sink_err = two_sum(sink.float(), -final_hi)
+    denominator = denominator * correction + exp_pair(sink_hi, sink_err - final_lo)
+    return (numerator * (correction / denominator)).bfloat16()
 
 
 def replay_compensated_logits(query, keys, indices, sink, use_compensated_dot=False):
@@ -68,8 +134,8 @@ def replay_compensated_logits(query, keys, indices, sink, use_compensated_dot=Fa
     numerator = torch.zeros_like(query, dtype=torch.float32)
     for start in (0, 64):
         selected = keys[start:start + 64]
-        dot = (compensated_dot(query, selected) if use_compensated_dot else
-               selected.double() @ query.double())
+        dot = (sum(part.double() for part in compensated_dot(query, selected))
+               if use_compensated_dot else selected.double() @ query.double())
         exact = dot * query.numel() ** -0.5
         exact[indices[start:start + 64] < 0] = -torch.inf
         next_max = torch.maximum(maximum, exact.max())
@@ -141,6 +207,15 @@ def main():
             introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
         print(f"compensated_logits dot_fp32_pair={use_compensated_dot} "
               f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
+
+    fixed = introduced = 0
+    for token, head in pairs:
+        candidate = replay_fp32_pair(query[token, head], data["selected"][token],
+                                     data["indices"][token], data["sink"][head])
+        mismatch = changed[token, head]
+        fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
+        introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
+    print(f"fp32_pair_pipeline fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
 
 if __name__ == "__main__":
     main()
