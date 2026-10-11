@@ -122,7 +122,7 @@ def test_decode_layer_requires_independent_x_next_accuracy(composition, monkeypa
     from models.deepseek_v4_1_flash import moe
 
     counts = torch.ones(composition.C.EP_SIZE, dtype=torch.int32)
-    actual = torch.zeros(composition.C.EP_SIZE, 1, 1, 20)
+    actual = torch.zeros(composition.C.EP_SIZE, composition.C.MOE_TOKENS, 1, 20)
     expected = torch.zeros_like(actual)
     if independent_error:
         actual[0, 0, 0, :2] = 1.0
@@ -131,9 +131,9 @@ def test_decode_layer_requires_independent_x_next_accuracy(composition, monkeypa
     compare = composition._compare_moe_from_actual_attention(counts)
     outputs = {
         "attention_hidden": torch.zeros_like(actual),
-        "attention_pre_mix": torch.zeros(composition.C.EP_SIZE, 1, 1),
-        "next_pre_mix": torch.zeros(composition.C.EP_SIZE, 1, 1),
-        "x_mixed": torch.zeros(composition.C.EP_SIZE, 1, 20),
+        "attention_pre_mix": torch.zeros(composition.C.EP_SIZE, composition.C.MOE_TOKENS, 1),
+        "next_pre_mix": torch.zeros(composition.C.EP_SIZE, composition.C.MOE_TOKENS, 1),
+        "x_mixed": torch.zeros(composition.C.EP_SIZE, composition.C.MOE_TOKENS, 20),
     }
     inputs = {
         "ffn_norm_weight": torch.zeros(composition.C.EP_SIZE, 20),
