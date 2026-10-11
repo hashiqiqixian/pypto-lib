@@ -16,6 +16,20 @@ import torch
 def scores(q, keys, chunk):
     if chunk == 0:
         return keys.float() @ q.float()
+    if chunk < 0:
+        products = keys.float() * q.float()[None]
+        if chunk == -1:
+            return products.sum(-1)
+        if chunk == -2:
+            return products.clamp_min(0).sum(-1) + products.clamp_max(0).sum(-1)
+        high = torch.zeros(keys.shape[0], dtype=torch.float32)
+        low = torch.zeros_like(high)
+        for column in range(q.numel()):
+            value = products[:, column] - low
+            updated = high + value
+            low = (updated - high) - value
+            high = updated
+        return high
     partials = [keys[:, start:start + chunk].float() @ q[start:start + chunk].float()
                 for start in range(0, q.numel(), chunk)]
     # A balanced tree keeps the error smaller than sequentially summing tiles.
@@ -60,7 +74,7 @@ def main():
     pairs.extend((int(flat // query.shape[1]), int(flat % query.shape[1])) for flat in sampled)
     pairs = list(dict.fromkeys(pairs))
     print(f"changed_elements={len(changed)} evaluated_pairs={len(pairs)}")
-    for chunk in (0, 256, 128, 64, 32):
+    for chunk in (0, 256, 128, 64, 32, -1, -2, -3):
         for accurate_online in (False, True):
             matches = 0
             introduced = 0
