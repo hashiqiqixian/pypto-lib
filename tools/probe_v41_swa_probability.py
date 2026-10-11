@@ -37,7 +37,7 @@ def probe_probability(
             pl.matmul(q_first, kv_first, b_trans=True),
             pl.matmul(q_second, kv_second, b_trans=True),
         )
-        scores = pl.mul(scores, C.HEAD_DIM ** -0.5)
+        scores = pl.mul(scores, HEAD_DIM ** -0.5)
         idx = pl.cast(indices[:, :64], pl.FP32)
         valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
         scores = pl.col_expand_add(scores, pl.mul(pl.sub(valid, 1.0), 1e30))
