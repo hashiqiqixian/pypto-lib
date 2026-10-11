@@ -90,10 +90,15 @@ def main():
     for chunk in (0, 256, 128, 64, 32, -1, -3):
         scores = projected_scores(q, keys_block, chunk) * (512 ** -0.5)
         scores[block_indices < 0] = -torch.inf
-        probability = (scores - scores.max()).exp()[local_index]
-        print(f"chunk={chunk:3} score={float(scores[local_index]):.12g} "
-              f"probability={float(probability):.12g} "
-              f"bf16={float(probability.bfloat16()):.12g}")
+        difference = scores - scores.max()
+        for label, probability in (
+            ("exp", difference.exp()[local_index]),
+            ("half_squared", difference.mul(0.5).exp().square()[local_index]),
+            ("exp2", torch.exp2(difference * 1.4426950408889634)[local_index]),
+        ):
+            print(f"chunk={chunk:3} method={label} score={float(scores[local_index]):.12g} "
+                  f"probability={float(probability):.12g} "
+                  f"bf16={float(probability.bfloat16()):.12g}")
     for item in sorted(candidates)[:12]:
         print("mismatch=%d fixed=%d introduced=%d index=%d direction=%+d "
               "weight=%.9g altered=%.9g factor=%.9g" %
