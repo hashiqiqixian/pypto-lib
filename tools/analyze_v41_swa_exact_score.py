@@ -50,6 +50,37 @@ def replay(query, keys, indices, sink, score_dtype, online_dtype, numerator_dtyp
     return (numerator * factor.to(numerator_dtype)).bfloat16()
 
 
+def replay_v4_merge(query, keys, indices, sink, score_dtype, online_dtype):
+    """Replay V4's block-partial and merge order on a two-block SWA window."""
+    parts = []
+    for start in (0, 64):
+        selected = keys[start:start + 64]
+        scores = (selected.double() @ query.double()).to(score_dtype)
+        scores = scores.to(online_dtype) * query.numel() ** -0.5
+        scores[indices[start:start + 64] < 0] = -torch.inf
+        block_max = scores.max()
+        if torch.isneginf(block_max):
+            parts.append((torch.tensor(-1e30, dtype=online_dtype),
+                          torch.tensor(0.0, dtype=online_dtype),
+                          torch.zeros_like(query, dtype=online_dtype)))
+            continue
+        probabilities = (scores - block_max).exp()
+        block_sum = probabilities.sum()
+        block_value = (probabilities.bfloat16().to(online_dtype)
+                       @ selected.to(online_dtype))
+        parts.append((block_max, block_sum, block_value))
+
+    maximum, denominator, numerator = parts[0]
+    block_max, block_sum, block_value = parts[1]
+    next_max = torch.maximum(maximum, block_max)
+    alpha = (maximum - next_max).exp()
+    beta = (block_max - next_max).exp()
+    denominator = alpha * denominator + beta * block_sum
+    numerator = alpha * numerator + beta * block_value
+    denominator = denominator + (sink.to(online_dtype) - next_max).exp()
+    return (numerator / denominator).bfloat16()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("capture")
@@ -90,6 +121,18 @@ def main():
               f"round_correction={round_correction} fp32_factor={fp32_factor} "
               f"fixed={fixed}/{int(changed.sum())} "
               f"introduced={introduced}", flush=True)
+
+    for score_dtype in (torch.float32, torch.float64):
+        fixed = introduced = 0
+        for token, head in pairs:
+            candidate = replay_v4_merge(query[token, head], data["selected"][token],
+                                        data["indices"][token], data["sink"][head],
+                                        score_dtype, torch.float32)
+            mismatch = changed[token, head]
+            fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
+            introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
+        print(f"v4_merge score={score_dtype} online={torch.float32} "
+              f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
 
 
 if __name__ == "__main__":
