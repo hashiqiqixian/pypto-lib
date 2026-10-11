@@ -13,7 +13,7 @@ import argparse
 import torch
 
 
-def replay(query, keys, indices, sink, score_dtype, online_dtype):
+def replay(query, keys, indices, sink, score_dtype, online_dtype, accurate_probability=False):
     maximum = torch.tensor(-1e30, dtype=online_dtype)
     denominator = torch.tensor(0.0, dtype=online_dtype)
     numerator = torch.zeros_like(query, dtype=online_dtype)
@@ -24,7 +24,10 @@ def replay(query, keys, indices, sink, score_dtype, online_dtype):
         score[indices[start:start + 64] < 0] = -torch.inf
         next_max = torch.maximum(maximum, score.max())
         correction = (maximum - next_max).exp()
-        probability = (score - next_max).exp()
+        if accurate_probability:
+            probability = (score.double() - next_max.double()).exp().to(online_dtype)
+        else:
+            probability = (score - next_max).exp()
         denominator = denominator * correction + probability.sum()
         numerator = numerator * correction + probability.bfloat16().to(online_dtype) @ selected.to(online_dtype)
         maximum = next_max
@@ -45,21 +48,23 @@ def main():
     changed = actual != expected
     pairs = list(dict.fromkeys((int(t), int(h)) for t, h, _ in changed.nonzero(as_tuple=False)))
     print(f"changed_elements={int(changed.sum())} changed_pairs={len(pairs)}", flush=True)
-    for score_dtype, online_dtype in (
-        (torch.float32, torch.float32),
-        (torch.float32, torch.float64),
-        (torch.float64, torch.float32),
-        (torch.float64, torch.float64),
+    for score_dtype, online_dtype, accurate_probability in (
+        (torch.float32, torch.float32, False),
+        (torch.float32, torch.float32, True),
+        (torch.float32, torch.float64, False),
+        (torch.float64, torch.float32, False),
+        (torch.float64, torch.float64, False),
     ):
         fixed = introduced = 0
         for token, head in pairs:
             candidate = replay(query[token, head], data["selected"][token],
                                data["indices"][token], data["sink"][head],
-                               score_dtype, online_dtype)
+                               score_dtype, online_dtype, accurate_probability)
             mismatch = changed[token, head]
             fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
             introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
-        print(f"score={score_dtype} online={online_dtype} fixed={fixed}/{int(changed.sum())} "
+        print(f"score={score_dtype} online={online_dtype} accurate_probability={accurate_probability} "
+              f"fixed={fixed}/{int(changed.sum())} "
               f"introduced={introduced}", flush=True)
 
 
