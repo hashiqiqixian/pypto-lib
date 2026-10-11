@@ -11,6 +11,7 @@
 import argparse
 import math
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -58,6 +59,8 @@ from models.deepseek_v4_1_flash.config import (
 
 
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
+SOFTMAX_SCALE_HI = struct.unpack("f", struct.pack("f", SOFTMAX_SCALE))[0]
+SOFTMAX_SCALE_LO = SOFTMAX_SCALE - SOFTMAX_SCALE_HI
 
 # Tiling.
 M_TILE = 16
@@ -156,32 +159,94 @@ def attend_window(
         h = block % (LOCAL_H // M_TILE) * M_TILE
         q0 = t * LOCAL_H + h
         maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
+        maximum_low = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
         denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
         numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
         for part in pl.range(2):
             k0 = t * 128 + part * 64
             q = qflat[q0:q0 + M_TILE, :]
             kv = kflat[k0:k0 + 64, :]
-            scores = pl.matmul(q, kv, b_trans=True)
-            scores = pl.mul(scores, SOFTMAX_SCALE)
+            raw = pl.matmul(q, kv, b_trans=True)
+            scores = pl.mul(raw, SOFTMAX_SCALE_HI)
+            raw_split = pl.mul(raw, 4097.0)
+            raw_high = pl.sub(raw_split, pl.sub(raw_split, raw))
+            raw_low = pl.sub(raw, raw_high)
+            scale_split = pl.mul(SOFTMAX_SCALE_HI, 4097.0)
+            scale_high = pl.sub(scale_split, pl.sub(scale_split, SOFTMAX_SCALE_HI))
+            scale_low = pl.sub(SOFTMAX_SCALE_HI, scale_high)
+            score_low = pl.add(
+                pl.add(
+                    pl.add(pl.sub(pl.mul(raw_high, scale_high), scores),
+                           pl.mul(raw_high, scale_low)),
+                    pl.mul(raw_low, scale_high)),
+                pl.add(pl.mul(raw_low, scale_low), pl.mul(raw, SOFTMAX_SCALE_LO)))
+            scaled = pl.add(scores, score_low)
+            carried = pl.sub(scaled, scores)
+            score_low = pl.add(pl.sub(scores, pl.sub(scaled, carried)),
+                               pl.add(pl.sub(score_low, carried), 0.0))
+            scores = scaled
             idx = pl.cast(indices[t:t + 1, part * 64:part * 64 + 64], pl.FP32)
             valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
             bias = pl.mul(pl.sub(valid, 1.0), 1e30)
             scores = pl.col_expand_add(scores, bias)
-            next_max = pl.maximum(maximum, pl.reshape(pl.row_max(scores), [1, M_TILE]))
-            correction = pl.exp(pl.sub(maximum, next_max))
+            block_max = pl.reshape(pl.row_max(scores), [1, M_TILE])
+            matches = pl.cmp(scores, pl.reshape(block_max, [M_TILE, 1]), cmp_type=0)
+            block_low = pl.reshape(pl.row_max(
+                pl.add(score_low, pl.mul(pl.sub(matches, 1.0), 1e30))), [1, M_TILE])
+            choose_block = pl.minimum(
+                pl.add(pl.cmp(block_max, maximum, cmp_type=4),
+                       pl.mul(pl.cmp(block_max, maximum, cmp_type=0),
+                              pl.cmp(block_low, maximum_low, cmp_type=4))), 1.0)
+            choose_old = pl.sub(1.0, choose_block)
+            next_max = pl.add(pl.mul(choose_block, block_max), pl.mul(choose_old, maximum))
+            next_low = pl.add(pl.mul(choose_block, block_low), pl.mul(choose_old, maximum_low))
+            correction_hi = pl.sub(maximum, next_max)
+            correction_carried = pl.sub(correction_hi, maximum)
+            correction_low = pl.add(
+                pl.add(pl.sub(maximum, pl.sub(correction_hi, correction_carried)),
+                       pl.sub(pl.neg(next_max), correction_carried)),
+                pl.sub(maximum_low, next_low))
+            correction_base = pl.exp(correction_hi)
+            correction = pl.add(correction_base, pl.mul(correction_base, correction_low))
+            centered_hi = pl.row_expand_sub(scores, pl.reshape(next_max, [M_TILE, 1]))
+            centered_carried = pl.sub(centered_hi, scores)
+            centered_low = pl.add(
+                pl.add(pl.sub(scores, pl.sub(centered_hi, centered_carried)),
+                       pl.sub(pl.neg(pl.reshape(next_max, [M_TILE, 1])), centered_carried)),
+                pl.row_expand_sub(score_low, pl.reshape(next_low, [M_TILE, 1])))
+            probability_base = pl.exp(centered_hi)
             probabilities = pl.col_expand_mul(
-                pl.exp(pl.row_expand_sub(scores, pl.reshape(next_max, [M_TILE, 1]))), valid)
+                pl.add(probability_base, pl.mul(probability_base, centered_low)), valid)
             denominator = pl.add(pl.mul(denominator, correction),
                                  pl.reshape(pl.row_sum(probabilities), [1, M_TILE]))
             weights = pl.cast(probabilities, pl.BF16, mode="rint")
             weighted = pl.matmul(weights, kv)
             numerator = pl.add(pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])), weighted)
             maximum = next_max
+            maximum_low = next_low
         sinks = pl.reshape(sink[h:h + M_TILE], [1, M_TILE])
-        final_max = pl.maximum(maximum, sinks)
-        correction = pl.exp(pl.sub(maximum, final_max))
-        denominator = pl.add(pl.mul(denominator, correction), pl.exp(pl.sub(sinks, final_max)))
+        choose_sink = pl.minimum(
+            pl.add(pl.cmp(sinks, maximum, cmp_type=4),
+                   pl.mul(pl.cmp(sinks, maximum, cmp_type=0),
+                          pl.cmp(pl.neg(maximum_low), 0.0, cmp_type=4))), 1.0)
+        choose_old = pl.sub(1.0, choose_sink)
+        final_max = pl.add(pl.mul(choose_sink, sinks), pl.mul(choose_old, maximum))
+        final_low = pl.mul(choose_old, maximum_low)
+        correction_hi = pl.sub(maximum, final_max)
+        correction_carried = pl.sub(correction_hi, maximum)
+        correction_low = pl.add(
+            pl.add(pl.sub(maximum, pl.sub(correction_hi, correction_carried)),
+                   pl.sub(pl.neg(final_max), correction_carried)),
+            pl.sub(maximum_low, final_low))
+        correction_base = pl.exp(correction_hi)
+        correction = pl.add(correction_base, pl.mul(correction_base, correction_low))
+        sink_hi = pl.sub(sinks, final_max)
+        sink_carried = pl.sub(sink_hi, sinks)
+        sink_low = pl.sub(pl.sub(sinks, pl.sub(sink_hi, sink_carried)),
+                          pl.add(final_max, sink_carried))
+        sink_base = pl.exp(sink_hi)
+        sink_exp = pl.add(sink_base, pl.mul(sink_base, pl.sub(sink_low, final_low)))
+        denominator = pl.add(pl.mul(denominator, correction), sink_exp)
         result = pl.row_expand_mul(numerator, pl.reshape(pl.div(correction, denominator), [M_TILE, 1]))
         oflat[q0:q0 + M_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
     return output
