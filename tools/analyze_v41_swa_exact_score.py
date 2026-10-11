@@ -50,6 +50,20 @@ def replay(query, keys, indices, sink, score_dtype, online_dtype, numerator_dtyp
     return (numerator * factor.to(numerator_dtype)).bfloat16()
 
 
+def replay_compensated_logits(query, keys, indices, sink):
+    exact = (keys.double() @ query.double()) * query.numel() ** -0.5
+    exact[indices < 0] = -torch.inf
+    maximum = torch.maximum(exact.max(), sink.double())
+    centered = exact - maximum
+    centered_hi = centered.float()
+    centered_lo = (centered - centered_hi.double()).float()
+    probability_hi = centered_hi.exp()
+    probabilities = probability_hi + probability_hi * centered_lo
+    denominator = probabilities.sum() + (sink.double() - maximum).exp().float()
+    numerator = probabilities.bfloat16().float() @ keys.float()
+    return (numerator / denominator).bfloat16()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("capture")
@@ -90,6 +104,15 @@ def main():
               f"round_correction={round_correction} fp32_factor={fp32_factor} "
               f"fixed={fixed}/{int(changed.sum())} "
               f"introduced={introduced}", flush=True)
+
+    fixed = introduced = 0
+    for token, head in pairs:
+        candidate = replay_compensated_logits(query[token, head], data["selected"][token],
+                                              data["indices"][token], data["sink"][head])
+        mismatch = changed[token, head]
+        fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
+        introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
+    print(f"compensated_logits fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
 
 if __name__ == "__main__":
     main()
