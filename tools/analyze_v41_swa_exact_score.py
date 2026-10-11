@@ -132,10 +132,12 @@ def replay_fp32_pair(query, keys, indices, sink, compensated_qk=True):
     return (numerator * (correction / denominator)).bfloat16()
 
 
-def replay_compensated_logits(query, keys, indices, sink, use_compensated_dot=False):
+def replay_compensated_logits(query, keys, indices, sink, use_compensated_dot=False,
+                              wide_online=False):
+    online_dtype = torch.float64 if wide_online else torch.float32
     maximum = torch.tensor(-1e30, dtype=torch.float64)
-    denominator = torch.tensor(0.0, dtype=torch.float32)
-    numerator = torch.zeros_like(query, dtype=torch.float32)
+    denominator = torch.tensor(0.0, dtype=online_dtype)
+    numerator = torch.zeros_like(query, dtype=online_dtype)
     for start in (0, 64):
         selected = keys[start:start + 64]
         dot = (sum(part.double() for part in compensated_dot(query, selected))
@@ -143,19 +145,21 @@ def replay_compensated_logits(query, keys, indices, sink, use_compensated_dot=Fa
         exact = dot * query.numel() ** -0.5
         exact[indices[start:start + 64] < 0] = -torch.inf
         next_max = torch.maximum(maximum, exact.max())
-        correction = (maximum - next_max).exp().float()
+        correction = (maximum - next_max).exp().to(online_dtype)
         centered = exact - next_max
         centered_hi = centered.float()
         centered_lo = torch.where(torch.isfinite(centered),
                                   (centered - centered_hi.double()).float(), 0.0)
         probability_hi = centered_hi.exp()
-        probabilities = probability_hi + probability_hi * centered_lo
+        probabilities = ((centered.exp() if wide_online else
+                          probability_hi + probability_hi * centered_lo))
         denominator = denominator * correction + probabilities.sum()
-        numerator = numerator * correction + probabilities.bfloat16().float() @ selected.float()
+        numerator = (numerator * correction +
+                     probabilities.bfloat16().to(online_dtype) @ selected.to(online_dtype))
         maximum = next_max
     final_max = torch.maximum(maximum, sink.double())
-    correction = (maximum - final_max).exp().float()
-    denominator = denominator * correction + (sink.double() - final_max).exp().float()
+    correction = (maximum - final_max).exp().to(online_dtype)
+    denominator = denominator * correction + (sink.double() - final_max).exp().to(online_dtype)
     return (numerator * (correction / denominator)).bfloat16()
 
 
@@ -201,16 +205,19 @@ def main():
               f"introduced={introduced}", flush=True)
 
     for use_compensated_dot in (False, True):
-        fixed = introduced = 0
-        for token, head in pairs:
-            candidate = replay_compensated_logits(
-                query[token, head], data["selected"][token], data["indices"][token],
-                data["sink"][head], use_compensated_dot=use_compensated_dot)
-            mismatch = changed[token, head]
-            fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
-            introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
-        print(f"compensated_logits dot_fp32_pair={use_compensated_dot} "
-              f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
+        for wide_online in (False, True):
+            fixed = introduced = 0
+            for token, head in pairs:
+                candidate = replay_compensated_logits(
+                    query[token, head], data["selected"][token], data["indices"][token],
+                    data["sink"][head], use_compensated_dot=use_compensated_dot,
+                    wide_online=wide_online)
+                mismatch = changed[token, head]
+                fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
+                introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
+            print(f"compensated_logits dot_fp32_pair={use_compensated_dot} "
+                  f"wide_online={wide_online} fixed={fixed}/{int(changed.sum())} "
+                  f"introduced={introduced}", flush=True)
 
     for compensated_qk in (False, True):
         fixed = introduced = 0
