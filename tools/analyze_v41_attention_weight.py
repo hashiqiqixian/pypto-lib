@@ -66,6 +66,25 @@ def main():
             introduced = ((actual == expected) & (trial != actual)).sum().item()
             candidates.append((mismatch, -fixed, introduced, index, direction,
                                float(weight), float(altered), float(factors[index])))
+    best_index = min(candidates)[3]
+    if best_index < 64:
+        keys_block = keys[:64]
+        block_indices = indices[:64]
+    else:
+        keys_block = keys[64:]
+        block_indices = indices[64:]
+    for dtype in (torch.float32, torch.float64):
+        scores = (keys_block.to(dtype) @ q.to(dtype)) * (512 ** -0.5)
+        scores[block_indices < 0] = -torch.inf
+        probability = (scores - scores.max()).exp()
+        local_index = best_index % 64
+        value = float(probability[local_index])
+        low = float((weights[best_index].view(torch.int16).to(torch.int32) - 1)
+                    .to(torch.int16).view(torch.bfloat16))
+        high = float(weights[best_index])
+        print(f"best_index={best_index} dtype={dtype} score={float(scores[local_index]):.12g} "
+              f"maximum={float(scores.max()):.12g} probability={value:.12g} "
+              f"bf16_midpoint={(low + high) / 2:.12g}")
     for item in sorted(candidates)[:12]:
         print("mismatch=%d fixed=%d introduced=%d index=%d direction=%+d "
               "weight=%.9g altered=%.9g factor=%.9g" %
