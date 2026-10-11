@@ -62,7 +62,8 @@ def replay_compensated_logits(query, keys, indices, sink):
         correction = (maximum - next_max).exp().float()
         centered = exact - next_max
         centered_hi = centered.float()
-        centered_lo = (centered - centered_hi.double()).float()
+        centered_lo = torch.where(torch.isfinite(centered),
+                                  (centered - centered_hi.double()).float(), 0.0)
         probability_hi = centered_hi.exp()
         probabilities = probability_hi + probability_hi * centered_lo
         denominator = denominator * correction + probabilities.sum()
