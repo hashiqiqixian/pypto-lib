@@ -21,7 +21,18 @@ def main():
     parser.add_argument("--row", type=int, default=74)
     parser.add_argument("--head", type=int, default=2)
     args = parser.parse_args()
-    data = torch.load(args.capture, map_location="cpu", weights_only=True)
+    if args.capture.endswith(".npz"):
+        import numpy as np
+
+        with np.load(args.capture) as capture:
+            data = {
+                name: torch.from_numpy(capture[name].copy()).to(torch.bfloat16)
+                if name in {"actual", "expected", "q", "selected"}
+                else torch.from_numpy(capture[name].copy())
+                for name in capture.files
+            }
+    else:
+        data = torch.load(args.capture, map_location="cpu", weights_only=True)
     row, head = args.row, args.head
     q = data["q"][row].reshape(16, 512)[head].double()
     keys = data["selected"][row].double()
