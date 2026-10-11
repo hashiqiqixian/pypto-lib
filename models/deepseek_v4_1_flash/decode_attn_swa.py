@@ -60,7 +60,7 @@ from models.deepseek_v4_1_flash.config import (
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
 
 # Tiling.
-M_TILE = 16
+M_TILE = 8
 
 
 @pl.jit.inline
