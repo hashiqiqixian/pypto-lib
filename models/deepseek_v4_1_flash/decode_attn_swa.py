@@ -68,6 +68,7 @@ SOFTMAX_SCALE_LOW = SOFTMAX_SCALE_HI - SOFTMAX_SCALE_HIGH
 
 # Tiling.
 M_TILE = 16
+SCORE_K_TILE = 32
 
 
 @pl.jit.inline
@@ -170,7 +171,17 @@ def attend_window(
             k0 = t * 128 + part * 64
             q = qflat[q0:q0 + M_TILE, :]
             kv = kflat[k0:k0 + 64, :]
-            raw = pl.matmul(q, kv, b_trans=True)
+            raw = pl.full([M_TILE, 64], dtype=pl.FP32, value=0.0)
+            dot_low = pl.full([M_TILE, 64], dtype=pl.FP32, value=0.0)
+            for k_part in pl.range(HEAD_DIM // SCORE_K_TILE):
+                q_part = q[:, k_part * SCORE_K_TILE:(k_part + 1) * SCORE_K_TILE]
+                kv_part = kv[:, k_part * SCORE_K_TILE:(k_part + 1) * SCORE_K_TILE]
+                partial = pl.matmul(q_part, kv_part, b_trans=True)
+                summed = pl.add(raw, partial)
+                carried = pl.sub(summed, raw)
+                dot_low = pl.add(dot_low, pl.add(pl.sub(raw, pl.sub(summed, carried)),
+                                                  pl.sub(partial, carried)))
+                raw = summed
             scores = pl.mul(raw, SOFTMAX_SCALE_HI)
             raw_split = pl.mul(raw, 4097.0)
             raw_high = pl.sub(raw_split, pl.sub(raw_split, raw))
@@ -180,7 +191,8 @@ def attend_window(
                     pl.add(pl.sub(pl.mul(raw_high, SOFTMAX_SCALE_HIGH), scores),
                            pl.mul(raw_high, SOFTMAX_SCALE_LOW)),
                     pl.mul(raw_low, SOFTMAX_SCALE_HIGH)),
-                pl.add(pl.mul(raw_low, SOFTMAX_SCALE_LOW), pl.mul(raw, SOFTMAX_SCALE_LO)))
+                pl.add(pl.add(pl.mul(raw_low, SOFTMAX_SCALE_LOW), pl.mul(raw, SOFTMAX_SCALE_LO)),
+                       pl.mul(dot_low, SOFTMAX_SCALE_HI)))
             scaled = pl.add(scores, score_low)
             carried = pl.sub(scaled, scores)
             score_low = pl.add(pl.sub(scores, pl.sub(scaled, carried)),
