@@ -174,7 +174,7 @@ def attend_window(
                 pl.exp(pl.row_expand_sub(scores, pl.reshape(next_max, [M_TILE, 1]))), valid)
             denominator = pl.add(pl.mul(denominator, correction),
                                  pl.reshape(pl.row_sum(probabilities), [1, M_TILE]))
-            weights = pl.cast(probabilities, pl.BF16, mode="round")
+            weights = pl.cast(probabilities, pl.BF16, mode="rint")
             weighted = pl.matmul(weights, kv)
             numerator = pl.add(pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])), weighted)
             maximum = next_max
