@@ -79,6 +79,20 @@ def main():
             largest = torch.topk(row_bad, min(8, row_bad.numel()))
             print(f"x_next rank={rank} worst_rows="
                   f"{list(zip(largest.indices.tolist(), [round(v, 6) for v in largest.values.tolist()]))}")
+            attention_delta = (data["actual_attention_output"][rank].float() -
+                               data["expected_attention_output"][rank].float())
+            attention_row_error = attention_delta.norm(dim=-1) / data[
+                "expected_attention_output"][rank].float().norm(dim=-1).clamp_min(1e-12)
+            actual_payload, _ = official_quantize(actual_mixed[rank])
+            expected_payload, _ = official_quantize(expected_mixed[rank])
+            payload_row_changes = (actual_payload.view(torch.uint8) !=
+                                   expected_payload.view(torch.uint8)).reshape(actual.shape[0], -1).sum(-1)
+            top = torch.topk(row_bad, min(8, row_bad.numel())).indices
+            causes = [(int(row), round(float(attention_row_error[row]), 7),
+                       int(payload_row_changes[row]), round(float(row_bad[row]), 6))
+                      for row in top]
+            print(f"x_next rank={rank} worst_row_causes={causes} "
+                  "(row, attention_rel_l2, fp8_payload_changes, x_next_bad_ratio)")
     report("x_mixed using actual hidden, expected pre-mix", data["actual_x_mixed"],
            golden_mhc_pre(actual_h, expected_p))
     report("x_mixed using expected hidden, actual pre-mix", data["actual_x_mixed"],
