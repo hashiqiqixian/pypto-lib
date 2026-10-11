@@ -155,10 +155,13 @@ def attend_window(
         t = block // (LOCAL_H // M_TILE)
         h = block % (LOCAL_H // M_TILE) * M_TILE
         q0 = t * LOCAL_H + h
-        maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
-        denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
-        numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-        for part in pl.range(2):
+        first_max = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
+        first_sum = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
+        first_weighted = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+        second_max = first_max
+        second_sum = first_sum
+        second_weighted = first_weighted
+        for part in pl.unroll(2):
             k0 = t * 128 + part * 64
             kv = kflat[k0:k0 + 64, :]
             scores = pl.full([M_TILE, 64], dtype=pl.FP32, value=0.0)
@@ -177,21 +180,32 @@ def attend_window(
             valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
             bias = pl.mul(pl.sub(valid, 1.0), 1e30)
             scores = pl.col_expand_add(scores, bias)
-            next_max = pl.maximum(maximum, pl.reshape(pl.row_max(scores), [1, M_TILE]))
-            correction = pl.exp(pl.sub(maximum, next_max))
+            local_max = pl.reshape(pl.row_max(scores), [1, M_TILE])
             probabilities = pl.col_expand_mul(
-                pl.exp(pl.row_expand_sub(scores, pl.reshape(next_max, [M_TILE, 1]))), valid)
-            denominator = pl.add(pl.mul(denominator, correction),
-                                 pl.reshape(pl.row_sum(probabilities), [1, M_TILE]))
+                pl.exp(pl.row_expand_sub(scores, pl.reshape(local_max, [M_TILE, 1]))), valid)
+            local_sum = pl.reshape(pl.row_sum(probabilities), [1, M_TILE])
             weights = pl.cast(probabilities, pl.BF16, mode="rint")
-            weighted = pl.matmul(weights, kv)
-            numerator = pl.add(pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])), weighted)
-            maximum = next_max
+            local_weighted = pl.matmul(weights, kv)
+            if part == 0:
+                first_max = local_max
+                first_sum = local_sum
+                first_weighted = local_weighted
+            else:
+                second_max = local_max
+                second_sum = local_sum
+                second_weighted = local_weighted
         sinks = pl.reshape(sink[h:h + M_TILE], [1, M_TILE])
-        final_max = pl.maximum(maximum, sinks)
-        correction = pl.exp(pl.sub(maximum, final_max))
-        denominator = pl.add(pl.mul(denominator, correction), pl.exp(pl.sub(sinks, final_max)))
-        result = pl.row_expand_mul(numerator, pl.reshape(pl.div(correction, denominator), [M_TILE, 1]))
+        final_max = pl.maximum(pl.maximum(first_max, second_max), sinks)
+        first_scale = pl.exp(pl.sub(first_max, final_max))
+        second_scale = pl.exp(pl.sub(second_max, final_max))
+        denominator = pl.add(pl.exp(pl.sub(sinks, final_max)),
+                             pl.add(pl.mul(first_sum, first_scale), pl.mul(second_sum, second_scale)))
+        numerator = pl.add(
+            pl.row_expand_mul(first_weighted, pl.reshape(first_scale, [M_TILE, 1])),
+            pl.row_expand_mul(second_weighted, pl.reshape(second_scale, [M_TILE, 1])),
+        )
+        one = pl.full([1, M_TILE], dtype=pl.FP32, value=1.0)
+        result = pl.row_expand_mul(numerator, pl.reshape(pl.div(one, denominator), [M_TILE, 1]))
         oflat[q0:q0 + M_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
     return output
 
