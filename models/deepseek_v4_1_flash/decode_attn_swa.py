@@ -185,7 +185,7 @@ def attend_window(
                 pl.exp(pl.row_expand_sub(scores, pl.reshape(local_max, [M_TILE, 1]))), valid)
             local_sum = pl.reshape(pl.row_sum(probabilities), [1, M_TILE])
             weights = pl.cast(probabilities, pl.BF16, mode="rint")
-            local_weighted = pl.matmul(weights, kv)
+            local_weighted = pl.matmul(weights, kv, out_dtype=pl.FP32)
             if part == 0:
                 first_max = local_max
                 first_sum = local_sum
