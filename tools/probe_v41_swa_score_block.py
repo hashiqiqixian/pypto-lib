@@ -28,6 +28,8 @@ def score_block(
     centered: pl.Out[pl.Tensor[[M_TILE, 64], pl.FP32]],
     probabilities: pl.Out[pl.Tensor[[M_TILE, 64], pl.FP32]],
     weights: pl.Out[pl.Tensor[[M_TILE, 64], pl.BF16]],
+    fused_probabilities: pl.Out[pl.Tensor[[M_TILE, 64], pl.FP32]],
+    fused_weights: pl.Out[pl.Tensor[[M_TILE, 64], pl.BF16]],
 ):
     for _ in pl.spmd(1):
         raw = pl.mul(pl.matmul(q, keys, b_trans=True), SOFTMAX_SCALE)
@@ -36,12 +38,15 @@ def score_block(
         maximum = pl.reshape(pl.row_max(masked), [M_TILE, 1])
         shifted = pl.row_expand_sub(masked, maximum)
         probability = pl.col_expand_mul(pl.exp(shifted), valid)
+        fused_probability = pl.col_expand_mul(pl.row_expand_expdif(masked, maximum), valid)
         scores[:, :] = raw
         maximums[:, :] = maximum
         centered[:, :] = shifted
         probabilities[:, :] = probability
         weights[:, :] = pl.cast(probability, pl.BF16, mode="rint")
-    return scores, maximums, centered, probabilities, weights
+        fused_probabilities[:, :] = fused_probability
+        fused_weights[:, :] = pl.cast(fused_probability, pl.BF16, mode="rint")
+    return scores, maximums, centered, probabilities, weights, fused_probabilities, fused_weights
 
 
 def main():
@@ -66,7 +71,9 @@ def main():
               TensorSpec("maximums", [M_TILE, 1], torch.float32),
               TensorSpec("centered", [M_TILE, 64], torch.float32),
               TensorSpec("probabilities", [M_TILE, 64], torch.float32),
-              TensorSpec("weights", [M_TILE, 64], torch.bfloat16)]
+              TensorSpec("weights", [M_TILE, 64], torch.bfloat16),
+              TensorSpec("fused_probabilities", [M_TILE, 64], torch.float32),
+              TensorSpec("fused_weights", [M_TILE, 64], torch.bfloat16)]
 
     def golden(values):
         exact = values["q"].double() @ values["keys"].double().T * SOFTMAX_SCALE
@@ -79,6 +86,8 @@ def main():
         probability = shifted.exp()
         values["probabilities"].copy_(probability.float())
         values["weights"].copy_(probability.bfloat16())
+        values["fused_probabilities"].copy_(probability.float())
+        values["fused_weights"].copy_(probability.bfloat16())
 
     def compare(name):
         def check(actual, expected, **_):
@@ -91,7 +100,8 @@ def main():
     result = run(score_block, specs, golden_fn=golden,
                  config=dict(platform="a5", device_id=args.device),
                  compare_fn={name: compare(name) for name in
-                             ("scores", "maximums", "centered", "probabilities", "weights")})
+                             ("scores", "maximums", "centered", "probabilities", "weights",
+                              "fused_probabilities", "fused_weights")})
     if not result.passed:
         raise SystemExit(result.error or 1)
 
