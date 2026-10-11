@@ -160,9 +160,15 @@ def attend_window(
         numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
         for part in pl.range(2):
             k0 = t * 128 + part * 64
-            q = qflat[q0:q0 + M_TILE, :]
             kv = kflat[k0:k0 + 64, :]
-            scores = pl.matmul(q, kv, b_trans=True)
+            q_first = qflat[q0:q0 + M_TILE, :256]
+            q_second = qflat[q0:q0 + M_TILE, 256:]
+            kv_first = kflat[k0:k0 + 64, :256]
+            kv_second = kflat[k0:k0 + 64, 256:]
+            scores = pl.add(
+                pl.matmul(q_first, kv_first, b_trans=True),
+                pl.matmul(q_second, kv_second, b_trans=True),
+            )
             scores = pl.mul(scores, SOFTMAX_SCALE)
             idx = pl.cast(indices[t:t + 1, part * 64:part * 64 + 64], pl.FP32)
             valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
