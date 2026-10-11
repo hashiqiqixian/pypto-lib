@@ -1,0 +1,76 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Identify a BF16 attention-weight boundary in a captured SWA head."""
+
+import argparse
+
+import torch
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("capture")
+    parser.add_argument("--row", type=int, default=74)
+    parser.add_argument("--head", type=int, default=2)
+    args = parser.parse_args()
+    data = torch.load(args.capture, map_location="cpu", weights_only=True)
+    row, head = args.row, args.head
+    q = data["q"][row].reshape(16, 512)[head].double()
+    keys = data["selected"][row].double()
+    indices = data["indices"][row]
+    actual = data["actual"][row].reshape(16, 512)[head]
+    expected = data["expected"][row].reshape(16, 512)[head]
+    maximum = torch.tensor(-1e30, dtype=torch.float64)
+    denominator = torch.tensor(0.0, dtype=torch.float64)
+    numerator = torch.zeros(512, dtype=torch.float64)
+    weights = []
+    factors = []
+    for start in (0, 64):
+        scores = (keys[start:start + 64] @ q) * (512 ** -0.5)
+        scores[indices[start:start + 64] < 0] = -torch.inf
+        next_max = torch.maximum(maximum, scores.max())
+        correction = (maximum - next_max).exp()
+        probability = (scores - next_max).exp().bfloat16()
+        denominator = denominator * correction + (scores - next_max).exp().sum()
+        numerator = numerator * correction + probability.double() @ keys[start:start + 64]
+        if start:
+            factors[:64] = [factor * correction for factor in factors[:64]]
+        weights.append(probability)
+        factors.extend([torch.tensor(1.0, dtype=torch.float64)] * 64)
+        maximum = next_max
+    sink = data["sink"][head].double()
+    final_max = torch.maximum(maximum, sink)
+    correction = (maximum - final_max).exp()
+    denominator = denominator * correction + (sink - final_max).exp()
+    numerator *= correction
+    factors = torch.stack(factors) * (correction / denominator)
+    base = numerator / denominator
+    print(f"row={row} head={head} original_differences={(actual != expected).sum().item()} "
+          f"replay_differences={(base.bfloat16() != expected).sum().item()}")
+    candidates = []
+    weights = torch.cat(weights)
+    for index in torch.nonzero(indices >= 0).flatten().tolist():
+        weight = weights[index]
+        for direction in (-1, 1):
+            bits = weight.view(torch.int16).to(torch.int32) + direction
+            altered = bits.to(torch.int16).view(torch.bfloat16).double()
+            trial = (base + (altered - weight.double()) * factors[index] * keys[index]).bfloat16()
+            mismatch = (trial != actual).sum().item()
+            fixed = ((actual != expected) & (trial == actual)).sum().item()
+            introduced = ((actual == expected) & (trial != actual)).sum().item()
+            candidates.append((mismatch, -fixed, introduced, index, direction,
+                               float(weight), float(altered), float(factors[index])))
+    for item in sorted(candidates)[:12]:
+        print("mismatch=%d fixed=%d introduced=%d index=%d direction=%+d "
+              "weight=%.9g altered=%.9g factor=%.9g" %
+              (item[0], -item[1], *item[2:]))
+
+
+if __name__ == "__main__":
+    main()
