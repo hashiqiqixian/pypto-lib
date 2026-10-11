@@ -12,6 +12,8 @@ import argparse
 
 import torch
 
+from analyze_v41_swa_compensation import scores as projected_scores
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -85,6 +87,13 @@ def main():
         print(f"best_index={best_index} dtype={dtype} score={float(scores[local_index]):.12g} "
               f"maximum={float(scores.max()):.12g} probability={value:.12g} "
               f"bf16_midpoint={(low + high) / 2:.12g}")
+    for chunk in (0, 256, 128, 64, 32, -1, -3):
+        scores = projected_scores(q, keys_block, chunk) * (512 ** -0.5)
+        scores[block_indices < 0] = -torch.inf
+        probability = (scores - scores.max()).exp()[local_index]
+        print(f"chunk={chunk:3} score={float(scores[local_index]):.12g} "
+              f"probability={float(probability):.12g} "
+              f"bf16={float(probability.bfloat16()):.12g}")
     for item in sorted(candidates)[:12]:
         print("mismatch=%d fixed=%d introduced=%d index=%d direction=%+d "
               "weight=%.9g altered=%.9g factor=%.9g" %
