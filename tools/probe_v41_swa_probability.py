@@ -15,6 +15,7 @@ import torch
 
 from golden import TensorSpec, run
 from models.deepseek_v4_1_flash import config as C
+from models.deepseek_v4_1_flash.config import HEAD_DIM
 
 
 @pl.jit
@@ -29,7 +30,7 @@ def probe_probability(
     with pl.at(level=pl.Level.CORE_GROUP):
         q_first = pl.reshape(q[:, :16 * 256], [16, 256])
         q_second = pl.reshape(q[:, 16 * 256:], [16, 256])
-        kv = pl.reshape(selected[:, :64, :], [64, C.HEAD_DIM])
+        kv = pl.reshape(selected[:, :64, :], [64, HEAD_DIM])
         kv_first = kv[:, :256]
         kv_second = kv[:, 256:]
         scores = pl.add(
