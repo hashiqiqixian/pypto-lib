@@ -51,17 +51,27 @@ def replay(query, keys, indices, sink, score_dtype, online_dtype, numerator_dtyp
 
 
 def replay_compensated_logits(query, keys, indices, sink):
-    exact = (keys.double() @ query.double()) * query.numel() ** -0.5
-    exact[indices < 0] = -torch.inf
-    maximum = torch.maximum(exact.max(), sink.double())
-    centered = exact - maximum
-    centered_hi = centered.float()
-    centered_lo = (centered - centered_hi.double()).float()
-    probability_hi = centered_hi.exp()
-    probabilities = probability_hi + probability_hi * centered_lo
-    denominator = probabilities.sum() + (sink.double() - maximum).exp().float()
-    numerator = probabilities.bfloat16().float() @ keys.float()
-    return (numerator / denominator).bfloat16()
+    maximum = torch.tensor(-1e30, dtype=torch.float64)
+    denominator = torch.tensor(0.0, dtype=torch.float32)
+    numerator = torch.zeros_like(query, dtype=torch.float32)
+    for start in (0, 64):
+        selected = keys[start:start + 64]
+        exact = (selected.double() @ query.double()) * query.numel() ** -0.5
+        exact[indices[start:start + 64] < 0] = -torch.inf
+        next_max = torch.maximum(maximum, exact.max())
+        correction = (maximum - next_max).exp().float()
+        centered = exact - next_max
+        centered_hi = centered.float()
+        centered_lo = (centered - centered_hi.double()).float()
+        probability_hi = centered_hi.exp()
+        probabilities = probability_hi + probability_hi * centered_lo
+        denominator = denominator * correction + probabilities.sum()
+        numerator = numerator * correction + probabilities.bfloat16().float() @ selected.float()
+        maximum = next_max
+    final_max = torch.maximum(maximum, sink.double())
+    correction = (maximum - final_max).exp().float()
+    denominator = denominator * correction + (sink.double() - final_max).exp().float()
+    return (numerator * (correction / denominator)).bfloat16()
 
 
 def main():
