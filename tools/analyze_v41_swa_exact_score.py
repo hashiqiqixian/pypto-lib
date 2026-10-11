@@ -85,7 +85,7 @@ def exp_pair(high, low):
     return base + base * low
 
 
-def replay_fp32_pair(query, keys, indices, sink):
+def replay_fp32_pair(query, keys, indices, sink, compensated_qk=True):
     scale_hi = torch.tensor(query.numel() ** -0.5, dtype=torch.float32)
     scale_lo = torch.tensor(query.numel() ** -0.5 - float(scale_hi), dtype=torch.float32)
     maximum_hi = torch.tensor(-1e30, dtype=torch.float32)
@@ -94,7 +94,11 @@ def replay_fp32_pair(query, keys, indices, sink):
     numerator = torch.zeros_like(query, dtype=torch.float32)
     for start in (0, 64):
         selected = keys[start:start + 64]
-        dot_hi, dot_lo = compensated_dot(query, selected)
+        if compensated_qk:
+            dot_hi, dot_lo = compensated_dot(query, selected)
+        else:
+            dot_hi = (selected.double() @ query.double()).float()
+            dot_lo = torch.zeros_like(dot_hi)
         product = dot_hi * scale_hi
         product_lo = (split_product_error(dot_hi, scale_hi, product) +
                       dot_hi * scale_lo + dot_lo * scale_hi + dot_lo * scale_lo)
@@ -208,14 +212,17 @@ def main():
         print(f"compensated_logits dot_fp32_pair={use_compensated_dot} "
               f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
 
-    fixed = introduced = 0
-    for token, head in pairs:
-        candidate = replay_fp32_pair(query[token, head], data["selected"][token],
-                                     data["indices"][token], data["sink"][head])
-        mismatch = changed[token, head]
-        fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
-        introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
-    print(f"fp32_pair_pipeline fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
+    for compensated_qk in (False, True):
+        fixed = introduced = 0
+        for token, head in pairs:
+            candidate = replay_fp32_pair(query[token, head], data["selected"][token],
+                                         data["indices"][token], data["sink"][head],
+                                         compensated_qk=compensated_qk)
+            mismatch = changed[token, head]
+            fixed += int((candidate[mismatch] == expected[token, head][mismatch]).sum())
+            introduced += int((candidate[~mismatch] != expected[token, head][~mismatch]).sum())
+        print(f"fp32_pair_pipeline compensated_qk={compensated_qk} "
+              f"fixed={fixed}/{int(changed.sum())} introduced={introduced}", flush=True)
 
 if __name__ == "__main__":
     main()
