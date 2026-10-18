@@ -54,6 +54,9 @@ if C.N_LOCAL_EXPERTS <= 0 or C.EP_SIZE * C.N_LOCAL_EXPERTS % 16:
     _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
 _MAX_CHUNK_TOKENS = 4096
 CAPACITY = _shape_options.capacity
+_diagnostic_layers = int(os.environ.get("PYPTO_V41_PREFILL_DIAGNOSTIC_LAYERS", "40"))
+if not 1 <= _diagnostic_layers <= 40:
+    _shape_parser.error("PYPTO_V41_PREFILL_DIAGNOSTIC_LAYERS must be between 1 and 40")
 if C.TP_SIZE != 1 or _shape_options.dp not in (None, C.EP_SIZE):
     _shape_parser.error("prefill requires TP1 with DP equal to EP")
 if not 16 <= CAPACITY <= _MAX_CHUNK_TOKENS or CAPACITY % 16:
@@ -506,7 +509,7 @@ def l2_prefill_fwd(
     slab_mixed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     slab_rows = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
     moe_ready = pl.system.task_dummy(deps=[])
-    for layer in pl.range(40):
+    for layer in pl.range(_diagnostic_layers):
         stage = layer // 20
         active = pl.read(counts, [stage])
         current_slot = (2 * stage + layer % 2) * CAPACITY
@@ -722,8 +725,9 @@ def l2_prefill_fwd(
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
             moe_ready, active, rank, layer + 1,
         )
-    final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [2 * CAPACITY, 0, 0])
-    final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [2 * CAPACITY, 0])
+    final_slot = (2 * ((_diagnostic_layers - 1) // 20) + _diagnostic_layers % 2) * CAPACITY
+    final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [final_slot, 0, 0])
+    final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [final_slot, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
     output_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
     gather_rows(source_hidden, identity_rows, output_hidden, gather_ready)
