@@ -496,8 +496,6 @@ def l2_prefill_fwd(
     gather_ready = pl.system.task_dummy(deps=[])
     pack_x_hc(embedding_ids, embedding, initial_hidden)
     gather_rows(initial_pre, identity_rows, initial_mix, gather_ready)
-    topk_indices = pl.create_tensor([CAPACITY, INDEX_TOPK], dtype=pl.INT32)
-    candidate_mask = pl.create_tensor([CAPACITY, pl.tensor.dim(compressed_cache, 1) * 128], dtype=pl.UINT8)
     # Keep stage handoff buffers outside attention scopes and reuse bounded
     # MoE slabs across all layers and rounds.
     attn_hidden = pl.create_tensor([CAPACITY, HC_MULT, D], dtype=pl.FP32)
@@ -670,6 +668,8 @@ def l2_prefill_fwd(
                 gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready)
                 gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready)
         with pl.scope():
+            topk_indices = pl.create_tensor([CAPACITY, INDEX_TOPK], dtype=pl.INT32)
+            candidate_mask = pl.create_tensor([CAPACITY, pl.tensor.dim(compressed_cache, 1) * 128], dtype=pl.UINT8)
             attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
             attn_residual = pl.create_tensor([CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
             collapsed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
