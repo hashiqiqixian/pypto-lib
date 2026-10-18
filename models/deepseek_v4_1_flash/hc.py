@@ -141,25 +141,31 @@ def hc_mixes(
         total = pl.add(pl.add(total, partial1), pl.add(partial2, partial3))
         pre_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
         post_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
+        pre_base = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
+        post_base = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
         for j in pl.unroll(HC_PAD):
-            pre_value_j = pl.tile.read(total, [0, j]) * inv_scalar * scale0 + pl.read(base, [j])
-            post_value_j = (
-                pl.tile.read(total, [0, HC_MULT + j % HC_MULT]) * inv_scalar * scale1
-                + pl.read(base, [HC_MULT + j % HC_MULT])
-            )
+            pre_value_j = pl.tile.read(total, [0, j]) * inv_scalar * scale0
+            post_value_j = pl.tile.read(total, [0, HC_MULT + j % HC_MULT]) * inv_scalar * scale1
             pl.tile.write(pre_logits, [0, j], pre_value_j)
             pl.tile.write(post_logits, [0, j], post_value_j)
+            pl.tile.write(pre_base, [0, j], pl.read(base, [j]))
+            pl.tile.write(post_base, [0, j], pl.read(base, [HC_MULT + j % HC_MULT]))
+        pre_logits = pl.add(pre_logits, pre_base)
+        post_logits = pl.add(post_logits, post_base)
         pre_value = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
         post_value = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
         pl.store(pl.set_validshape(pre_value, valid_rows, HC_MULT), [t0, 0], pre_mix)
         pl.store(pl.set_validshape(post_value, valid_rows, HC_MULT), [t0, 0], post_mix)
         comb_offset = HC_MULT * 2
         logits = pl.tile.full([HC_PAD, HC_PAD], dtype=pl.FP32, value=0.0)
+        logits_base = pl.tile.full([HC_PAD, HC_PAD], dtype=pl.FP32, value=0.0)
         for i in pl.unroll(HC_PAD):
             for j in pl.unroll(HC_PAD):
                 lane = comb_offset + (i % HC_MULT) * HC_MULT + j % HC_MULT
-                value = pl.tile.read(total, [0, lane]) * inv_scalar * scale2 + pl.read(base, [lane])
+                value = pl.tile.read(total, [0, lane]) * inv_scalar * scale2
                 pl.tile.write(logits, [i, j], value)
+                pl.tile.write(logits_base, [i, j], pl.read(base, [lane]))
+        logits = pl.add(logits, logits_base)
         row_tmp = pl.create_tile([HC_PAD, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
         rows = pl.exp(pl.row_expand_sub(logits, pl.row_max(logits, row_tmp)))
         rows = pl.add(pl.row_expand_div(rows, pl.mul(pl.row_sum(rows, row_tmp), 0.5)), HC_EPS)

@@ -372,7 +372,7 @@ def expert_shared(
                             )
                     y_bf16 = pl.cast(y_acc, target_type=pl.BF16, mode="rint")
                     y_valid = pl.set_validshape(y_bf16, SH_VALID_M, D_OUT_TILE)
-                    sh = pl.store(y_valid, [ts0, d0], sh)
+                    pl.store(y_valid, [ts0, d0], sh)
 
     return sh
 
