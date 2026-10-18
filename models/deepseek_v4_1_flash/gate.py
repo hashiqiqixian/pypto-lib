@@ -41,7 +41,7 @@ T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 GATE_D_TILE = 2048 if M.name == "flash" else 512
 assert (D // GATE_D_TILE) % 2 == 0, "gate K-loop trip count must be even (A5 accumulator-buffer constraint)"
 QUANT_TILE = 256
-QUANT_TASK_TILE = QUANT_TILE * 4
+QUANT_TASK_TILE = QUANT_TILE
 assert D % QUANT_TASK_TILE == 0
 MX_GROUP = 32
 MX_SCALE_GROUPS = D // MX_GROUP
