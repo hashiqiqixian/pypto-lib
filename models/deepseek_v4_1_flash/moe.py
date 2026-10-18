@@ -119,12 +119,12 @@ def _moe_core(
             shared_t = pl.tile.get_block_idx()
             zero_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
             shared_output = pl.store(zero_row, [shared_t, 0], shared_output)
-    else:
-        expert_shared(x_norm_mx, x_norm_scale, shared_w1, shared_w1_scale,
-                      shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
-                      shared_output)
 
     if SKIP_TRANSPORT_TEST:
+        if not SKIP_SHARED_TEST:
+            expert_shared(x_norm_mx, x_norm_scale, shared_w1, shared_w1_scale,
+                          shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+                          shared_output)
         with pl.spmd(t, name_hint="moe_skip_transport_output", deps=[_output_zero_tid]) as output_ready:
             out_t = pl.tile.get_block_idx()
             if out_t < num_tokens:
@@ -160,6 +160,10 @@ def _moe_core(
             routed_output,
             input_ready,
         )
+        if not SKIP_SHARED_TEST:
+            expert_shared(x_norm_mx, x_norm_scale, shared_w1, shared_w1_scale,
+                          shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+                          shared_output)
         output_ready = combine_scattered(
             shared_output,
             output,
