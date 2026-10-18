@@ -184,7 +184,7 @@ def dispatch(
         N_RANKS * N_LOCAL,
         name_hint="dispatch_push",
         deps=[_reuse_tid, _stage_tid],
-        allow_early_resolve=True,
+        allow_early_resolve=False,
     ) as _push_tid:
         push_block = pl.tile.get_block_idx()
         dst = push_block // N_LOCAL
