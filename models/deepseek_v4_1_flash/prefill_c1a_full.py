@@ -145,7 +145,8 @@ def prefill_c1a_full_attention(
         published = prefill_publish_decoder(
             x, compressor_wkv, compressor_norm_weight, index_wk, index_norm_weight,
             compressed_rope_cos, compressed_rope_sin, compressed_slots,
-            compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, num_tokens,
+            compressed_cache, compressed_cache_scale, index_cache, index_cache_scale,
+            num_tokens, num_tokens,
         )
 
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
@@ -270,6 +271,7 @@ def prefill_publish_decoder(
         [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
     ],
     num_tokens: pl.Scalar[pl.INT32],
+    valid_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x, 0)
     compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -283,7 +285,10 @@ def prefill_publish_decoder(
     prefill_c1a_compressor_rope(
         compressed_latent, compressed_rope_cos, compressed_rope_sin, compressed_rotated, num_tokens,
     )
-    compressed_ready = publish_compressed_cache(compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens)
+    compressed_ready = publish_compressed_cache(
+        compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale,
+        num_tokens, valid_tokens,
+    )
     index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     prefill_c1a_index_key_project(compressed_latent, index_wk, index_projection, num_tokens)
     index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
@@ -293,7 +298,10 @@ def prefill_publish_decoder(
             rms_norm(index_projection, index_norm_weight, index_normalized, norm_worker, num_tokens, width=INDEX_DIM)
     index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     prefill_c1a_index_key_rope(index_normalized, compressed_rope_cos, compressed_rope_sin, index_rotated, num_tokens)
-    index_ready = publish_index_cache(index_rotated, compressed_slots, index_cache, index_cache_scale, num_tokens)
+    index_ready = publish_index_cache(
+        index_rotated, compressed_slots, index_cache, index_cache_scale,
+        num_tokens, valid_tokens,
+    )
     ready = pl.system.task_dummy(deps=[compressed_ready, index_ready])
     return ready
 

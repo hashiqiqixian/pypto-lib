@@ -179,6 +179,7 @@ def publish_compressed_cache(
         pl.BF16,
     ],
     num_tokens: pl.Scalar[pl.INT32],
+    valid_tokens: pl.Scalar[pl.INT32],
 ):
     """Publish ratio-1 KV rows as group-16 MXFP4 with BF16 scales."""
     cache_rows = pl.tensor.dim(cache, 0) * 128
@@ -187,7 +188,7 @@ def publish_compressed_cache(
     with pl.spmd(num_tokens, name_hint="c1a_compressed_publish") as publish_tid:
         token = pl.tile.get_block_idx()
         slot_i64 = pl.read(slots, [token])
-        if slot_i64 >= 0:
+        if token < valid_tokens and slot_i64 >= 0:
             slot = pl.cast(slot_i64, pl.INDEX)
             source = pl.cast(pl.load(value, [token, 0], [1, HEAD_DIM]), pl.FP32)
             grouped = pl.reshape(source, [HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP])
