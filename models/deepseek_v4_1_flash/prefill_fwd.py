@@ -699,18 +699,19 @@ def l2_prefill_fwd(
                 if (layer - 2) % 6 == 0:
                     mode = 1
             state_slot = pl.min(cache_slot, 2)
-            prefill_attention(
-                normalized, wq_a, wq_a_scale, q_norm, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm,
-                attn_sink, wo_a, wo_b, wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
-                window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer],
-                compressed_cache[cache_slot], compressed_scales[cache_slot], token_requests[stage],
-                compressed_lens[stage], index_cache[cache_slot], index_scales[cache_slot],
-                index_block_tables[stage], position_ids[stage], compressed_cos, compressed_sin,
-                compressor_wkv, compressor_wgate, query_starts[stage], state_block_table, state_cache[state_slot],
-                compressor_norm, compressed_slots, index_wk, index_norm, index_wq_b, index_wq_b_scale,
-                index_weights, candidate_mask, topk_indices, attention_window, attention_arrived,
-                attn_output, rank, 0, active, layer + 1, mode,
-            )
+            if active > 0:
+                prefill_attention(
+                    normalized, wq_a, wq_a_scale, q_norm, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm,
+                    attn_sink, wo_a, wo_b, wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
+                    window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer],
+                    compressed_cache[cache_slot], compressed_scales[cache_slot], token_requests[stage],
+                    compressed_lens[stage], index_cache[cache_slot], index_scales[cache_slot],
+                    index_block_tables[stage], position_ids[stage], compressed_cos, compressed_sin,
+                    compressor_wkv, compressor_wgate, query_starts[stage], state_block_table, state_cache[state_slot],
+                    compressor_norm, compressed_slots, index_wk, index_norm, index_wq_b, index_wq_b_scale,
+                    index_weights, candidate_mask, topk_indices, attention_window, attention_arrived,
+                    attn_output, rank, 0, active, layer + 1, mode,
+                )
             hc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden)
         moe_ready = _prefill_moe(
             attn_hidden, attn_pre, ffn_fn, ffn_scale, ffn_base, ffn_norm, gate_weight, gate_bias,
