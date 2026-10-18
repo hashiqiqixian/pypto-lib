@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 import json
 import math
+import os
 from numbers import Integral
 from pathlib import Path
 import struct
@@ -832,6 +833,10 @@ class PrefillCheckpoint:
 
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
+        shared_root = os.environ.get("PYPTO_V41_SHARED_SHARD_DIR")
+        self.shared_root = Path(shared_root).resolve() if shared_root else None
+        if self.shared_root is not None and not self.shared_root.is_dir():
+            raise ValueError("PYPTO_V41_SHARED_SHARD_DIR must be an existing directory")
         config = json.loads((self.root / "config.json").read_text())
         text = config["text_config"]
         quant = config.get("quantization_config", {})
@@ -853,12 +858,21 @@ class PrefillCheckpoint:
         self.weight_map = index["weight_map"]
         self._headers = {}
 
+    def _shard_path(self, shard: str) -> Path:
+        relative = Path(shard)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"checkpoint shard path must be relative: {shard}")
+        path = (self.root / relative).resolve()
+        if not path.is_relative_to(self.root) and (
+            self.shared_root is None or not path.is_relative_to(self.shared_root)
+        ):
+            raise ValueError(f"checkpoint shard leaves allowed directories: {shard}")
+        return path
+
     def tensor(self, name: str) -> torch.Tensor:
         """Return an owned CPU tensor without loading the rest of its shard."""
         shard = self.weight_map[name]
-        path = (self.root / shard).resolve()
-        if not path.is_relative_to(self.root):
-            raise ValueError(f"checkpoint shard leaves its root: {shard}")
+        path = self._shard_path(shard)
         with path.open("rb") as file:
             header_size = struct.unpack("<Q", file.read(8))[0]
             if header_size > 64 * 1024 * 1024:
@@ -884,9 +898,7 @@ class PrefillCheckpoint:
             raise ValueError("table row ids must have an integer dtype")
         ids = rows.to(dtype=torch.int64, device="cpu").flatten()
         shard = self.weight_map[name]
-        path = (self.root / shard).resolve()
-        if not path.is_relative_to(self.root):
-            raise ValueError(f"checkpoint shard leaves its root: {shard}")
+        path = self._shard_path(shard)
         with path.open("rb") as file:
             header_size = struct.unpack("<Q", file.read(8))[0]
             if header_size > 64 * 1024 * 1024:
@@ -1069,9 +1081,7 @@ class ResidentPrefillWeights:
         checkpoint = self.checkpoint
         shard = checkpoint.weight_map[name]
         if shard not in checkpoint._headers:
-            path = (checkpoint.root / shard).resolve()
-            if not path.is_relative_to(checkpoint.root):
-                raise ValueError(f"checkpoint shard leaves its root: {shard}")
+            path = checkpoint._shard_path(shard)
             with path.open("rb") as file:
                 size = struct.unpack("<Q", file.read(8))[0]
                 if size > 64 * 1024 * 1024:
