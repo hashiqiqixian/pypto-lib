@@ -15,7 +15,7 @@ import pypto.language.distributed as pld
 import torch
 
 import config as C
-from config import BLOCK_SIZE, B_DYN, FLASH, TP_SIZE, T_DYN, TABLE_DYN
+from config import BLOCK_SIZE, B_DYN, FLASH, MOE_TOKENS, TP_SIZE, T_DYN, TABLE_DYN
 from o_proj import prefill_tp_output_all_reduce
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
 from hc import hc_head, hc_mixes, hc_post, hc_pre, zero_bf16_padding
@@ -60,7 +60,7 @@ TOPK = FLASH.num_experts_per_tok
 MAIN_IN = DSPARK_DRAFT_LAYERS * D
 DSPARK_WINDOW = FLASH.sliding_window
 DSPARK_QUERY_T_DYN = pl.dynamic("V41_DSPARK_QUERY_T_DYN")
-DSPARK_CHUNK_REQUESTS = C.MOE_TOKENS // DSPARK_QUERY_WIDTH
+DSPARK_CHUNK_REQUESTS = MOE_TOKENS // DSPARK_QUERY_WIDTH
 DSPARK_CHUNK_TOKENS = DSPARK_CHUNK_REQUESTS * DSPARK_QUERY_WIDTH
 assert DSPARK_CHUNK_REQUESTS > 0
 def golden_main_projection(
@@ -423,7 +423,7 @@ def draft_layer(
     zero_bf16_padding(attention_output, num_tokens)
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
-    force_topk = pl.create_tensor([C.MOE_TOKENS, TOPK], dtype=pl.INT32)
+    force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     moe(
         attention_hidden,
         attention_pre_mix,
@@ -619,14 +619,14 @@ def _dspark_drafter(
     for chunk in pl.range((batch + DSPARK_CHUNK_REQUESTS - 1) // DSPARK_CHUNK_REQUESTS):
         first_token = chunk * DSPARK_CHUNK_TOKENS
         active_tokens = pl.min(DSPARK_CHUNK_TOKENS, query_tokens - first_token)
-        padded_ids = pl.create_tensor([C.MOE_TOKENS], dtype=pl.INT64)
-        padded_slots = pl.create_tensor([DSPARK_DRAFT_LAYERS, C.MOE_TOKENS], dtype=pl.INT64)
+        padded_ids = pl.create_tensor([MOE_TOKENS], dtype=pl.INT64)
+        padded_slots = pl.create_tensor([DSPARK_DRAFT_LAYERS, MOE_TOKENS], dtype=pl.INT64)
         padded_indices = pl.create_tensor(
-            [DSPARK_DRAFT_LAYERS, C.MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], dtype=pl.INT32
+            [DSPARK_DRAFT_LAYERS, MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], dtype=pl.INT32
         )
-        rope_cos = pl.create_tensor([C.MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
-        rope_sin = pl.create_tensor([C.MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
-        for token in pl.spmd(C.MOE_TOKENS, name_hint="dspark_pad_queries"):
+        rope_cos = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
+        rope_sin = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
+        for token in pl.spmd(MOE_TOKENS, name_hint="dspark_pad_queries"):
             token_id = pl.cast(0, pl.INT64)
             if token < active_tokens:
                 source = first_token + token
@@ -645,10 +645,10 @@ def _dspark_drafter(
                         index = pl.read(window_indices, [layer, first_token + token, offset])
                     pl.write(padded_indices, [layer, token, offset], index)
 
-        x_hc = pl.create_tensor([C.MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+        x_hc = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
         pack_x_hc(padded_ids, embedding_weight, x_hc)
-        pre_mix = pl.create_tensor([C.MOE_TOKENS, HC_MULT], dtype=pl.FP32)
-        for token in pl.spmd(C.MOE_TOKENS, name_hint="dspark_initial_pre_mix"):
+        pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
+        for token in pl.spmd(MOE_TOKENS, name_hint="dspark_initial_pre_mix"):
             for lane in pl.range(HC_MULT):
                 value = pl.cast(0.0, pl.FP32)
                 if lane == 0:
@@ -686,9 +686,9 @@ def _dspark_drafter(
             layer_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = (
                 shared_w3_scale[layer]
             )
-            next_pre_mix = pl.create_tensor([C.MOE_TOKENS, HC_MULT], dtype=pl.FP32)
-            x_mixed = pl.create_tensor([C.MOE_TOKENS, D], dtype=pl.BF16)
-            x_next = pl.create_tensor([C.MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+            next_pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
+            x_mixed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+            x_next = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
             draft_layer(
                 x_hc,
                 pre_mix,
@@ -756,7 +756,7 @@ def _dspark_drafter(
             x_hc = x_next
             pre_mix = next_pre_mix
 
-        padded_head = pl.create_tensor([C.MOE_TOKENS, D], dtype=pl.BF16)
+        padded_head = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
         hc_head(x_hc, pre_mix, padded_head)
         for row in pl.spmd(active_tokens, name_hint="dspark_head_unpad"):
             flat_head_hidden[first_token + row : first_token + row + 1, :] = padded_head[row : row + 1, :]
@@ -873,7 +873,7 @@ def l3_dspark_drafter(
     recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-    routed_output_buf = pld.alloc_window_buffer([C.MOE_TOKENS * TOPK, D], dtype=pl.BF16)
+    routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         attention_output = pld.window(attention_output_buf, [C.PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
@@ -885,7 +885,7 @@ def l3_dspark_drafter(
         recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
         arrived = pld.window(arrived_buf, [C.EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buf, [C.MOE_TOKENS * TOPK, D], dtype=pl.BF16)
+        routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(
             combine_arrived_buf, [C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
         )
