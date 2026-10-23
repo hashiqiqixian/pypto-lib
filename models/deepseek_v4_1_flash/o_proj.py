@@ -479,11 +479,11 @@ def prefill_tp_output_all_reduce(
             col = tile % (D // 512) * 512
             acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
             for peer in pl.range(TP_SIZE):
-                value = pld.tile.remote_load(
+                peer_value = pld.tile.remote_load(
                     output_window,
                     peer=group_base + peer, offsets=[row, col], shape=[1, 512],
                 )
-                acc = pl.add(acc, value)
+                acc = pl.add(acc, peer_value)
             output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_release", deps=[reduce_tid]) as release_tid:
         for peer in pl.range(TP_SIZE):
