@@ -16,6 +16,9 @@ from quant import golden_mxfp8_linear, mx_projection, mxfp8_linear
 from rmsnorm import golden_rms_norm, rms_norm
 
 
+KV_OUTPUT_T_DYN = pl.dynamic("V41_KV_OUTPUT_T_DYN")
+
+
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
 D = M.hidden_size
@@ -113,8 +116,8 @@ def kv_proj_rope(
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    projected: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    projected: pl.Tensor[[KV_OUTPUT_T_DYN, HEAD_DIM], pl.BF16],
+    window_kv: pl.Tensor[[KV_OUTPUT_T_DYN, HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x, 0)
