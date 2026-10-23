@@ -180,8 +180,8 @@ def dispatch(
             for k in pl.range(TOPK):
                 eid = pl.tile.read(indices_tile, [t, k])
                 dst = eid // N_LOCAL
-                loc_e = eid - dst * N_LOCAL
-                cursor[dst * N_LOCAL + loc_e] = cursor[dst * N_LOCAL + loc_e] + 1
+                meta_local_expert = eid - dst * N_LOCAL
+                cursor[dst * N_LOCAL + meta_local_expert] = cursor[dst * N_LOCAL + meta_local_expert] + 1
 
         meta_tile = pl.tile.full([1, (N_LOCAL + 7) // 8 * 8], dtype=pl.INT32, value=0)
         for dst in pl.range(N_RANKS):

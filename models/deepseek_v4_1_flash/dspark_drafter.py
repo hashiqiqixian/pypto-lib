@@ -294,11 +294,12 @@ def select_dspark_anchor_ids(
     anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
 ):
     batch = pl.tensor.dim(num_sampled, 0)
-    for request in pl.spmd(batch, name_hint="dspark_select_anchor"):
-        anchor = pl.read(next_prefill_tokens, [request])
-        if pl.read(num_sampled, [request]) > 0:
-            anchor = pl.read(last_sampled, [request])
-        pl.write(anchor_ids, [request], anchor)
+    for _ in pl.spmd(1, name_hint="dspark_select_anchor"):
+        for request in pl.range(batch):
+            anchor = pl.read(next_prefill_tokens, [request])
+            if pl.read(num_sampled, [request]) > 0:
+                anchor = pl.read(last_sampled, [request])
+            pl.write(anchor_ids, [request], anchor)
     return anchor_ids
 
 
@@ -625,34 +626,36 @@ def _dspark_drafter(
         )
         rope_cos = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
         rope_sin = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
-        for token in pl.spmd(MOE_TOKENS, name_hint="dspark_pad_queries"):
-            token_id = pl.cast(0, pl.INT64)
-            if token < active_tokens:
-                source = first_token + token
-                token_id = pl.read(query_ids, [source])
-                rope_cos[token : token + 1, :] = query_rope_cos[source : source + 1, :]
-                rope_sin[token : token + 1, :] = query_rope_sin[source : source + 1, :]
-            pl.write(padded_ids, [token], token_id)
-            for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                slot = pl.cast(-1, pl.INT64)
+        for _ in pl.spmd(1, name_hint="dspark_pad_queries"):
+            for token in pl.range(MOE_TOKENS):
+                token_id = pl.cast(0, pl.INT64)
                 if token < active_tokens:
-                    slot = pl.read(query_slots, [layer, first_token + token])
-                pl.write(padded_slots, [layer, token], slot)
-                for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
-                    index = pl.cast(-1, pl.INT32)
+                    source = first_token + token
+                    token_id = pl.read(query_ids, [source])
+                    rope_cos[token : token + 1, :] = query_rope_cos[source : source + 1, :]
+                    rope_sin[token : token + 1, :] = query_rope_sin[source : source + 1, :]
+                pl.write(padded_ids, [token], token_id)
+                for layer in pl.range(DSPARK_DRAFT_LAYERS):
+                    slot = pl.cast(-1, pl.INT64)
                     if token < active_tokens:
-                        index = pl.read(window_indices, [layer, first_token + token, offset])
-                    pl.write(padded_indices, [layer, token, offset], index)
+                        slot = pl.read(query_slots, [layer, first_token + token])
+                    pl.write(padded_slots, [layer, token], slot)
+                    for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
+                        index = pl.cast(-1, pl.INT32)
+                        if token < active_tokens:
+                            index = pl.read(window_indices, [layer, first_token + token, offset])
+                        pl.write(padded_indices, [layer, token, offset], index)
 
         x_hc = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
         pack_x_hc(padded_ids, embedding_weight, x_hc)
         pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
-        for token in pl.spmd(MOE_TOKENS, name_hint="dspark_initial_pre_mix"):
-            for lane in pl.range(HC_MULT):
-                value = pl.cast(0.0, pl.FP32)
-                if lane == 0:
-                    value = pl.cast(1.0, pl.FP32)
-                pl.write(pre_mix, [token, lane], value)
+        for _ in pl.spmd(1, name_hint="dspark_initial_pre_mix"):
+            for token in pl.range(MOE_TOKENS):
+                for lane in pl.range(HC_MULT):
+                    value = pl.cast(0.0, pl.FP32)
+                    if lane == 0:
+                        value = pl.cast(1.0, pl.FP32)
+                    pl.write(pre_mix, [token, lane], value)
 
         for layer in pl.unroll(DSPARK_DRAFT_LAYERS):
             layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[
