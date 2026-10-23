@@ -69,7 +69,7 @@ def attend_dspark_window(
     output: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    tokens = MOE_TOKENS
+    tokens = pl.tensor.dim(query, 0)
     head_rows = tokens * LOCAL_H
     cache_rows = tokens * DSPARK_SWA_INDEX_WIDTH
     qflat = pl.reshape(query, [head_rows, HEAD_DIM])
@@ -141,7 +141,7 @@ def dspark_attention(
     output: pl.Tensor[[MOE_TOKENS, D], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    tokens = MOE_TOKENS
+    tokens = pl.tensor.dim(x, 0)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)

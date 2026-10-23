@@ -52,7 +52,9 @@ _shape_parser.add_argument("--experts-per-rank", type=int)
 _shape_parser.add_argument("--capacity", type=int, default=128)
 _shape_parser.add_argument("--dp", type=int)
 _shape_options = _shape_parser.parse_known_args()[0]
-C.EP_SIZE = _shape_options.ep or (4 if _shape_options.checkpoint else 2)
+if _shape_options.checkpoint and _shape_options.ep is None and _shape_options.dp is None:
+    C.EP_SIZE = 4
+    C.DP_SIZE = 4
 _default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
 C.N_LOCAL_EXPERTS = _default_experts if _shape_options.experts_per_rank is None else _shape_options.experts_per_rank
 if C.N_LOCAL_EXPERTS <= 0 or C.EP_SIZE * C.N_LOCAL_EXPERTS % 16:
