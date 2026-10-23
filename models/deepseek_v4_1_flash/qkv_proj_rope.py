@@ -131,7 +131,6 @@ def kv_proj_rope(
     for norm_worker in pl.spmd(norm_blocks, name_hint="attention_kv_norm"):
         rms_norm(projected, kv_norm_weight, normalized, norm_worker, num_tokens, width=HEAD_DIM)
     rope(normalized, rope_cos, rope_sin, window_kv, num_tokens, 1, "attention_kv_rope", 2147483647)
-    return window_kv
 
 
 def golden_rope_interleave(
