@@ -515,10 +515,15 @@ if __name__ == "__" + "main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark Markov validation")
+    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=C.SUPPORTED_TP_SIZES)
+    parser.add_argument("--dp", type=int, default=C.DP_SIZE)
+    parser.add_argument("--ep", type=int, default=C.EP_SIZE, choices=C.SUPPORTED_EP_SIZES)
     parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    if (args.tp, args.dp, args.ep) != (C.TP_SIZE, C.DP_SIZE, C.EP_SIZE):
+        parser.error("--tp/--dp/--ep must match the import-time configuration")
     result = run_markov_case(
         platform=args.platform,
         device_id=args.device,

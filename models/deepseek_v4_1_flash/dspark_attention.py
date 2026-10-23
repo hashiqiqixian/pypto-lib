@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 
-from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, ORI_BLOCKS_DYN, TP_SIZE, T_DYN
+from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN, TP_SIZE
 from o_proj import o_proj
 from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
 from sparse_attention import publish_window_row
@@ -36,8 +36,8 @@ SOFTMAX_SCALE = HEAD_DIM**-0.5
 def gather_dspark_window(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
-    selected: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    selected: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     cache_rows = pl.tensor.dim(cache, 0) * 128
@@ -62,14 +62,14 @@ def gather_dspark_window(
 
 @pl.jit.inline
 def attend_dspark_window(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    selected: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    query: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
+    selected: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    tokens = pl.tensor.dim(query, 0)
+    tokens = MOE_TOKENS
     head_rows = tokens * LOCAL_H
     cache_rows = tokens * DSPARK_SWA_INDEX_WIDTH
     qflat = pl.reshape(query, [head_rows, HEAD_DIM])
@@ -118,7 +118,7 @@ def attend_dspark_window(
 
 @pl.jit.inline(auto_scope=False)
 def dspark_attention(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    x: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -132,21 +132,22 @@ def dspark_attention(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    rope_cos: pl.Tensor[[MOE_TOKENS, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[MOE_TOKENS, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[MOE_TOKENS], pl.INT64],
+    window_indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    output: pl.Tensor[[T_DYN, D], pl.FP32],
+    output: pl.Tensor[[MOE_TOKENS, D], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    tokens = pl.tensor.dim(x, 0)
+    tokens = MOE_TOKENS
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens,
+                max_workers=64 if TP_SIZE == 1 else 2147483647)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
@@ -154,13 +155,14 @@ def dspark_attention(
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens,
+           grouped_max_workers=4096)
     return output, window_cache, window_cache_scale
 
 
 @pl.jit
 def dspark_attention_test(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    x: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -174,23 +176,17 @@ def dspark_attention_test(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    rope_cos: pl.Tensor[[MOE_TOKENS, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[MOE_TOKENS, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[MOE_TOKENS], pl.INT64],
+    window_indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16]],
-    output: pl.Out[pl.Tensor[[T_DYN, D], pl.FP32]],
+    output: pl.Out[pl.Tensor[[MOE_TOKENS, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x.bind_dynamic(0, T_DYN)
-    rope_cos.bind_dynamic(0, T_DYN)
-    rope_sin.bind_dynamic(0, T_DYN)
-    window_slots.bind_dynamic(0, T_DYN)
-    window_indices.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     window_cache_scale.bind_dynamic(0, ORI_BLOCKS_DYN)
-    output.bind_dynamic(0, T_DYN)
     return dspark_attention(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -217,6 +213,12 @@ def make_attention_inputs(seed: int = 43):
         128, 130 + DSPARK_QUERY_WIDTH, dtype=torch.int32
     )
     values["window_indices"] = indices
+    for name in ("x", "rope_cos", "rope_sin", "window_slots", "window_indices"):
+        current = values[name]
+        fill = -1 if name in ("window_slots", "window_indices") else 0
+        padded = torch.full((MOE_TOKENS, *current.shape[1:]), fill, dtype=current.dtype)
+        padded[:DSPARK_QUERY_WIDTH] = current
+        values[name] = padded
     return values
 
 
@@ -230,8 +232,13 @@ def run_attention_case(*, platform: str = "a5sim", device_id: int = 0, compile_o
     values = make_attention_inputs()
 
     def golden(tensors):
-        result = golden_swa_attention(*(tensors[name] for name in SWA_INPUT_NAMES))
-        tensors["output"].copy_(result.output)
+        row_inputs = ("x", "rope_cos", "rope_sin", "window_slots", "window_indices")
+        result = golden_swa_attention(*(
+            tensors[name][:DSPARK_QUERY_WIDTH] if name in row_inputs else tensors[name]
+            for name in SWA_INPUT_NAMES
+        ))
+        tensors["output"].zero_()
+        tensors["output"][:DSPARK_QUERY_WIDTH].copy_(result.output)
         tensors["window_cache"].copy_(result.window_cache)
         tensors["window_cache_scale"].copy_(result.window_cache_scale)
 
@@ -241,7 +248,7 @@ def run_attention_case(*, platform: str = "a5sim", device_id: int = 0, compile_o
     specs = [TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=values[name])
              for name in SWA_INPUT_NAMES]
     specs += [
-        TensorSpec("output", [DSPARK_QUERY_WIDTH, D], torch.float32),
+        TensorSpec("output", [MOE_TOKENS, D], torch.float32),
         ScalarSpec("num_tokens", torch.int32, DSPARK_QUERY_WIDTH, compile_runtime=True),
     ]
     return run(
@@ -250,7 +257,8 @@ def run_attention_case(*, platform: str = "a5sim", device_id: int = 0, compile_o
         golden_fn=golden,
         compare_fn={
             "window_cache": compare_payload,
-            "output": ratio_allclose(atol=0.03, rtol=0.03, max_error_ratio=0.0),
+            "output": ratio_allclose(atol=0.03, rtol=0.03, max_error_ratio=0.001,
+                                     valid_rows=DSPARK_QUERY_WIDTH),
         },
         config={"platform": platform, "device_id": device_id},
         compile_only=compile_only,

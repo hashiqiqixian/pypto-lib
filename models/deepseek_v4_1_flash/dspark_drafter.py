@@ -27,7 +27,7 @@ from expert_routed import (
 )
 from input_pack import pack_x_hc
 from utils import paged_slots
-from moe import AUX_WIDTH, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
+from decode_moe import AUX_WIDTH, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
 
 from dspark_attention import dspark_attention
 from dspark_context_kv import dspark_context_kv
@@ -368,7 +368,7 @@ def draft_layer(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one V4.1 draft decoder layer with delayed mHC boundaries."""
-    tokens = pl.tensor.dim(x_hc, 0)
+    tokens = C.MOE_TOKENS
     attention_input = pl.create_tensor([tokens, D], dtype=pl.BF16)
     normalized_attention = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
@@ -423,6 +423,7 @@ def draft_layer(
     zero_bf16_padding(attention_output, num_tokens)
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
+    force_topk = pl.create_tensor([C.MOE_TOKENS, TOPK], dtype=pl.INT32)
     moe(
         attention_hidden,
         attention_pre_mix,
@@ -460,6 +461,7 @@ def draft_layer(
         num_tokens,
         rank,
         moe_epoch,
+        force_topk,
     )
     return x_next, next_pre_mix
 
@@ -1045,10 +1047,15 @@ if __name__ == "__" + "main__":
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark drafter validation")
     parser.add_argument("--mode", choices=("projection", "metadata"), required=True)
+    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=C.SUPPORTED_TP_SIZES)
+    parser.add_argument("--dp", type=int, default=C.DP_SIZE)
+    parser.add_argument("--ep", type=int, default=C.EP_SIZE, choices=C.SUPPORTED_EP_SIZES)
     parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    if (args.tp, args.dp, args.ep) != (C.TP_SIZE, C.DP_SIZE, C.EP_SIZE):
+        parser.error("--tp/--dp/--ep must match the import-time configuration")
     run_case = run_projection_case if args.mode == "projection" else run_metadata_case
     result = run_case(platform=args.platform, device_id=args.device, compile_only=args.compile_only)
     print(result)

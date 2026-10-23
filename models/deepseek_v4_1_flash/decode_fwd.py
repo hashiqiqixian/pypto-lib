@@ -1256,6 +1256,7 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
+    parser.add_argument("--dp", type=int, default=C.DP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--experts-per-rank", type=int, default=N_LOCAL_EXPERTS, help="routed experts on each EP rank")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--compile-only", action="store_true")
@@ -1265,8 +1266,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("this forward entry requires hardware; --sim is unsupported")
-    if (args.tp, args.ep, args.experts_per_rank) != (TP_SIZE, EP_SIZE, N_LOCAL_EXPERTS):
-        parser.error("--tp/--ep/--experts-per-rank are import-time configuration; pass them on the Python command line")
+    if (args.tp, args.ep, args.dp, args.experts_per_rank) != (TP_SIZE, EP_SIZE, C.DP_SIZE, N_LOCAL_EXPERTS):
+        parser.error("--tp/--ep/--dp/--experts-per-rank must match the import-time configuration")
     if args.tp != 1:
         parser.error("the decode_fwd smoke fixture requires --tp 1")
     devices = [int(device) for device in args.device.split(",") if device]
