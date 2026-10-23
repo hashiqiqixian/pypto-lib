@@ -186,7 +186,6 @@ def publish_window_row(
 ):
     for t in pl.spmd(num_tokens, name_hint="swa_cache_publish"):
         _publish_window_row(kv, slots, cache, scales, t)
-    return cache, scales
 
 
 @pl.jit.inline(auto_scope=False)
