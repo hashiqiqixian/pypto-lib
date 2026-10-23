@@ -368,21 +368,20 @@ def draft_layer(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one V4.1 draft decoder layer with delayed mHC boundaries."""
-    tokens = pl.tensor.dim(x_hc, 0)
-    attention_input = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    normalized_attention = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
+    attention_input = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+    normalized_attention = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+    attention_pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
+    post_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
+    residual_mix = pl.create_tensor([MOE_TOKENS, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_mixes(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
         attention_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
     )
     hc_pre(x_hc, incoming_pre_mix, attention_input)
-    for block in pl.spmd((tokens + 7) // 8, name_hint="dspark_attn_norm"):
-        rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, tokens, output_fp32=False)
+    for block in pl.spmd((MOE_TOKENS + 7) // 8, name_hint="dspark_attn_norm"):
+        rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, MOE_TOKENS, output_fp32=False)
     zero_bf16_padding(normalized_attention, num_tokens)
-    attention_partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+    attention_partial = pl.create_tensor([MOE_TOKENS, D], dtype=pl.FP32)
     dspark_attention(
         normalized_attention,
         wq_a,
@@ -407,7 +406,7 @@ def draft_layer(
         attention_partial,
         num_tokens,
     )
-    attention_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    attention_output = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     group_base = rank // TP_SIZE * TP_SIZE
     tp_rank = rank % TP_SIZE
     prefill_tp_output_all_reduce(
@@ -421,7 +420,7 @@ def draft_layer(
         attention_epoch,
     )
     zero_bf16_padding(attention_output, num_tokens)
-    attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
+    attention_hidden = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
     hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     moe(
