@@ -51,16 +51,17 @@ def sample_target_rows_rank(
         rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, block, tokens)
     for chunk in pl.range(CHUNKS):
         row_indices = pl.create_tensor([MAX_LOGIT_ROWS], dtype=pl.INT32)
-        for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="dspark_target_select_rows"):
-            global_row = chunk * MAX_LOGIT_ROWS + row
-            selected = pl.cast(-1, pl.INT32)
-            if global_row < ROWS:
-                request = global_row // DECODE_ROWS_PER_REQUEST
-                offset = global_row % DECODE_ROWS_PER_REQUEST
-                width = pl.read(active_widths, [request])
-                if offset < width and global_row < tokens:
-                    selected = pl.cast(global_row, pl.INT32)
-            pl.write(row_indices, [row], selected)
+        for _core in pl.spmd(1, name_hint="dspark_target_select_rows"):
+            for row in pl.range(MAX_LOGIT_ROWS):
+                global_row = chunk * MAX_LOGIT_ROWS + row
+                selected = pl.cast(-1, pl.INT32)
+                if global_row < ROWS:
+                    request = global_row // DECODE_ROWS_PER_REQUEST
+                    offset = global_row % DECODE_ROWS_PER_REQUEST
+                    width = pl.read(active_widths, [request])
+                    if offset < width and global_row < tokens:
+                        selected = pl.cast(global_row, pl.INT32)
+                pl.write(row_indices, [row], selected)
         logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
         chunk_samples = pl.create_tensor([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32)
         lm_head_with_sampling(
@@ -68,10 +69,11 @@ def sample_target_rows_rank(
             hidden_window, hidden_done, logits_window, logits_done,
             rank, pl.cast(0, pl.INT32), chunk + 1, CHUNKS,
         )
-        for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="dspark_target_collect_samples"):
-            global_row = chunk * MAX_LOGIT_ROWS + row
-            if global_row < ROWS:
-                sampled_ids[global_row : global_row + 1, :] = chunk_samples[row : row + 1, :]
+        for _core in pl.spmd(1, name_hint="dspark_target_collect_samples"):
+            for row in pl.range(MAX_LOGIT_ROWS):
+                global_row = chunk * MAX_LOGIT_ROWS + row
+                if global_row < ROWS:
+                    sampled_ids[global_row : global_row + 1, :] = chunk_samples[row : row + 1, :]
     return sampled_ids
 
 
