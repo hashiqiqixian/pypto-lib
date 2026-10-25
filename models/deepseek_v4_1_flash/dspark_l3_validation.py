@@ -104,6 +104,7 @@ if __name__ == "__main__":
             "backend_type": "a5",
             "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
             "ring_heap": 2 * 1024**3,
+            "log_level": "warn",
         },
         atol=0.0,
         rtol=0.0,
