@@ -51,6 +51,12 @@ def main():
                 for offset in range(int(widths[rank, request])):
                     expected[rank, request * 6 + offset, 0] = 7
 
+    def compare_samples(actual, expected, **_kwargs):
+        mismatches = (actual != expected).nonzero(as_tuple=False)
+        first = mismatches[:16].tolist()
+        details = [(index, int(actual[tuple(index)]), int(expected[tuple(index)])) for index in first]
+        return not bool(mismatches.numel()), f"mismatch_count={len(mismatches)} first={details}"
+
     specs = [
         TensorSpec("x_hc", [4, tokens, sample.HC_MULT, sample.D], torch.float32, init_value=x_hc),
         TensorSpec("pre_mix", [4, tokens, sample.HC_MULT], torch.float32, init_value=pre_mix),
@@ -63,6 +69,7 @@ def main():
         fn=sample.l3_sample_target_rows,
         specs=specs,
         golden_fn=golden,
+        compare_fn={"sampled_ids": compare_samples},
         config={
             "backend_type": "a5",
             "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
