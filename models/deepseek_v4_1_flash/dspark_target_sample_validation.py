@@ -55,6 +55,7 @@ def main():
         mismatches = (actual != expected).nonzero(as_tuple=False)
         first = mismatches[:16].tolist()
         details = [(index, int(actual[tuple(index)]), int(expected[tuple(index)])) for index in first]
+        print("sample mismatch", len(mismatches), details, flush=True)
         return not bool(mismatches.numel()), f"mismatch_count={len(mismatches)} first={details}"
 
     specs = [
