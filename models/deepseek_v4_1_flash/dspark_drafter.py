@@ -260,7 +260,7 @@ def dspark_metadata(
             active = first > 0
             prefix_start = pl.max(first - DSPARK_WINDOW, 0)
             context_len = first - prefix_start
-            visible_len = context_len + DSPARK_QUERY_WIDTH
+            visible_len = pl.cast(context_len + DSPARK_QUERY_WIDTH, pl.INT32)
             if not active:
                 visible_len = pl.cast(0, pl.INT32)
             for offset in pl.range(DSPARK_QUERY_WIDTH):
