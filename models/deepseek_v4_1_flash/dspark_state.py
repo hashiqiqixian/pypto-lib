@@ -572,7 +572,7 @@ def l3_prepare_drafter_geometry(
 def prepare_prefill_drafter_geometry_rank(
     positions: pl.Tensor[[T_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
+    num_tokens: pl.Tensor[[1], pl.INT32],
     first_query_positions: pl.Tensor[[BATCH], pl.INT32],
     block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, BATCH, TABLE_DYN], pl.INT32],
     rope_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
@@ -595,10 +595,11 @@ def prepare_prefill_drafter_geometry_rank(
     table_blocks = pl.tensor.dim(block_tables, 2)
     rope_rows = pl.tensor.dim(rope_cos_table, 0)
     for _core in pl.spmd(1, name_hint="dspark_prefill_geometry"):
+        active_tokens = pl.read(num_tokens, [0])
         for row in pl.range(tokens):
             position = pl.read(positions, [row])
             request = pl.read(request_ids, [row])
-            active = row < num_tokens and request >= 0 and request < BATCH
+            active = row < active_tokens and request >= 0 and request < BATCH
             active = active and position >= 0 and position < rope_rows
             for col in pl.range(ROPE_HALF):
                 cos = pl.cast(0.0, pl.FP32)
@@ -636,7 +637,7 @@ def prepare_prefill_drafter_geometry_rank(
 def l3_prepare_prefill_drafter_geometry(
     positions: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     request_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
-    num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
+    num_tokens: pl.Tensor[[EP_SIZE, 1], pl.INT32],
     first_query_positions: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
     block_tables: pl.Tensor[[EP_SIZE, DSPARK_DRAFT_LAYERS, BATCH, TABLE_DYN], pl.INT32],
     rope_cos_table: pl.Tensor[[EP_SIZE, ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
