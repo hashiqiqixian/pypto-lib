@@ -23,6 +23,8 @@ ROWS = MAX_BATCH_PER_DP * DECODE_ROWS_PER_REQUEST
 CHUNKS = (ROWS + MAX_LOGIT_ROWS - 1) // MAX_LOGIT_ROWS
 TARGET_T_DYN = pl.dynamic("V41_DSPARK_TARGET_T_DYN")
 
+assert CHUNKS == 5
+
 if TP_SIZE != 1:
     raise ValueError("DSpark target row sampling currently requires TP1")
 
@@ -97,4 +99,50 @@ def l3_sample_target_chunk(
             x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank],
             active_widths[rank], sampled_ids[rank], hidden_window, hidden_done,
             logits_window, logits_done, rank, chunk, device=rank,
+        )
+
+
+@pl.jit
+def merge_target_chunks_rank(
+    chunk_0: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    chunk_1: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    chunk_2: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    chunk_3: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    chunk_4: pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids: pl.Out[pl.Tensor[[ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+):
+    """Discard the eight padded rows after the five 16-row LM-head calls."""
+    for _core in pl.spmd(1, name_hint="dspark_merge_target_chunks"):
+        for row in pl.range(ROWS):
+            chunk = row // MAX_LOGIT_ROWS
+            offset = row % MAX_LOGIT_ROWS
+            for lane in pl.range(SAMPLED_IDS_PAD):
+                value = pl.cast(0, pl.INT32)
+                if chunk == 0:
+                    value = pl.read(chunk_0, [offset, lane])
+                elif chunk == 1:
+                    value = pl.read(chunk_1, [offset, lane])
+                elif chunk == 2:
+                    value = pl.read(chunk_2, [offset, lane])
+                elif chunk == 3:
+                    value = pl.read(chunk_3, [offset, lane])
+                else:
+                    value = pl.read(chunk_4, [offset, lane])
+                pl.write(sampled_ids, [row, lane], value)
+    return sampled_ids
+
+
+@pl.jit.host
+def l3_merge_target_chunks(
+    chunk_0: pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    chunk_1: pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    chunk_2: pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    chunk_3: pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    chunk_4: pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+):
+    for rank in pl.range(pld.world_size()):
+        merge_target_chunks_rank(
+            chunk_0[rank], chunk_1[rank], chunk_2[rank], chunk_3[rank], chunk_4[rank],
+            sampled_ids[rank], device=rank,
         )
