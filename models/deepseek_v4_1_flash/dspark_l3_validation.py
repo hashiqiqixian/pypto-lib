@@ -17,6 +17,7 @@ from config import DP_SIZE, EP_SIZE, TP_SIZE
 from dspark_drafter import l3_dspark_drafter
 from golden import ScalarSpec, TensorSpec, run
 from pypto.ir import DistributedConfig
+from pypto.runtime import ExecutionMode
 
 
 _DTYPES = {
@@ -102,6 +103,7 @@ if __name__ == "__main__":
         compare_fn={"window_cache": _zero_cache, "window_cache_scale": _finite_cache_scale},
         config={
             "backend_type": "a5",
+            "execution_mode": ExecutionMode.ONBOARD,
             "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
             "ring_heap": 2 * 1024**3,
             "log_level": "warn",
