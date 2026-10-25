@@ -283,7 +283,7 @@ def dspark_metadata(
                 for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
                     slot = pl.cast(-1, pl.INT32)
                     if offset < visible_len:
-                        position = prefix_start + offset
+                        position = pl.cast(prefix_start + offset, pl.INT32)
                         logical_block = position // BLOCK_SIZE
                         physical_block = pl.read(
                             block_tables, [layer, request, pl.cast(logical_block, pl.INDEX)]
