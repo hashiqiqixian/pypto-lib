@@ -513,8 +513,8 @@ def prepare_drafter_geometry_rank(
                 active = pl.read(context_valid, [request, offset]) == 1
                 active = active and position >= 0 and position < rope_rows
                 for col in pl.range(ROPE_HALF):
-                    cos = pl.cast(0, pl.FP32)
-                    sin = pl.cast(0, pl.FP32)
+                    cos = pl.cast(0.0, pl.FP32)
+                    sin = pl.cast(0.0, pl.FP32)
                     if active:
                         cos = pl.read(rope_cos_table, [position, col])
                         sin = pl.read(rope_sin_table, [position, col])
@@ -532,8 +532,8 @@ def prepare_drafter_geometry_rank(
                 query_position = pl.cast(first + offset, pl.INT32)
                 active = first > 0 and query_position < rope_rows
                 for col in pl.range(ROPE_HALF):
-                    cos = pl.cast(0, pl.FP32)
-                    sin = pl.cast(0, pl.FP32)
+                    cos = pl.cast(0.0, pl.FP32)
+                    sin = pl.cast(0.0, pl.FP32)
                     if active:
                         cos = pl.read(rope_cos_table, [query_position, col])
                         sin = pl.read(rope_sin_table, [query_position, col])
@@ -601,8 +601,8 @@ def prepare_prefill_drafter_geometry_rank(
             active = row < num_tokens and request >= 0 and request < BATCH
             active = active and position >= 0 and position < rope_rows
             for col in pl.range(ROPE_HALF):
-                cos = pl.cast(0, pl.FP32)
-                sin = pl.cast(0, pl.FP32)
+                cos = pl.cast(0.0, pl.FP32)
+                sin = pl.cast(0.0, pl.FP32)
                 if active:
                     cos = pl.read(rope_cos_table, [position, col])
                     sin = pl.read(rope_sin_table, [position, col])
@@ -622,8 +622,8 @@ def prepare_prefill_drafter_geometry_rank(
                 query_position = pl.cast(first + offset, pl.INT32)
                 active = first > 0 and query_position < rope_rows
                 for col in pl.range(ROPE_HALF):
-                    cos = pl.cast(0, pl.FP32)
-                    sin = pl.cast(0, pl.FP32)
+                    cos = pl.cast(0.0, pl.FP32)
+                    sin = pl.cast(0.0, pl.FP32)
                     if active:
                         cos = pl.read(rope_cos_table, [query_position, col])
                         sin = pl.read(rope_sin_table, [query_position, col])
