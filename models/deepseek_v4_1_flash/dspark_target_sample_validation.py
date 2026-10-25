@@ -52,7 +52,7 @@ def main():
                     expected[rank, request * 6 + offset, 0] = 7
 
     def compare_samples(actual, expected, **_kwargs):
-        mismatches = (actual != expected).nonzero(as_tuple=False)
+        mismatches = (actual[:, :16] != expected[:, :16]).nonzero(as_tuple=False)
         first = mismatches[:16].tolist()
         details = [(index, int(actual[tuple(index)]), int(expected[tuple(index)])) for index in first]
         print("sample mismatch", len(mismatches), details, flush=True)

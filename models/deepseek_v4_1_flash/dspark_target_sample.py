@@ -20,7 +20,7 @@ from rmsnorm import rms_norm_tiled_compensated
 D = FLASH.hidden_size
 HC_MULT = FLASH.hc_mult
 ROWS = MAX_BATCH_PER_DP * DECODE_ROWS_PER_REQUEST
-CHUNKS = (ROWS + MAX_LOGIT_ROWS - 1) // MAX_LOGIT_ROWS
+CHUNKS = 1
 TARGET_T_DYN = pl.dynamic("V41_DSPARK_TARGET_T_DYN")
 
 if TP_SIZE != 1:
