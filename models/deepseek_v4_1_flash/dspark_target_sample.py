@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Sample every V4.1 DSpark verification row from the target's final HC state."""
+"""Sample one 16-row V4.1 DSpark target chunk per completed L3 call."""
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -28,18 +28,19 @@ if TP_SIZE != 1:
 
 
 @pl.jit
-def sample_target_rows_rank(
+def sample_target_chunk_rank(
     x_hc: pl.Tensor[[TARGET_T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[TARGET_T_DYN, HC_MULT], pl.FP32],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     active_widths: pl.Tensor[[MAX_BATCH_PER_DP], pl.INT32],
-    sampled_ids: pl.Out[pl.Tensor[[ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
+    chunk: pl.Scalar[pl.INT32],
 ):
     x_hc.bind_dynamic(0, TARGET_T_DYN)
     pre_mix.bind_dynamic(0, TARGET_T_DYN)
@@ -49,43 +50,38 @@ def sample_target_rows_rank(
     normalized = pl.create_tensor([tokens, D], dtype=pl.BF16)
     for block in pl.spmd((tokens + 7) // 8, name_hint="dspark_target_final_norm"):
         rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, block, tokens)
-    for chunk in pl.range(CHUNKS):
-        row_indices = pl.create_tensor([MAX_LOGIT_ROWS], dtype=pl.INT32)
-        for _core in pl.spmd(1, name_hint="dspark_target_select_rows"):
-            for row in pl.range(MAX_LOGIT_ROWS):
-                global_row = chunk * MAX_LOGIT_ROWS + row
-                selected = pl.cast(-1, pl.INT32)
-                if global_row < ROWS:
-                    request = global_row // DECODE_ROWS_PER_REQUEST
-                    offset = global_row % DECODE_ROWS_PER_REQUEST
-                    width = pl.read(active_widths, [request])
-                    if offset < width and global_row < tokens:
-                        selected = pl.cast(global_row, pl.INT32)
-                pl.write(row_indices, [row], selected)
-        logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-        chunk_samples = pl.create_tensor([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32)
-        lm_head_with_sampling(
-            normalized, lm_head_weight, row_indices, logits, chunk_samples,
-            hidden_window, hidden_done, logits_window, logits_done,
-            rank, pl.cast(0, pl.INT32), chunk + 1, CHUNKS,
-        )
-        for _core in pl.spmd(1, name_hint="dspark_target_collect_samples"):
-            for row in pl.range(MAX_LOGIT_ROWS):
-                global_row = chunk * MAX_LOGIT_ROWS + row
-                if global_row < ROWS:
-                    sampled_ids[global_row : global_row + 1, :] = chunk_samples[row : row + 1, :]
+    row_indices = pl.create_tensor([MAX_LOGIT_ROWS], dtype=pl.INT32)
+    for _core in pl.spmd(1, name_hint="dspark_target_select_rows"):
+        for row in pl.range(MAX_LOGIT_ROWS):
+            global_row = chunk * MAX_LOGIT_ROWS + row
+            selected = pl.cast(-1, pl.INT32)
+            if global_row < ROWS:
+                request = global_row // DECODE_ROWS_PER_REQUEST
+                offset = global_row % DECODE_ROWS_PER_REQUEST
+                width = pl.read(active_widths, [request])
+                if offset < width and global_row < tokens:
+                    selected = pl.cast(global_row, pl.INT32)
+            pl.write(row_indices, [row], selected)
+    logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+    lm_head_with_sampling(
+        normalized, lm_head_weight, row_indices, logits, sampled_ids,
+        hidden_window, hidden_done, logits_window, logits_done,
+        rank, pl.cast(0, pl.INT32), pl.cast(1, pl.INT32), pl.cast(1, pl.INT32),
+    )
     return sampled_ids
 
 
 @pl.jit.host
-def l3_sample_target_rows(
+def l3_sample_target_chunk(
     x_hc: pl.Tensor[[EP_SIZE, TARGET_T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[EP_SIZE, TARGET_T_DYN, HC_MULT], pl.FP32],
     final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
     lm_head_weight: pl.Tensor[[EP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     active_widths: pl.Tensor[[EP_SIZE, MAX_BATCH_PER_DP], pl.INT32],
-    sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    chunk: pl.Scalar[pl.INT32],
 ):
+    """Call with chunk 0 through 4 in order, reusing target state after each call completes."""
     x_hc.bind_dynamic(1, TARGET_T_DYN)
     pre_mix.bind_dynamic(1, TARGET_T_DYN)
     hidden_window_buf = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
@@ -97,8 +93,8 @@ def l3_sample_target_rows(
         hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
         logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        sample_target_rows_rank(
+        sample_target_chunk_rank(
             x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank],
             active_widths[rank], sampled_ids[rank], hidden_window, hidden_done,
-            logits_window, logits_done, rank, device=rank,
+            logits_window, logits_done, rank, chunk, device=rank,
         )
