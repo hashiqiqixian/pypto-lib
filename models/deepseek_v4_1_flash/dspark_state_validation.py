@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Isolated EP4 validation; this file is intentionally outside the product PR."""
 
 import argparse
@@ -35,6 +43,9 @@ def execute(name, fn, inputs, outputs, golden, devices, compile_only):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--dp", type=int, default=4)
+    parser.add_argument("--ep", type=int, default=4)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     devices = [int(item) for item in os.environ.get("TASK_DEVICE", "0,1,2,3").split(",")]
