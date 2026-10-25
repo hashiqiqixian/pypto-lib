@@ -21,7 +21,7 @@ from pypto.ir import DistributedConfig
 
 _DTYPES = {
     "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
+    "fp32": torch.float32,
     "fp8e4m3fn": torch.float8_e4m3fn,
     "fp8e8m0": torch.float8_e8m0fnu,
     "int16": torch.int16,
