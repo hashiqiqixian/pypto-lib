@@ -13,9 +13,10 @@ import inspect
 
 import torch
 
-from config import DP_SIZE, EP_SIZE, TP_SIZE
+from config import DP_SIZE, DSPARK_DRAFT_LAYERS, DSPARK_NOISE_TOKEN_ID, DSPARK_QUERY_WIDTH, EP_SIZE, TP_SIZE
 from dspark_drafter import l3_dspark_drafter
 from golden import ScalarSpec, TensorSpec, run
+from hc import golden_hc_post, golden_hc_pre, golden_mhc_mixes
 from pypto.ir import DistributedConfig
 from pypto.runtime import ExecutionMode
 
@@ -50,8 +51,19 @@ def _zero_cache(actual, _expected, **_kwargs):
 
 
 def _finite_cache_scale(actual, _expected, **_kwargs):
-    ok = bool(torch.isfinite(actual.float()).all())
-    return ok, "finite cache scales"
+    active = actual[:, :, 0, : DSPARK_QUERY_WIDTH + 1, 0, :]
+    untouched = actual[:, :, 0, DSPARK_QUERY_WIDTH + 1 :, 0, :]
+    ok = bool(torch.isfinite(actual.float()).all() and (active > 0).all() and not untouched.any())
+    return ok, "context and query cache rows published; unused rows unchanged"
+
+
+def _embedding(shape):
+    weight = torch.zeros(shape, dtype=torch.bfloat16)
+    pattern = (torch.arange(shape[-1], dtype=torch.float32) % 29 - 14) / 32
+    for rank in range(EP_SIZE):
+        weight[rank, 0] = ((rank + 1) * pattern).bfloat16()
+        weight[rank, DSPARK_NOISE_TOKEN_ID] = ((rank + 1) * pattern.flip(0)).bfloat16()
+    return weight
 
 
 def build_specs():
@@ -74,12 +86,38 @@ def build_specs():
             from quant import build_mxfp4_pair_lut
 
             initial = build_mxfp4_pair_lut().unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
+        elif name == "embedding_weight":
+            initial = lambda shape=shape: _embedding(shape)
         specs.append(TensorSpec(name, shape, dtype, init_value=initial, resident="stacked"))
     return specs
 
 
-def golden_zero(values):
-    values["head_hidden"].zero_()
+def golden_residual(values):
+    ids = torch.tensor([0] + [DSPARK_NOISE_TOKEN_ID] * (DSPARK_QUERY_WIDTH - 1))
+    for rank in range(EP_SIZE):
+        hidden = values["embedding_weight"][rank, ids].float()
+        x_hc = hidden.unsqueeze(1).expand(-1, 4, -1).clone()
+        pre_mix = torch.zeros(DSPARK_QUERY_WIDTH, 4)
+        pre_mix[:, 0] = 1
+        sublayer = torch.zeros_like(hidden, dtype=torch.bfloat16)
+        for layer in range(DSPARK_DRAFT_LAYERS):
+            attn = golden_mhc_mixes(
+                x_hc,
+                values["hc_attn_fn"][rank, layer],
+                values["hc_attn_scale"][rank, layer],
+                values["hc_attn_base"][rank, layer],
+            )
+            x_hc = golden_hc_post(sublayer, x_hc, attn[1], attn[2]).float()
+            pre_mix, post_mix, residual_mix = golden_mhc_mixes(
+                x_hc,
+                values["hc_ffn_fn"][rank, layer],
+                values["hc_ffn_scale"][rank, layer],
+                values["hc_ffn_base"][rank, layer],
+            )
+            x_hc = golden_hc_post(sublayer, x_hc, post_mix, residual_mix).float()
+        values["head_hidden"][rank, 0] = golden_hc_pre(x_hc, pre_mix).bfloat16()
+    if not bool(values["head_hidden"].abs().sum() > 0):
+        raise AssertionError("the residual reference must be nonzero")
 
 
 if __name__ == "__main__":
@@ -99,7 +137,7 @@ if __name__ == "__main__":
     result = run(
         fn=l3_dspark_drafter,
         specs=build_specs(),
-        golden_fn=golden_zero,
+        golden_fn=golden_residual,
         compare_fn={"window_cache": _zero_cache, "window_cache_scale": _finite_cache_scale},
         config={
             "backend_type": "a5",
@@ -108,8 +146,8 @@ if __name__ == "__main__":
             "ring_heap": 2 * 1024**3,
             "log_level": "warn",
         },
-        atol=0.0,
-        rtol=0.0,
+        atol=0.03,
+        rtol=0.03,
     )
     print(result)
     if not result.passed:
