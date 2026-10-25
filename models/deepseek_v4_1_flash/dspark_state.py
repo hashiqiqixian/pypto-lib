@@ -396,3 +396,77 @@ def l3_accept_target(
             context_valid[rank], context_positions[rank], num_sampled[rank],
             last_sampled[rank], first_query_positions[rank], device=rank,
         )
+
+
+def golden_commit_drafts(
+    slot_ids: torch.Tensor,
+    generations: torch.Tensor,
+    draft_ids: torch.Tensor,
+    state_tokens: torch.Tensor,
+    state_meta: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Publish Markov drafts only after the preceding target window was consumed."""
+    tokens = state_tokens.clone()
+    meta = state_meta.clone()
+    committed = torch.zeros_like(slot_ids, dtype=torch.int32)
+    for request in range(slot_ids.numel()):
+        slot = int(slot_ids[request])
+        if slot < 0 or slot >= meta.shape[0]:
+            continue
+        if int(meta[slot, STATE_VALID]) != 1 or int(meta[slot, STATE_GENERATION]) != int(generations[request]):
+            continue
+        if int(meta[slot, STATE_DRAFT_COUNT]) != 0:
+            continue
+        if int(meta[slot, STATE_ANCHOR]) + DSPARK_QUERY_WIDTH >= int(meta[slot, STATE_LIMIT]):
+            continue
+        tokens[slot, 1:ROWS] = draft_ids[request]
+        meta[slot, STATE_DRAFT_COUNT] = DSPARK_QUERY_WIDTH
+        committed[request] = 1
+    return tokens, meta, committed
+
+
+@pl.jit
+def commit_drafts_rank(
+    slot_ids: pl.Tensor[[BATCH], pl.INT32],
+    generations: pl.Tensor[[BATCH], pl.INT32],
+    draft_ids: pl.Tensor[[BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
+    state_tokens: pl.InOut[pl.Tensor[[BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
+    state_meta: pl.InOut[pl.Tensor[[BATCH, STATE_META_WIDTH], pl.INT32]],
+    committed: pl.Out[pl.Tensor[[BATCH], pl.INT32]],
+):
+    for _core in pl.spmd(1, name_hint="dspark_commit_drafts"):
+        for request in pl.range(BATCH):
+            published = pl.cast(0, pl.INT32)
+            slot = pl.read(slot_ids, [request])
+            if slot >= 0 and slot < BATCH:
+                valid = pl.read(state_meta, [slot, STATE_VALID])
+                generation = pl.read(state_meta, [slot, STATE_GENERATION])
+                expected = pl.read(generations, [request])
+                count = pl.read(state_meta, [slot, STATE_DRAFT_COUNT])
+                anchor = pl.read(state_meta, [slot, STATE_ANCHOR])
+                limit = pl.read(state_meta, [slot, STATE_LIMIT])
+                if valid == 1 and generation == expected and count == 0:
+                    if anchor + DSPARK_QUERY_WIDTH < limit:
+                        for offset in pl.range(DSPARK_QUERY_WIDTH):
+                            draft = pl.read(draft_ids, [request, offset])
+                            pl.write(state_tokens, [slot, offset + 1], pl.cast(draft, pl.INT64))
+                        pl.write(state_meta, [slot, STATE_DRAFT_COUNT], pl.cast(DSPARK_QUERY_WIDTH, pl.INT32))
+                        published = pl.cast(1, pl.INT32)
+            pl.write(committed, [request], published)
+    return state_tokens, state_meta, committed
+
+
+@pl.jit.host
+def l3_commit_drafts(
+    slot_ids: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
+    generations: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
+    draft_ids: pl.Tensor[[EP_SIZE, BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
+    state_tokens: pl.InOut[pl.Tensor[[EP_SIZE, BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
+    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, BATCH, STATE_META_WIDTH], pl.INT32]],
+    committed: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT32]],
+):
+    for rank in pl.range(pld.world_size()):
+        commit_drafts_rank(
+            slot_ids[rank], generations[rank], draft_ids[rank], state_tokens[rank],
+            state_meta[rank], committed[rank], device=rank,
+        )
