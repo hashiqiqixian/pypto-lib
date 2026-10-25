@@ -529,14 +529,14 @@ def prepare_drafter_geometry_rank(
                     pl.write(context_slots, [layer, row], slot)
             for offset in pl.range(DSPARK_QUERY_WIDTH):
                 row = request * DSPARK_QUERY_WIDTH + offset
-                position = first + offset
-                active = first > 0 and position < rope_rows
+                query_position = pl.cast(first + offset, pl.INT32)
+                active = first > 0 and query_position < rope_rows
                 for col in pl.range(ROPE_HALF):
                     cos = pl.cast(0, pl.FP32)
                     sin = pl.cast(0, pl.FP32)
                     if active:
-                        cos = pl.read(rope_cos_table, [position, col])
-                        sin = pl.read(rope_sin_table, [position, col])
+                        cos = pl.read(rope_cos_table, [query_position, col])
+                        sin = pl.read(rope_sin_table, [query_position, col])
                     pl.write(query_rope_cos, [row, col], cos)
                     pl.write(query_rope_sin, [row, col], sin)
     return context_slots, context_rope_cos, context_rope_sin, query_rope_cos, query_rope_sin
@@ -619,14 +619,14 @@ def prepare_prefill_drafter_geometry_rank(
             first = pl.read(first_query_positions, [request])
             for offset in pl.range(DSPARK_QUERY_WIDTH):
                 row = request * DSPARK_QUERY_WIDTH + offset
-                position = first + offset
-                active = first > 0 and position < rope_rows
+                query_position = pl.cast(first + offset, pl.INT32)
+                active = first > 0 and query_position < rope_rows
                 for col in pl.range(ROPE_HALF):
                     cos = pl.cast(0, pl.FP32)
                     sin = pl.cast(0, pl.FP32)
                     if active:
-                        cos = pl.read(rope_cos_table, [position, col])
-                        sin = pl.read(rope_sin_table, [position, col])
+                        cos = pl.read(rope_cos_table, [query_position, col])
+                        sin = pl.read(rope_sin_table, [query_position, col])
                     pl.write(query_rope_cos, [row, col], cos)
                     pl.write(query_rope_sin, [row, col], sin)
     return context_slots, context_rope_cos, context_rope_sin, query_rope_cos, query_rope_sin
