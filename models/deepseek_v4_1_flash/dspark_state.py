@@ -12,7 +12,17 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from config import DECODE_ROWS_PER_REQUEST, DSPARK_QUERY_WIDTH, EP_SIZE, MAX_BATCH_PER_DP, TP_SIZE
+from config import (
+    BLOCK_SIZE,
+    DECODE_ROWS_PER_REQUEST,
+    DSPARK_DRAFT_LAYERS,
+    DSPARK_QUERY_WIDTH,
+    EP_SIZE,
+    FLASH,
+    MAX_BATCH_PER_DP,
+    TABLE_DYN,
+    TP_SIZE,
+)
 
 
 BATCH = MAX_BATCH_PER_DP
@@ -27,6 +37,8 @@ STATE_META_WIDTH = 6
 STATE_TOKEN_WIDTH = ROWS
 PREFILL_SAMPLE_ROWS = 16
 SAMPLED_STRIDE = 8
+ROPE_HALF = FLASH.qk_rope_head_dim // 2
+ROPE_ROWS_DYN = pl.dynamic("V41_DSPARK_ROPE_ROWS_DYN")
 
 if TP_SIZE != 1:
     raise ValueError("DSpark request state currently requires TP1")
@@ -469,4 +481,87 @@ def l3_commit_drafts(
         commit_drafts_rank(
             slot_ids[rank], generations[rank], draft_ids[rank], state_tokens[rank],
             state_meta[rank], committed[rank], device=rank,
+        )
+
+
+@pl.jit
+def prepare_drafter_geometry_rank(
+    context_valid: pl.Tensor[[BATCH, ROWS], pl.INT32],
+    context_positions: pl.Tensor[[BATCH, ROWS], pl.INT32],
+    first_query_positions: pl.Tensor[[BATCH], pl.INT32],
+    block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, BATCH, TABLE_DYN], pl.INT32],
+    rope_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
+    rope_sin_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
+    context_slots: pl.Out[pl.Tensor[[DSPARK_DRAFT_LAYERS, BATCH * ROWS], pl.INT64]],
+    context_rope_cos: pl.Out[pl.Tensor[[BATCH * ROWS, ROPE_HALF], pl.FP32]],
+    context_rope_sin: pl.Out[pl.Tensor[[BATCH * ROWS, ROPE_HALF], pl.FP32]],
+    query_rope_cos: pl.Out[pl.Tensor[[BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+    query_rope_sin: pl.Out[pl.Tensor[[BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+):
+    block_tables.bind_dynamic(2, TABLE_DYN)
+    rope_cos_table.bind_dynamic(0, ROPE_ROWS_DYN)
+    rope_sin_table.bind_dynamic(0, ROPE_ROWS_DYN)
+    table_blocks = pl.tensor.dim(block_tables, 2)
+    rope_rows = pl.tensor.dim(rope_cos_table, 0)
+    for _core in pl.spmd(1, name_hint="dspark_drafter_geometry"):
+        for request in pl.range(BATCH):
+            first = pl.read(first_query_positions, [request])
+            for offset in pl.range(ROWS):
+                row = request * ROWS + offset
+                position = pl.read(context_positions, [request, offset])
+                active = pl.read(context_valid, [request, offset]) == 1
+                active = active and position >= 0 and position < rope_rows
+                for col in pl.range(ROPE_HALF):
+                    cos = pl.cast(0, pl.FP32)
+                    sin = pl.cast(0, pl.FP32)
+                    if active:
+                        cos = pl.read(rope_cos_table, [position, col])
+                        sin = pl.read(rope_sin_table, [position, col])
+                    pl.write(context_rope_cos, [row, col], cos)
+                    pl.write(context_rope_sin, [row, col], sin)
+                for layer in pl.range(DSPARK_DRAFT_LAYERS):
+                    slot = pl.cast(-1, pl.INT64)
+                    if active and position // BLOCK_SIZE < table_blocks:
+                        physical = pl.read(block_tables, [layer, request, position // BLOCK_SIZE])
+                        if physical >= 0:
+                            slot = pl.cast(physical * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT64)
+                    pl.write(context_slots, [layer, row], slot)
+            for offset in pl.range(DSPARK_QUERY_WIDTH):
+                row = request * DSPARK_QUERY_WIDTH + offset
+                position = first + offset
+                active = first > 0 and position < rope_rows
+                for col in pl.range(ROPE_HALF):
+                    cos = pl.cast(0, pl.FP32)
+                    sin = pl.cast(0, pl.FP32)
+                    if active:
+                        cos = pl.read(rope_cos_table, [position, col])
+                        sin = pl.read(rope_sin_table, [position, col])
+                    pl.write(query_rope_cos, [row, col], cos)
+                    pl.write(query_rope_sin, [row, col], sin)
+    return context_slots, context_rope_cos, context_rope_sin, query_rope_cos, query_rope_sin
+
+
+@pl.jit.host
+def l3_prepare_drafter_geometry(
+    context_valid: pl.Tensor[[EP_SIZE, BATCH, ROWS], pl.INT32],
+    context_positions: pl.Tensor[[EP_SIZE, BATCH, ROWS], pl.INT32],
+    first_query_positions: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
+    block_tables: pl.Tensor[[EP_SIZE, DSPARK_DRAFT_LAYERS, BATCH, TABLE_DYN], pl.INT32],
+    rope_cos_table: pl.Tensor[[EP_SIZE, ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
+    rope_sin_table: pl.Tensor[[EP_SIZE, ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
+    context_slots: pl.Out[pl.Tensor[[EP_SIZE, DSPARK_DRAFT_LAYERS, BATCH * ROWS], pl.INT64]],
+    context_rope_cos: pl.Out[pl.Tensor[[EP_SIZE, BATCH * ROWS, ROPE_HALF], pl.FP32]],
+    context_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, BATCH * ROWS, ROPE_HALF], pl.FP32]],
+    query_rope_cos: pl.Out[pl.Tensor[[EP_SIZE, BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+    query_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+):
+    block_tables.bind_dynamic(3, TABLE_DYN)
+    rope_cos_table.bind_dynamic(1, ROPE_ROWS_DYN)
+    rope_sin_table.bind_dynamic(1, ROPE_ROWS_DYN)
+    for rank in pl.range(pld.world_size()):
+        prepare_drafter_geometry_rank(
+            context_valid[rank], context_positions[rank], first_query_positions[rank],
+            block_tables[rank], rope_cos_table[rank], rope_sin_table[rank],
+            context_slots[rank], context_rope_cos[rank], context_rope_sin[rank],
+            query_rope_cos[rank], query_rope_sin[rank], device=rank,
         )

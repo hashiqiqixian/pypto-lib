@@ -257,18 +257,29 @@ def dspark_metadata(
             request = worker + request_offset
             first = pl.read(first_query_positions, [request])
             anchor = pl.read(anchor_ids, [request])
+            active = first > 0
             prefix_start = pl.max(first - DSPARK_WINDOW, 0)
             context_len = first - prefix_start
             visible_len = context_len + DSPARK_QUERY_WIDTH
+            if not active:
+                visible_len = pl.cast(0, pl.INT32)
             for offset in pl.range(DSPARK_QUERY_WIDTH):
                 token = request * DSPARK_QUERY_WIDTH + offset
-                token_id = pl.cast(DSPARK_NOISE_TOKEN_ID, pl.INT64)
-                if offset == 0:
+                token_id = pl.cast(0, pl.INT64)
+                if active:
+                    token_id = pl.cast(DSPARK_NOISE_TOKEN_ID, pl.INT64)
+                if active and offset == 0:
                     token_id = anchor
                 pl.write(query_ids, [token], token_id)
-                pl.write(query_positions, [token], pl.cast(first + offset, pl.INT32))
+                position = pl.cast(0, pl.INT32)
+                if active:
+                    position = pl.cast(first + offset, pl.INT32)
+                pl.write(query_positions, [token], position)
             for layer in pl.range(DSPARK_DRAFT_LAYERS):
                 pl.write(window_lens, [layer, request], pl.cast(visible_len, pl.INT32))
+                for query in pl.range(DSPARK_QUERY_WIDTH):
+                    token = request * DSPARK_QUERY_WIDTH + query
+                    pl.write(query_slots, [layer, token], pl.cast(-1, pl.INT64))
                 for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
                     slot = pl.cast(-1, pl.INT32)
                     if offset < visible_len:
@@ -281,7 +292,7 @@ def dspark_metadata(
                     for query in pl.range(DSPARK_QUERY_WIDTH):
                         token = request * DSPARK_QUERY_WIDTH + query
                         pl.write(window_indices, [layer, token, offset], slot)
-                        if offset == context_len + query:
+                        if active and offset == context_len + query:
                             pl.write(query_slots, [layer, token], pl.cast(slot, pl.INT64))
     return query_ids, query_positions, query_slots, window_indices, window_lens
 
