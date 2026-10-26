@@ -140,19 +140,18 @@ def dspark_attention(
     output: pl.Tensor[[MOE_TOKENS, D], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    tokens = pl.tensor.dim(x, 0)
-    qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([MOE_TOKENS, Q_LORA], dtype=pl.BF16)
+    q = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([MOE_TOKENS, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
     q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens,
                 max_workers=64 if TP_SIZE == 1 else 2147483647)
-    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    kv_projection = pl.create_tensor([MOE_TOKENS, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
-    selected = pl.create_tensor([tokens, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
+    selected = pl.create_tensor([MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attended = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
     # JIT dependency calls require an explicit constexpr binding.
     o_proj(
