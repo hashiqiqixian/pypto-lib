@@ -334,7 +334,7 @@ def kv_proj_rope(
     window_kv: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    return window_kv
+    pass
 
 
 @pl.jit.inline(auto_scope=False)
