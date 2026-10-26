@@ -110,7 +110,7 @@ def q_proj_qr(
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+    query_latent: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x, 0)
@@ -131,7 +131,7 @@ def _q_proj_rope_from_mx(
     wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     q_b_n_tile: pl.constexpr,
     max_workers: pl.constexpr = 2147483647,
@@ -198,7 +198,7 @@ def q_proj_rope(
     wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     max_workers: pl.constexpr = 2147483647,
 ):
