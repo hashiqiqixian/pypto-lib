@@ -145,6 +145,8 @@ def dspark_attention(
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens,
+                max_workers=64 if TP_SIZE == 1 else 2147483647)
     return output, window_cache, window_cache_scale
 
 
