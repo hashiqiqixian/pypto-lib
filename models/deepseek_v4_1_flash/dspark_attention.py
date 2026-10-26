@@ -145,20 +145,6 @@ def dspark_attention(
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens,
-                max_workers=64 if TP_SIZE == 1 else 2147483647)
-    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
-    selected = pl.create_tensor([tokens, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
-    gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
-    # JIT dependency calls require an explicit constexpr binding.
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin, output, num_tokens, grouped_max_workers=GROUPED_WORKER_TILE,
-    )
     return output, window_cache, window_cache_scale
 
 
