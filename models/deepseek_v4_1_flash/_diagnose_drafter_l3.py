@@ -8,6 +8,7 @@ from golden import ScalarSpec, TensorSpec, run
 from pypto.ir import DistributedConfig
 
 import config as C
+from decode_moe import _route_bias
 from dspark_drafter import l3_dspark_drafter
 from expert_routed import build_mxfp4_pair_lut
 
@@ -58,6 +59,8 @@ for name in l3_dspark_drafter.param_names:
         initial = 1
     elif name == "mxfp4_pair_lut":
         initial = build_mxfp4_pair_lut().unsqueeze(0).expand(C.EP_SIZE, -1, -1).contiguous()
+    elif name == "correction_bias":
+        initial = _route_bias().reshape(1, 1, -1).expand(C.EP_SIZE, C.DSPARK_DRAFT_LAYERS, -1).contiguous()
     specs.append(TensorSpec(name, shape, dtype, init_value=initial))
 
 
@@ -80,7 +83,11 @@ result = run(
         "window_cache": lambda *_args, **_kwargs: (True, "cache numerical contents not checked"),
         "window_cache_scale": lambda *_args, **_kwargs: (True, "cache scale numerical contents not checked"),
     },
-    config={"platform": "a5", "distributed_config": DistributedConfig(device_ids=[0, 1, 2, 3], num_sub_workers=0)},
+    config={
+        "platform": "a5",
+        "distributed_config": DistributedConfig(device_ids=[0, 1, 2, 3], num_sub_workers=0),
+        "ring_heap": (4 * 1024**3,) * C.EP_SIZE,
+    },
 )
 print(result)
 if not result.passed:
