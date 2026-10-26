@@ -341,7 +341,7 @@ def draft_layer(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one V4.1 draft decoder layer with delayed mHC boundaries."""
-    tokens = pl.tensor.dim(x_hc, 0)
+    tokens = MOE_TOKENS
     attention_input = pl.create_tensor([tokens, D], dtype=pl.BF16)
     normalized_attention = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
