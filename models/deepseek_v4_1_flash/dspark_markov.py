@@ -13,7 +13,7 @@ import pypto.language.distributed as pld
 import torch
 
 import config as C
-from config import B_DYN, DSPARK_MARKOV_RANK, DSPARK_QUERY_WIDTH, FLASH
+from config import B_DYN, DSPARK_MARKOV_RANK, DSPARK_QUERY_WIDTH, FLASH, TP_SIZE
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, TP_SIZE as LM_HEAD_TP_SIZE, VOCAB_PER_TP, lm_head
 from rmsnorm import rms_norm_tiled
 
@@ -342,8 +342,8 @@ def _markov_sample_from_hidden(
         rms_norm_tiled(flat_hidden, final_norm_weight, normalized, block, rows, output_fp32=False)
     base_logits = pl.create_tensor([batch, DSPARK_QUERY_WIDTH, VOCAB], dtype=pl.FP32)
     flat_logits = pl.reshape(base_logits, [rows, VOCAB])
-    group_base = rank // C.TP_SIZE * C.TP_SIZE
-    tp_rank = rank % C.TP_SIZE
+    group_base = rank // TP_SIZE * TP_SIZE
+    tp_rank = rank % TP_SIZE
     chunks = (rows + MAX_LOGIT_ROWS - 1) // MAX_LOGIT_ROWS
     completed_epochs = logits_epoch + chunks - 1
     for chunk in pl.range(chunks):
@@ -421,14 +421,14 @@ def l3_markov_sample_from_hidden(
     draft_ids.bind_dynamic(1, B_DYN)
     confidences.bind_dynamic(1, B_DYN)
     hidden_window_buf = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    hidden_done_buf = pld.alloc_window_buffer([C.TP_SIZE, 1], dtype=pl.INT32)
+    hidden_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     logits_window_buf = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-    logits_done_buf = pld.alloc_window_buffer([C.TP_SIZE, 1], dtype=pl.INT32)
+    logits_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        hidden_done = pld.window(hidden_done_buf, [C.TP_SIZE, 1], dtype=pl.INT32)
+        hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-        logits_done = pld.window(logits_done_buf, [C.TP_SIZE, 1], dtype=pl.INT32)
+        logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         l2_markov_sample_from_hidden(
             head_hidden[rank],
             final_norm_weight[rank],
