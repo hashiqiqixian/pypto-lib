@@ -168,9 +168,8 @@ def grouped_output(
 
                     accumulated = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE), [t0, output_n], accumulated)
             cube_tids[group * (O_LORA // N_TILE) + nb] = cube_tid
-    with pl.spmd(workers, name_hint="cast_o_a", deps=[cube_tids]):
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, max_workers):
+    for worker in pl.spmd(workers, name_hint="cast_o_a", deps=[cube_tids]):
+        for block in pl.range(worker, blocks, workers):
             t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
             n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
             rows = pl.min(M_TILE, num_tokens - t0)
