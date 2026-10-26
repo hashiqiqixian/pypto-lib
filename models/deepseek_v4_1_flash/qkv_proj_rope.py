@@ -324,12 +324,12 @@ def _kv_normalize_rope(
 
 @pl.jit.inline(auto_scope=False)
 def kv_proj_rope(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    x: pl.Tensor,
     wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
     projected: pl.Tensor,
     window_kv: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
