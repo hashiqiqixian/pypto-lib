@@ -72,7 +72,6 @@ def prepare_target_decode_rank(
     c2a_slots: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT64]],
     c1a_slots: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT64]],
     query_starts: pl.Out[pl.Tensor[[BATCH + 1], pl.INT32]],
-    logit_rows: pl.Out[pl.Tensor[[16], pl.INT32]],
 ):
     embedding_weight.bind_dynamic(0, VOCAB_DYN)
     window_table.bind_dynamic(1, WINDOW_TABLE_DYN)
@@ -85,8 +84,6 @@ def prepare_target_decode_rank(
     for _core in pl.spmd(1, name_hint="dspark_target_decode_metadata"):
         for request in pl.range(BATCH + 1):
             pl.write(query_starts, [request], pl.cast(request * ROWS, pl.INT32))
-        for row in pl.range(16):
-            pl.write(logit_rows, [row], pl.cast(-1, pl.INT32))
         for row in pl.range(PADDED_ROWS):
             request = row // ROWS
             offset = row % ROWS
@@ -159,7 +156,6 @@ def l3_prepare_target_decode(
     c2a_slots: pl.Out[pl.Tensor[[EP_SIZE, PADDED_ROWS], pl.INT64]],
     c1a_slots: pl.Out[pl.Tensor[[EP_SIZE, PADDED_ROWS], pl.INT64]],
     query_starts: pl.Out[pl.Tensor[[EP_SIZE, BATCH + 1], pl.INT32]],
-    logit_rows: pl.Out[pl.Tensor[[EP_SIZE, 16], pl.INT32]],
 ):
     embedding_weight.bind_dynamic(1, VOCAB_DYN)
     window_table.bind_dynamic(2, WINDOW_TABLE_DYN)
@@ -170,7 +166,7 @@ def l3_prepare_target_decode(
             input_ids[rank], positions[rank], active_widths[rank], embedding_weight[rank],
             window_table[rank], c2a_table[rank], c1a_table[rank], x_hc[rank], pre_mix[rank],
             position_ids[rank], request_ids[rank], window_slots[rank], window_indices[rank],
-            c2a_slots[rank], c1a_slots[rank], query_starts[rank], logit_rows[rank], device=rank,
+            c2a_slots[rank], c1a_slots[rank], query_starts[rank], device=rank,
         )
 
 
@@ -230,7 +226,6 @@ def golden_prepare_target_decode(values: Mapping[str, Any]) -> None:
             active_positions, active_requests, values["c1a_table"], BLOCK_SIZE, 1, True,
         )
     values["query_starts"].copy_(torch.arange(BATCH + 1, dtype=torch.int32) * ROWS)
-    values["logit_rows"].fill_(-1)
     values["pre_mix"].fill_(1)
     padded = torch.zeros(PADDED_ROWS, dtype=torch.int64)
     padded[:TARGET_ROWS] = ids
@@ -271,7 +266,6 @@ def run_prepare_target_decode_case(*, platform: str = "a5", device_id: int = 0,
         TensorSpec("c2a_slots", [PADDED_ROWS], torch.int64),
         TensorSpec("c1a_slots", [PADDED_ROWS], torch.int64),
         TensorSpec("query_starts", [BATCH + 1], torch.int32),
-        TensorSpec("logit_rows", [16], torch.int32),
     ]
     return run(
         fn=prepare_target_decode_rank, specs=specs, golden_fn=golden_prepare_target_decode,
@@ -336,7 +330,7 @@ def decode_fwd_dspark(
         position_ids=workspace["position_ids"], request_ids=workspace["request_ids"],
         window_slots=workspace["window_slots"], window_indices=workspace["window_indices"],
         c2a_slots=workspace["c2a_slots"], c1a_slots=workspace["c1a_slots"],
-        query_starts=workspace["query_starts"], logit_rows=workspace["logit_rows"],
+        query_starts=workspace["query_starts"],
     ))
     decode_args = dict(target_model)
     decode_args.pop("embedding_weight")
@@ -346,7 +340,7 @@ def decode_fwd_dspark(
         token_to_req_indices=workspace["request_ids"], window_slots=workspace["window_slots"],
         window_indices=workspace["window_indices"], c2a_compressed_slots=workspace["c2a_slots"],
         c1a_compressed_slots=workspace["c1a_slots"], query_start_loc=workspace["query_starts"],
-        logit_row_indices=workspace["logit_rows"],
+        logit_row_indices=target_model["logit_row_indices"],
     )
     _run(runner, l3_decode_fwd, decode_args)
     for chunk in range(CHUNKS):
