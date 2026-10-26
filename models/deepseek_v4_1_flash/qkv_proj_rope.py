@@ -339,7 +339,6 @@ def kv_proj_rope(
         num_tokens,
         D, HEAD_DIM, "proj_kv", "quant_kv", N_TILE, K_TILE, 1, 2147483647,
     )
-    _kv_normalize_rope(projected, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens)
     return window_kv
 
 
