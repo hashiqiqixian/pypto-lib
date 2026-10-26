@@ -334,11 +334,6 @@ def kv_proj_rope(
     window_kv: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    gemm_bf16_via_mxfp8_to_bf16_staged(
-        x, wkv, wkv_scale, projected,
-        num_tokens,
-        D, HEAD_DIM, "proj_kv", "quant_kv", N_TILE, K_TILE, 1, 2147483647,
-    )
     return window_kv
 
 
