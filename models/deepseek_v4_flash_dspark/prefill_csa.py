@@ -138,6 +138,8 @@ CSA_CMP_BLOCK_NUM = CMP_BLOCK_NUM
 
 # tiling
 CSA_TOPK_TOKEN_TILE = 2
+CSA_CACHE_WRITE_TILE = 64
+CSA_ROPE_TILE = 8
 
 assert COMPRESS_RATIO == INDEXER_COMPRESS_RATIO
 assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
@@ -262,12 +264,16 @@ def _prefill_attention_csa(
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     ori_cache_rows = ori_block_num * BLOCK_SIZE
     kv_cache_flat = pl.reshape(kv_cache, [ori_cache_rows, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_cache_write"):
-        for write_t in pl.range(t_dim):
-            write_row_raw = pl.read(ori_slot_mapping, [write_t])
-            if write_row_raw >= 0:
-                write_row = pl.cast(write_row_raw, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
+    cache_write_blocks = (t_dim + CSA_CACHE_WRITE_TILE - 1) // CSA_CACHE_WRITE_TILE
+    for prep_block in pl.spmd(cache_write_blocks, name_hint="prefill_csa_cache_write"):
+        prep_base = prep_block * CSA_CACHE_WRITE_TILE
+        for prep_offset in pl.range(CSA_CACHE_WRITE_TILE):
+            write_t = prep_base + prep_offset
+            if write_t < t_dim:
+                write_row_raw = pl.read(ori_slot_mapping, [write_t])
+                if write_row_raw >= 0:
+                    write_row = pl.cast(write_row_raw, pl.INDEX)
+                    kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
     compressor_ratio4(
         x_normed,
@@ -288,14 +294,16 @@ def _prefill_attention_csa(
     # Half-width FP32 current-token rows for the indexer Q-RoPE.
     idx_cos = pl.create_tensor([t_dim, HALF_ROPE], dtype=pl.FP32)
     idx_sin = pl.create_tensor([t_dim, HALF_ROPE], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_idx_halfrope"):
-        for idx_t in pl.range(t_dim):
-            idx_cos[idx_t : idx_t + 1, 0:HALF_ROPE] = pl.cast(
-                freqs_cos[idx_t : idx_t + 1, 0:HALF_ROPE], target_type=pl.FP32
-            )
-            idx_sin[idx_t : idx_t + 1, 0:HALF_ROPE] = pl.cast(
-                freqs_sin[idx_t : idx_t + 1, 0:HALF_ROPE], target_type=pl.FP32
-            )
+    rope_blocks = (t_dim + CSA_ROPE_TILE - 1) // CSA_ROPE_TILE
+    for prep_block in pl.spmd(rope_blocks, name_hint="prefill_csa_idx_halfrope"):
+        idx_t = prep_block * CSA_ROPE_TILE
+        idx_rows = pl.min(CSA_ROPE_TILE, t_dim - idx_t)
+        idx_cos_bf16 = pl.slice(freqs_cos, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+        idx_sin_bf16 = pl.slice(freqs_sin, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+        idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
+        idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
+        idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
+        idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
 
     cmp_topk_indices = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.INT32)
     idx_kv_cache_out, idx_kv_scale_out, cmp_topk_indices = prefill_indexer(
@@ -1132,12 +1140,16 @@ def prefill_attention_csa_cp_core(
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     ori_cache_rows = ori_block_num * BLOCK_SIZE
     kv_cache_flat = pl.reshape(kv_cache, [ori_cache_rows, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_cp_cache_write"):
-        for write_t in pl.range(kv_dim):
-            write_row_raw = pl.read(ori_slot_mapping_full, [write_t])
-            if write_row_raw >= 0:
-                write_row = pl.cast(write_row_raw, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
+    cache_write_blocks = (kv_dim + CSA_CACHE_WRITE_TILE - 1) // CSA_CACHE_WRITE_TILE
+    for prep_block in pl.spmd(cache_write_blocks, name_hint="prefill_csa_cp_cache_write"):
+        prep_base = prep_block * CSA_CACHE_WRITE_TILE
+        for prep_offset in pl.range(CSA_CACHE_WRITE_TILE):
+            write_t = prep_base + prep_offset
+            if write_t < kv_dim:
+                write_row_raw = pl.read(ori_slot_mapping_full, [write_t])
+                if write_row_raw >= 0:
+                    write_row = pl.cast(write_row_raw, pl.INDEX)
+                    kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
 
     compressor_ratio4(
         x_normed_full,
@@ -1166,14 +1178,16 @@ def prefill_attention_csa_cp_core(
     # Local indexer queries with half-width FP32 RoPE.
     idx_cos = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
     idx_sin = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_cp_idx_halfrope"):
-        for idx_t in pl.range(q_dim):
-            idx_cos_bf16 = freqs_cos_local[idx_t : idx_t + 1, 0:HALF_ROPE]
-            idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
-            idx_cos[idx_t : idx_t + 1, 0:HALF_ROPE] = idx_cos_fp32
-            idx_sin_bf16 = freqs_sin_local[idx_t : idx_t + 1, 0:HALF_ROPE]
-            idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
-            idx_sin[idx_t : idx_t + 1, 0:HALF_ROPE] = idx_sin_fp32
+    rope_blocks = (q_dim + CSA_ROPE_TILE - 1) // CSA_ROPE_TILE
+    for prep_block in pl.spmd(rope_blocks, name_hint="prefill_csa_cp_idx_halfrope"):
+        idx_t = prep_block * CSA_ROPE_TILE
+        idx_rows = pl.min(CSA_ROPE_TILE, q_dim - idx_t)
+        idx_cos_bf16 = pl.slice(freqs_cos_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+        idx_sin_bf16 = pl.slice(freqs_sin_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+        idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
+        idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
+        idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
+        idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
 
     cmp_topk_indices = pl.create_tensor([q_dim, IDX_TOPK], dtype=pl.INT32)
     cmp_topk_indices = prefill_indexer_query(

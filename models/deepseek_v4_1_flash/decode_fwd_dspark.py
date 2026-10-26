@@ -234,7 +234,7 @@ def golden_prepare_target_decode(values: Mapping[str, Any]) -> None:
 
 
 def run_prepare_target_decode_case(*, platform: str = "a5", devices: tuple[int, ...] = (0,),
-                                   compile_only: bool = False):
+                                   execution_mode: bool = False, compile_only: bool = False):
     """Exercise six-row, partial, and idle requests on one rank or all EP ranks."""
     import torch
 
@@ -272,7 +272,7 @@ def run_prepare_target_decode_case(*, platform: str = "a5", devices: tuple[int, 
     if len(devices) == 1:
         fn = prepare_target_decode_rank
         golden_fn = golden_prepare_target_decode
-        config = {"platform": platform, "device_id": devices[0]}
+        config = {"backend_type": platform, "execution_mode": execution_mode, "device_id": devices[0]}
     elif len(devices) == EP_SIZE:
         fn = l3_prepare_target_decode
         rank_specs = specs
@@ -289,6 +289,7 @@ def run_prepare_target_decode_case(*, platform: str = "a5", devices: tuple[int, 
 
         config = {
             "backend_type": platform,
+            "execution_mode": execution_mode,
             "distributed_config": DistributedConfig(device_ids=list(devices), num_sub_workers=0),
         }
     else:
@@ -296,7 +297,8 @@ def run_prepare_target_decode_case(*, platform: str = "a5", devices: tuple[int, 
     return run(fn=fn, specs=specs, golden_fn=golden_fn, config=config, compile_only=compile_only)
 
 
-def run_copy_target_hidden_case(*, devices: tuple[int, ...], compile_only: bool = False):
+def run_copy_target_hidden_case(*, devices: tuple[int, ...], execution_mode: bool = False,
+                                compile_only: bool = False):
     """Check that the three target-layer taps retain request-major row order."""
     import torch
 
@@ -320,6 +322,7 @@ def run_copy_target_hidden_case(*, devices: tuple[int, ...], compile_only: bool 
         golden_fn=golden,
         config={
             "backend_type": "a5",
+            "execution_mode": execution_mode,
             "distributed_config": DistributedConfig(device_ids=list(devices), num_sub_workers=0),
         },
         compile_only=compile_only,
@@ -510,6 +513,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
     parser.add_argument("--ep", type=int, default=EP_SIZE)
     parser.add_argument("--dp", type=int, default=EP_SIZE)
@@ -520,11 +524,14 @@ if __name__ == "__main__":
         parser.error("--tp/--ep/--dp must match the import-time TP1/DP=EP configuration")
     devices = tuple(int(value) for value in args.device.split(","))
     result = run_prepare_target_decode_case(
-        platform=args.platform, devices=devices, compile_only=args.compile_only,
+        platform=args.platform, devices=devices, execution_mode=args.execution_mode,
+        compile_only=args.compile_only,
     )
     if not result.passed:
         raise SystemExit(str(result))
     if len(devices) == EP_SIZE:
-        result = run_copy_target_hidden_case(devices=devices, compile_only=args.compile_only)
+        result = run_copy_target_hidden_case(
+            devices=devices, execution_mode=args.execution_mode, compile_only=args.compile_only,
+        )
         if not result.passed:
             raise SystemExit(str(result))

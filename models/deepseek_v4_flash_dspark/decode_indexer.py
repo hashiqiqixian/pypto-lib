@@ -1413,6 +1413,14 @@ def golden_indexer(tensors, inner_full=None):
     )
     q_i8 = q_i8.view(tokens, IDX_N_HEADS, IDX_HEAD_DIM)
     q_scale = q_scale.view(tokens, IDX_N_HEADS, 1)
+    # Match the score dispatch: buffered large batches reduce in FP32; the
+    # ordinary and streamed Cube paths also round the head coefficient to FP16.
+    buffered_score = bsz >= 64 and int(kv_seq_lens.max()) // ratio >= 32768
+    coefficient_scale = BUFFERED_SCORE_SCALE if buffered_score else SCORE_COEF_SCALE
+    fixpipe_scale = 1.0 / BUFFERED_SCORE_SCALE if buffered_score else SCORE_FIXPIPE_SCALE
+    coefficient = q_scale * weights.unsqueeze(-1) * coefficient_scale
+    if not buffered_score:
+        coefficient = coefficient.to(torch.float16).float()
     flat_cache = idx_kv_cache_i8.reshape(-1, IDX_HEAD_DIM)
     flat_scale = idx_kv_scale.reshape(-1, 1)
 
@@ -1451,8 +1459,10 @@ def golden_indexer(tensors, inner_full=None):
                     q_i8[token].to(torch.int32),
                     kv_i8[begin:end].to(torch.int32),
                 )
-                score = score_i32.float() * q_scale[token]
-                score = (torch.relu(score) * weights[token].unsqueeze(-1)).sum(dim=0)
+                # FIXPIPE applies ReLU and scaling before the FP16 transfer in
+                # every score path. Keep that rounding boundary in the golden.
+                score = (torch.relu(score_i32.float()) * fixpipe_scale).to(torch.float16).float()
+                score = (score * coefficient[token]).sum(dim=0)
                 score = score * kv_scale[begin:end, 0]
                 score = torch.where(
                     valid_pages[begin:end],
@@ -1722,10 +1732,8 @@ if __name__ == "__main__":
                 # Scores are diagnostic; sparse attention consumes the selected
                 # indices checked below. A3 reduction order may perturb one
                 # root score per query without changing the selected set.
-                # The Cube head reduction rounds its two operands to FP16,
-                # which puts about a quarter of one percent of the scores past
-                # the relative bound. topk_idxs below keeps main's comparator,
-                # which admits a swap only between tied scores.
+                # The golden mirrors the FP16 score/operand boundaries.
+                # topk_idxs admits a swap only between tied scores.
                 atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005
             ),
             "topk_idxs": topk_pair_compare("topk_scores"),
