@@ -14,7 +14,7 @@ import pypto.language.distributed as pld
 import torch
 
 import config as C
-from config import BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, TP_SIZE, T_DYN, TABLE_DYN
+from config import BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, PREFILL_MAX_TOKENS, TP_SIZE, T_DYN, TABLE_DYN
 from o_proj import prefill_tp_output_all_reduce
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
 from hc import hc_head, hc_post, hc_pre, zero_bf16_padding
@@ -839,7 +839,7 @@ def l3_dspark_drafter(
     window_cache_scale.bind_dynamic(2, C.ORI_BLOCKS_DYN)
     head_hidden.bind_dynamic(1, B_DYN)
 
-    attention_output_buf = pld.alloc_window_buffer([C.PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+    attention_output_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     attention_arrived_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
@@ -851,7 +851,7 @@ def l3_dspark_drafter(
     routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        attention_output = pld.window(attention_output_buf, [C.PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+        attention_output = pld.window(attention_output_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         attention_arrived = pld.window(attention_arrived_buf, [TP_SIZE, 1], dtype=pl.INT32)
         recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
