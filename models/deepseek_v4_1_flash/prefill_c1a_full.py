@@ -23,7 +23,7 @@ from pypto.ir import DistributedConfig
 from config import (
     FLASH as M, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
     INDEX_POOL_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, PREFILL_MAX_TOKENS, SP_T_DYN,
-    WINDOW_CACHE_GROUP, AttentionMode, BLOCK_SIZE,
+    WINDOW_CACHE_GROUP, BLOCK_SIZE,
 )
 from hc import golden_mhc_mixes, hc_mixes
 from hc import golden_hc_post, hc_post, prefill_sp_post
@@ -34,7 +34,7 @@ from sparse_attention import (
     prefill_publish_window,
 )
 from hc import HC_INPUT_NAMES, make_hc_inputs
-from utils import token_shards, AttentionGoldenResult
+from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
@@ -50,8 +50,6 @@ CASE_DEFAULT = 'multi_1k'
 CASE_MAX_TOKENS = C.PREFILL_MAX_TOKENS
 CASE_PAGE = 128
 CASE_NAMES = (CASE_DEFAULT, 'causal', 'mixed', 'long')
-TOPK_SCORE_ATOL = 5e-05
-TOPK_SCORE_RTOL = 0.015
 COMMON_INPUT_NAMES = ('x', 'wq_a', 'wq_a_scale', 'q_norm_weight', 'wq_b', 'wq_b_scale', 'wkv', 'wkv_scale', 'kv_norm_weight', 'attn_sink', 'wo_a', 'wo_a_scale', 'wo_b', 'wo_b_scale', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'window_cache', 'window_cache_scale', 'compressed_cache', 'compressed_cache_scale')
 
 
@@ -174,7 +172,6 @@ def prefill_c1a_full_attention(
     )
     if num_tokens > 0:
         source_ready = pl.system.task_dummy(deps=[publication_ready, indexer_completion])
-        tokens = pl.tensor.dim(x, 0)
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -348,31 +345,31 @@ def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, 
                 value = value[:active_tokens]
             kwargs[name] = value
         results.append(golden_fn(**kwargs))
-    reduced = _reduce_tp_partials([result.output for result in results])
+    reduced = _reduce_tp_partials([result["output"] for result in results])
     if active_tokens is None:
         tensors['output'][:] = reduced.unsqueeze(0)
     else:
         tensors['output'][:, :active_tokens] = reduced.unsqueeze(0)
     for rank, result in enumerate(results):
-        tensors['window_cache'][rank].copy_(result.window_cache)
-        _copy_storage(tensors['window_cache_scale'][rank], result.window_cache_scale)
+        tensors['window_cache'][rank].copy_(result["window_cache"])
+        _copy_storage(tensors['window_cache_scale'][rank], result["window_cache_scale"])
         if mode == 'full':
-            tensors['compressed_cache'][rank].copy_(result.compressed_cache)
-            tensors['compressed_cache_scale'][rank].copy_(result.compressed_cache_scale)
-            tensors['index_cache'][rank].copy_(result.index_cache)
-            _copy_storage(tensors['index_cache_scale'][rank], result.index_cache_scale)
+            tensors['compressed_cache'][rank].copy_(result["compressed_cache"])
+            tensors['compressed_cache_scale'][rank].copy_(result["compressed_cache_scale"])
+            tensors['index_cache'][rank].copy_(result["index_cache"])
+            _copy_storage(tensors['index_cache_scale'][rank], result["index_cache_scale"])
             ids = tensors['pool_block_ids'][rank]
             counts = tensors['pool_block_counts'][rank]
             ids.fill_(-1)
             counts.zero_()
-            rows = result.pool_block_ids.shape[0]
-            ids[:rows].copy_(result.pool_block_ids)
-            counts[:rows].copy_(result.pool_block_counts)
+            rows = result["pool_block_ids"].shape[0]
+            ids[:rows].copy_(result["pool_block_ids"])
+            counts[:rows].copy_(result["pool_block_counts"])
         if mode in ('full', 'reindex'):
             if active_tokens is None:
-                tensors['topk_indices'][rank].copy_(result.topk_indices)
+                tensors['topk_indices'][rank].copy_(result["topk_indices"])
             else:
-                tensors['topk_indices'][rank, :active_tokens].copy_(result.topk_indices)
+                tensors['topk_indices'][rank, :active_tokens].copy_(result["topk_indices"])
 
 
 def _physical_to_logical(inputs: dict[str, torch.Tensor], rank: int, token: int) -> dict[int, int]:
@@ -433,7 +430,7 @@ def topk_indices_compare(mode: str, score_fn: Callable) -> Callable:
                 extra_logical = torch.tensor([physical_to_logical[row] for row in extra], dtype=torch.int64)
                 missing_scores = torch.sort(scores[token, missing_logical], descending=True).values
                 extra_scores = torch.sort(scores[token, extra_logical], descending=True).values
-                tolerance = TOPK_SCORE_ATOL + TOPK_SCORE_RTOL * missing_scores.abs()
+                tolerance = 5e-05 + 0.015 * missing_scores.abs()
                 score_gap = missing_scores - extra_scores
                 if torch.all(score_gap <= tolerance):
                     continue
@@ -501,10 +498,10 @@ def golden_prefill_attn_c1a_full(
     index_wq_b: torch.Tensor,
     index_wq_b_scale: torch.Tensor,
     index_weights_proj: torch.Tensor,
-) -> AttentionGoldenResult:
+) -> dict:
     """Return one rank's FP32 partial output and reference cache state."""
     return golden_compressed_attention(
-        mode=AttentionMode.FULL, ratio=1,
+        mode='full', ratio=1,
         x=x,
         wq_a=wq_a, wq_a_scale=wq_a_scale, q_norm_weight=q_norm_weight, wq_b=wq_b, wq_b_scale=wq_b_scale,
         wkv=wkv, wkv_scale=wkv_scale, kv_norm_weight=kv_norm_weight, attn_sink=attn_sink,
@@ -562,32 +559,6 @@ def prefill_publish_decoder(
     )
     ready = pl.system.task_dummy(deps=[compressed_ready, index_ready])
     return ready
-
-
-CACHE_SLOTS = {
-    "window_cache": "window_slots",
-    "window_cache_scale": "window_slots",
-    "compressed_cache": "compressed_slots",
-    "compressed_cache_scale": "compressed_slots",
-    "index_cache": "compressed_slots",
-    "index_cache_scale": "compressed_slots",
-}
-
-
-def cache_compare(world_size, tokens, names=None):
-    """Mapped rows must match byte for byte and every other cache row must stay unchanged."""
-    options = dict(
-        mapping_shape=(world_size, tokens),
-        block_size=BLOCK_SIZE,
-        leading_rank_axis=True,
-        atol=0.0,
-        rtol=0.0,
-        max_error_ratio=0.0,
-    )
-    return {
-        name: mapped_pool_ratio_allclose(CACHE_SLOTS[name], pool_name=name, **options)
-        for name in (CACHE_SLOTS if names is None else names)
-    }
 
 
 RANKS_DYN = pl.dynamic("RANKS_DYN")
@@ -855,14 +826,14 @@ def c1a_sp_reference_attention(mode, tensors, x, ranks, *, reference):
             result['pool_block_counts'].zero_()
         if active:
             computed = reference(**values)
-            partial[:active] = computed.output
+            partial[:active] = computed["output"]
             for name in STATE_NAMES[mode]:
                 if name == 'topk_indices':
-                    result[name][:active] = computed.topk_indices
+                    result[name][:active] = computed["topk_indices"]
                 elif name in ('pool_block_ids', 'pool_block_counts'):
-                    result[name][:active] = getattr(computed, name)
+                    result[name][:active] = computed[name]
                 else:
-                    result[name] = getattr(computed, name)
+                    result[name] = computed[name]
         partials.append(partial)
         results.append(result)
     return (sum(partials).bfloat16(), results)
@@ -960,8 +931,46 @@ def make_c1a_sp_compare(mode, initial_state, world_size, tokens):
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
         "attn_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
         "x_hc_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
-        **cache_compare(world_size, tokens, [name for name in STATE_NAMES[mode] if "cache" in name]),
+        "window_cache": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window_cache",
+            mapping_shape=(world_size, tokens),
+            block_size=BLOCK_SIZE, leading_rank_axis=True,
+            atol=0.0, rtol=0.0, max_error_ratio=0.0,
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window_cache_scale",
+            mapping_shape=(world_size, tokens),
+            block_size=BLOCK_SIZE, leading_rank_axis=True,
+            atol=0.0, rtol=0.0, max_error_ratio=0.0,
+        ),
     }
+    if mode == "full":
+        compares.update({
+            "compressed_cache": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="compressed_cache",
+                mapping_shape=(world_size, tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "compressed_cache_scale": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="compressed_cache_scale",
+                mapping_shape=(world_size, tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "index_cache": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="index_cache",
+                mapping_shape=(world_size, tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "index_cache_scale": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="index_cache_scale",
+                mapping_shape=(world_size, tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+        })
     for name in STATE_NAMES[mode]:
         if name == "topk_indices":
             compares[name] = selected_topk_compare
@@ -1459,7 +1468,42 @@ if __name__ == "__main__":
             "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "attn_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
-            **cache_compare(len(devices), fixture_token_count(args.tokens, args.case)),
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache_scale",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "compressed_cache": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="compressed_cache",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "compressed_cache_scale": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="compressed_cache_scale",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "index_cache": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="index_cache",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "index_cache_scale": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="index_cache_scale",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
             "topk_indices": wrap_attention_compare(topk_indices_compare("full", golden_index_scores)),
         },
     )

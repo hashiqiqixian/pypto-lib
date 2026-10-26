@@ -6,44 +6,22 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SWA decode Attention half-layer composition entry."""
+"""SWA decode attention with mHC."""
 
-
-from dataclasses import replace
-from golden import ScalarSpec, TensorSpec
-import torch
-from golden import mapped_pool_ratio_allclose
 
 import pypto.language as pl
-
-from config import (
-    FLASH as M,
-    TP_SIZE,
-    T_DYN,
-    ORI_BLOCKS_DYN,
-    WINDOW_CACHE_GROUP,
-)
-
-
-from sparse_attention import build_swa_leaf_specs, golden_swa_leaf
-from golden import ratio_allclose
-
-# PyPTO resolves inline calls and JIT-body constants only from direct names.
-from config import LOCAL_T_DYN
-from sparse_attention import publish_window_row
-from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
-from sparse_attention import swa_attention_partial
-from o_proj import o_proj
-from hc import hc_pre, zero_bf16_padding, golden_hc_pre
-from hc import golden_mhc_mixes, hc_mixes
-from rmsnorm import golden_rms_norm, rms_norm_tiled
-from hc import golden_hc_post, hc_post, _hc_post_from_partial
+from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
+from sparse_attention import publish_window_row, swa_attention_partial
+from qkv_proj_rope import qkv_proj_rope
+from o_proj import o_proj, o_proj_hc_post
+from hc import hc_pre, _hc_pre_norm, zero_bf16_padding, hc_mixes, hc_post, _hc_post_from_partial
+from rmsnorm import rms_norm_tiled
 
 
 # model config
-LOCAL_H = M.num_attention_heads // TP_SIZE
-LOCAL_O_GROUPS = M.o_groups // TP_SIZE
-LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+LOCAL_H = M.num_attention_heads
+LOCAL_O_GROUPS = M.o_groups
+LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -55,8 +33,8 @@ HC_DIM = M.hc_dim
 MIX_HC = M.mix_hc
 MX_GROUP = M.weight_block_size[0]
 
-# Tiling.
-Q_ROPE_WORKER_TILE = 64 if TP_SIZE == 1 else 2147483647
+# tiling
+Q_ROPE_WORKER_TILE = 64
 
 
 @pl.jit.inline(auto_scope=False)
@@ -93,48 +71,60 @@ def decode_swa(
 ):
     """Run one SWA attention sublayer and emit the staggered mix for the next sublayer."""
     tokens = pl.tensor.dim(x_hc, 0)
-    x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_mixes(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
     )
-    hc_pre(x_hc, incoming_pre_mix, x_attn)
-    norm_tokens = pl.tensor.dim(x_attn, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_block, norm_tokens, output_fp32=False)
+
+    x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    if num_tokens > 0 and num_tokens <= 16 and tokens == num_tokens:
+        _hc_pre_norm(x_hc, incoming_pre_mix, attn_norm_weight, x_norm)
+    else:
+        x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
+        hc_pre(x_hc, incoming_pre_mix, x_attn)
+        norm_tokens = pl.tensor.dim(x_attn, 0)
+        for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="norm_in"):
+            rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_block, norm_tokens, output_fp32=False)
+
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens, max_workers=Q_ROPE_WORKER_TILE)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
+    qkv_proj_rope(
+        x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+        qr, q, kv_projection, kv, num_tokens, max_workers=Q_ROPE_WORKER_TILE,
+        fuse_qnorm=True, q_b_n_tile=256, q_b_max_workers=2147483647,
+    )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    swa_attention_partial(
-        q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens,
-    )
-    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b,
-        wo_b_scale, rope_cos, rope_sin,
-        partial, num_tokens, grouped_max_workers=4096,
-    )
-    output_rows = pl.tensor.dim(attention_output, 0)
-    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
-        _hc_post_from_partial(partial, attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens)
+    swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
+    if num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
+        o_proj_hc_post(
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
+        )
     else:
-        for row in pl.spmd(output_rows, name_hint="swa_output_cast"):
-            for col in pl.range(0, D, 512):
-                value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-                if row < num_tokens:
-                    partial_tile = pl.load(partial, [row, col], [1, 512])
-                    value = pl.cast(partial_tile, pl.BF16, mode="rint")
-                attention_output = pl.store(value, [row, col], attention_output)
-        hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
+        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b,
+            wo_b_scale, rope_cos, rope_sin,
+            partial, num_tokens, grouped_max_workers=4096,
+        )
+        output_rows = pl.tensor.dim(attention_output, 0)
+        if num_tokens > 0 and num_tokens <= 16:
+            _hc_post_from_partial(partial, attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens)
+        else:
+            for row in pl.spmd(output_rows, name_hint="cast_out"):
+                for col in pl.range(0, D, 512):
+                    value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                    if row < num_tokens:
+                        partial_tile = pl.load(partial, [row, col], [1, 512])
+                        value = pl.cast(partial_tile, pl.BF16, mode="rint")
+                    attention_output = pl.store(value, [row, col], attention_output)
+            hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
     return attention_hidden, attention_pre_mix
 
 
@@ -164,9 +154,7 @@ def l2_decode_swa(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-    ],
+    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     attention_output: pl.InOut[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
@@ -174,107 +162,139 @@ def l2_decode_swa(
 ):
     """Dispatch one production SWA composition to a device-selected JIT entry."""
     return decode_swa(
-        x_hc,
-        incoming_pre_mix,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
+        x_hc, incoming_pre_mix,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
-        wq_a,
-        wq_a_scale,
-        q_norm_weight,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        wkv_scale,
-        kv_norm_weight,
+        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight,
         attn_sink,
-        wo_a, wo_a_scale,
-        wo_b,
-        wo_b_scale,
-        rope_cos,
-        rope_sin,
-        window_slots,
-        window_indices,
-        window_cache,
-        window_cache_scale,
-        attention_output,
-        attention_hidden,
-        attention_pre_mix,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        window_slots, window_indices,
+        window_cache, window_cache_scale,
+        attention_output, attention_hidden, attention_pre_mix,
         num_tokens,
     )
 
 
 @pl.jit.host
 def l3_decode_swa(
-    x_hc: pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32],
-    hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[TP_SIZE, 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[TP_SIZE, MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[TP_SIZE, D], pl.BF16],
-    wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[TP_SIZE, D // MX_GROUP, Q_LORA], pl.FP8E8M0],
-    q_norm_weight: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[TP_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-    wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[TP_SIZE, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
-    kv_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
-    rope_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[TP_SIZE, T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[TP_SIZE, T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    attention_output: pl.InOut[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, D], pl.BF16]],
-    attention_hidden: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_pre_mix: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    attention_output: pl.InOut[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
+    attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(1, LOCAL_T_DYN)
-    rope_cos.bind_dynamic(1, T_DYN)
-    window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
+    x_hc.bind_dynamic(0, LOCAL_T_DYN)
+    rope_cos.bind_dynamic(0, T_DYN)
+    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     # MX_B_NN weight-scale views.
-    wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[0]
-    wq_b_scale_r: pl.Tensor[
-        [Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN
-    ] = wq_b_scale[0]
-    wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[0]
-    wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[0]
+    wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale
+    wq_b_scale_r: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale
+    wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale
+    wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale
     l2_decode_swa(
-        x_hc[0], incoming_pre_mix[0],
-        hc_attn_fn[0], hc_attn_scale[0], hc_attn_base[0],
-        attn_norm_weight[0],
-        wq_a[0], wq_a_scale_r, q_norm_weight[0], wq_b[0], wq_b_scale_r,
-        wkv[0], wkv_scale_r, kv_norm_weight[0],
-        attn_sink[0],
-        wo_a[0], wo_a_scale[0], wo_b[0], wo_b_scale_r,
-        rope_cos[0], rope_sin[0],
-        window_slots[0], window_indices[0],
-        window_cache[0], window_cache_scale[0],
-        attention_output[0], attention_hidden[0], attention_pre_mix[0],
+        x_hc, incoming_pre_mix,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_weight,
+        wq_a, wq_a_scale_r, q_norm_weight, wq_b, wq_b_scale_r,
+        wkv, wkv_scale_r, kv_norm_weight,
+        attn_sink,
+        wo_a, wo_a_scale, wo_b, wo_b_scale_r,
+        rope_cos, rope_sin,
+        window_slots, window_indices,
+        window_cache, window_cache_scale,
+        attention_output, attention_hidden, attention_pre_mix,
         num_tokens, device=0,
     )
 
 
-SCALAR_NAMES = ("num_tokens", "attention_epoch")
+def build_swa_specs(args):
+    """Build SWA attention operands, mHC boundaries, and runtime specifications."""
+    from golden import ScalarSpec, TensorSpec
+    import torch
+    from functools import partial
+    from config import MAX_BATCH_PER_DP
+    from utils import packed_query_lengths
+    from sparse_attention import SWA_INPUT_NAMES, make_swa_inputs, make_packed_swa_inputs
 
-
-def make_boundary_specs(args):
-    """Create local mHC token slabs, full attention gather storage, and runtime scalars."""
-    # Keep one uniform physical slab per rank.  The last rank(s) may contain
-    # padding when the active token count is not divisible by TP; the runtime
-    # scalar ``num_tokens`` and the collectives' first/count calculation keep
-    # those rows out of the gather and reduce-scatter.
-    local = getattr(args, "local_tokens", (args.tokens + args.tp - 1) // args.tp)
-    generator = torch.Generator().manual_seed(args.seed + 1000)
+    if getattr(args, "dp", 1) != 1:
+        raise ValueError("decode SWA specs describe one device")
+    packed = getattr(args, "start_pos", None) is not None or args.tokens > MAX_BATCH_PER_DP
+    packed = packed or args.requests != args.tokens or args.case in ("prefix", "shuffle")
+    if packed:
+        query_lens = getattr(args, "query_lens", None)
+        lengths = packed_query_lengths(args.tokens, args.requests, query_lens)
+        if query_lens is None and args.requests > 1 and lengths[-1] > 16:
+            lengths[0] += 7
+            lengths[-1] -= 7
+        prefixes = ([127, 128, 511, 1048000] * 8)[:args.requests] if args.case == "prefix" else [0] * args.requests
+        if getattr(args, "start_pos", None) is not None:
+            prefixes = args.start_pos
+        pages = 1 + sum((p + n + 128) // 128 - max(0, p - 127) // 128 + 1 for p, n in zip(prefixes, lengths))
+    else:
+        pages = args.tokens + 1
+    leaf_shapes = (
+        [args.tokens, D], [D, Q_LORA], [D // 32, Q_LORA], [Q_LORA],
+        [Q_LORA, LOCAL_H * HEAD_DIM], [Q_LORA // 32, LOCAL_H * HEAD_DIM],
+        [D, HEAD_DIM], [D // 32, HEAD_DIM], [HEAD_DIM], [LOCAL_H],
+        [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA],
+        [LOCAL_O_WIDTH, D], [LOCAL_O_WIDTH // 32, D],
+        [args.tokens, ROPE_DIM // 2], [args.tokens, ROPE_DIM // 2], [args.tokens], [args.tokens, 128],
+        [pages, 128, 1, HEAD_DIM], [pages, 128, 1, HEAD_DIM // 32],
+    )
+    bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
+    dtypes = (bf, fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, fp, mx, fp, mx,
+              torch.float32, torch.float32, torch.int64, torch.int32, fp, bf)
+    values = None
+    if not getattr(args, "compile_only", False) and not getattr(args, "golden_data", None):
+        if packed:
+            values = make_packed_swa_inputs(
+                args.tokens, args.requests, args.seed, args.case,
+                start_pos=getattr(args, "start_pos", None), query_lens=getattr(args, "query_lens", None),
+            )
+        else:
+            values = make_swa_inputs(args.tokens, args.seed)
+            if args.case == "masked":
+                values["window_slots"].fill_(-1)
+                values["window_indices"].fill_(-1)
+            elif args.case == "zero":
+                values["x"].zero_()
+                values["window_cache"].view(torch.uint8).zero_()
+            elif args.case == "sink":
+                values["attn_sink"].fill_(1000)
     specs = []
+    for name, shape, dtype in zip(SWA_INPUT_NAMES, leaf_shapes, dtypes):
+        if name == "x":
+            continue
+        initialize = None if values is None else partial(torch.clone, values[name])
+        specs.append(TensorSpec(name, shape, dtype, init_value=initialize))
+    local = getattr(args, "local_tokens", args.tokens)
+    generator = torch.Generator().manual_seed(args.seed + 1000)
     shapes = {
         "x_hc": [local, HC_MULT, D],
         "incoming_pre_mix": [local, HC_MULT],
@@ -292,133 +312,73 @@ def make_boundary_specs(args):
         elif name == "incoming_pre_mix":
             value = torch.softmax(value, dim=-1)
         if name in ("x_hc", "incoming_pre_mix"):
-            # Sequence-parallel ranks own different slices of the batch, so the token
-            # inputs must differ per rank: with replicated values a gather or
-            # ReduceScatter that mis-orders the slabs would still compare equal.
-            stacked = torch.randn([args.tp, *shape], generator=generator)
+            stacked = torch.randn(shape, generator=generator)
             if name == "incoming_pre_mix":
                 stacked = torch.softmax(stacked, dim=-1)
         else:
-            stacked = value.unsqueeze(0).repeat(args.tp, *([1] * len(shape)))
-        specs.append(
-            TensorSpec(name, [args.tp, *shape], value.dtype, init_value=stacked, resident="stacked")
-        )
+            stacked = value
+        specs.append(TensorSpec(name, shape, value.dtype, init_value=stacked))
     for name, shape, dtype in (
         ("attention_output", [local, D], torch.bfloat16),
         ("attention_hidden", [local, HC_MULT, D], torch.float32),
         ("attention_pre_mix", [local, HC_MULT], torch.float32),
     ):
         sentinel = 13.0 if name == "attention_output" else 0.0
-        specs.append(TensorSpec(name, [args.tp, *shape], dtype, init_value=sentinel, resident="stacked"))
-    specs.append(
-        TensorSpec(
-            "gathered", [args.tp, args.tokens, D], torch.bfloat16,
-            init_value=13.0, resident="stacked",
-        )
-    )
+        specs.append(TensorSpec(name, shape, dtype, init_value=sentinel))
+    specs.append(TensorSpec("gathered", [args.tokens, D], torch.bfloat16, init_value=13.0))
     specs.append(ScalarSpec("num_tokens", torch.int32, args.active_tokens))
-    specs.append(
-        ScalarSpec(
-            "attention_epoch",
-            torch.int32,
-            1,
-            compile_runtime=True,
-            benchmark_step=None,
-        )
-    )
-    return specs
-
-
-def assemble_specs(args, leaf_specs, spec_names, aliases=None):
-    """Combine one leaf's exact specs with the stable half-layer boundary specs."""
-    aliases = aliases or {}
-    specs = []
-    for spec in leaf_specs:
-        name = aliases.get(spec.name, spec.name)
-        if name in ("x", "output", *SCALAR_NAMES):
-            continue
-        specs.append(spec if name == spec.name else replace(spec, name=name))
-    specs.extend(make_boundary_specs(args))
+    specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
     by_name = {spec.name: spec for spec in specs}
-    missing = [name for name in spec_names if name not in by_name]
-    if missing:
-        raise ValueError(f"missing Attention specs: {missing}")
-    return [by_name[name] for name in spec_names]
+    return [by_name[name] for name in l3_decode_swa.param_names]
 
 
-def build_specs(args):
-    """Specs for the TP1 SWA attention composition."""
-    value_build_swa_specs = build_swa_leaf_specs(args, 'decode')
-    return assemble_specs(args, value_build_swa_specs, l3_decode_swa.param_names)
-
-
-def golden_decode_swa(tensors):
+def golden_swa(tensors, *, reference=None):
     """Compose TP1 mHC, normalization, QKV, attention and output references."""
+    import torch
+    from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
+    from hc import golden_hc_pre, golden_mhc_mixes, golden_hc_post
+    from rmsnorm import golden_rms_norm
+
     active = int(tensors["num_tokens"])
     pre_mix, post_mix, residual_mix = golden_mhc_mixes(
-        tensors["x_hc"][0],
-        tensors["hc_attn_fn"][0], tensors["hc_attn_scale"][0], tensors["hc_attn_base"][0],
+        tensors["x_hc"],
+        tensors["hc_attn_fn"], tensors["hc_attn_scale"], tensors["hc_attn_base"],
     )
-    tensors["attention_pre_mix"][0].copy_(pre_mix)
-    collapsed = golden_hc_pre(tensors["x_hc"][0], tensors["incoming_pre_mix"][0]).to(torch.bfloat16)
-    normalized = golden_rms_norm(collapsed[:active], tensors["attn_norm_weight"][0]).unsqueeze(0)
-    leaf = dict(tensors, x=normalized, output=tensors["attention_output"][:, :active])
-    golden_swa_leaf(leaf)
-    tensors["attention_hidden"][0].zero_()
-    tensors["attention_output"][0, active:].zero_()
+    tensors["attention_pre_mix"].copy_(pre_mix)
+    collapsed = golden_hc_pre(tensors["x_hc"], tensors["incoming_pre_mix"]).to(torch.bfloat16)
+    normalized = golden_rms_norm(collapsed[:active], tensors["attn_norm_weight"])
+    if reference is None:
+        inputs = {name: normalized if name == "x" else tensors[name] for name in SWA_INPUT_NAMES}
+        cache_rows = tensors["window_cache"].shape[0] * 128
+        shared_cache = active >= 32 and cache_rows <= active * 128
+        partial, cache, scale = swa_official_reference(inputs, shared_cache=shared_cache)
+        tensors["attention_output"][:active].copy_(partial.bfloat16())
+        tensors["window_cache"].view(torch.uint8).copy_(cache.contiguous().view(torch.uint8))
+        tensors["window_cache_scale"].copy_(scale)
+    else:
+        import inspect
+
+        parameters = inspect.signature(reference).parameters
+        inputs = {name: normalized if name == "x" else tensors[name] for name in parameters}
+        computed = reference(**inputs)
+        tensors["attention_output"][:active].copy_(computed["output"])
+        for name in ("window_cache", "window_cache_scale"):
+            tensors[name].view(torch.uint8).copy_(computed[name].contiguous().view(torch.uint8))
+    tensors["attention_hidden"].zero_()
+    tensors["attention_output"][active:].zero_()
     if active:
         hidden = golden_hc_post(
-            tensors["attention_output"][0, :active], tensors["x_hc"][0, :active],
+            tensors["attention_output"][:active], tensors["x_hc"][:active],
             post_mix[:active], residual_mix[:active],
         ).to(torch.float32)
-        tensors["attention_hidden"][0, :active].copy_(hidden)
-
-
-def comparisons(args, devices):
-    leaf = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
-    compare = {
-        "attention_hidden": leaf,
-        "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
-    }
-    compare.update(
-        {
-            "attention_output": leaf,
-            # Composed rows can flip one FP8 code at a quantization boundary: allow one
-            # subnormal step (2**-9) plus one relative step (2**-3) on the payload, and less
-            # than 1% of mapped rows to miss even that.
-            **window_cache_compare(
-                len(devices), args.tokens, payload_atol=2 ** -9, payload_rtol=2 ** -3,
-                payload_error_ratio=0.01,
-            ),
-        }
-    )
-    return compare
-
-
-def window_cache_compare(
-    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
-    scale_rtol=0.0, scale_error_ratio=0.0,
-):
-    """Compare the mapped window rows and require every other row to stay unchanged."""
-    options = dict(
-        mapping_shape=(world_size, tokens),
-        block_size=128,
-        leading_rank_axis=True,
-    )
-    return {
-        "window_cache": mapped_pool_ratio_allclose(
-            "window_slots", pool_name="window cache",
-            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
-        ),
-        "window_cache_scale": mapped_pool_ratio_allclose(
-            "window_slots", pool_name="window cache scale",
-            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
-        ),
-    }
+        tensors["attention_hidden"][:active].copy_(hidden)
+    tensors["attention_input"] = collapsed
 
 
 if __name__ == "__main__":
-    from utils import parse_decode_startpos
+    from golden import mapped_pool_ratio_allclose, ratio_allclose
+
+    from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
     import argparse
 
@@ -429,8 +389,10 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    startpos_help = "one position per request; omitted: default validation workload"
-    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
+    startpos_help = "one starting position per request; omitted: default validation workload"
+    parser.add_argument("--start-pos", "--startpos", dest="startpos", type=parse_decode_startpos, help=startpos_help)
+    query_help = "one query length per start-pos; omitted: config.DECODE_ROWS_PER_REQUEST each"
+    parser.add_argument("--query-lens", type=parse_decode_query_lens, help=query_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=("mixed", "shuffle", "prefix"), default="mixed")
     parser.add_argument("--compile-only", action="store_true")
@@ -438,18 +400,31 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.set_defaults(tokens=32, requests=4)
     args = parser.parse_args()
-    if args.startpos is not None:
-        args.tokens = args.requests = len(args.startpos)
+    configure_decode_workload(args, parser)
     args.start_pos = args.startpos
-    args.tp = args.dp = 1
+    args.dp = 1
     args.active_tokens = args.tokens
     args.bench = False
     devices = [args.device]
     result = run(
         fn=l3_decode_swa,
-        specs=build_specs(args),
-        golden_fn=golden_decode_swa,
-        compare_fn=comparisons(args, devices),
+        specs=build_swa_specs(args),
+        golden_fn=golden_swa,
+        compare_fn={
+            "attention_hidden": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
+            "attention_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache", mapping_shape=(args.tokens,),
+                block_size=128, leading_rank_axis=False,
+                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.01,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache scale", mapping_shape=(args.tokens,),
+                block_size=128, leading_rank_axis=False,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+        },
         config={
             "backend_type": args.backend_type, "execution_mode": args.execution_mode,
             "enable_chip_swimlane": args.enable_chip_swimlane,

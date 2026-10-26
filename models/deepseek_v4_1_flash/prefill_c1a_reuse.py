@@ -12,11 +12,10 @@ import math
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
-from golden import ScalarSpec, TensorSpec, ratio_allclose, run
+from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
 from config import (
-    FLASH as M, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, PREFILL_MAX_TOKENS,
+    FLASH as M, BLOCK_SIZE, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, PREFILL_MAX_TOKENS,
     WINDOW_CACHE_GROUP, SP_T_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN, INDEX_POOL_BLOCKS_DYN, INDEX_CACHE_GROUP,
-    AttentionMode,
 )
 from hc import golden_mhc_mixes, hc_mixes
 from hc import golden_hc_post, hc_post, prefill_sp_post
@@ -25,14 +24,12 @@ from rmsnorm import golden_rms_norm, rms_norm_tiled
 from prefill_c1a_full import (
     CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count, make_fixture_values, COMMON_INPUT_NAMES,
 )
-from utils import AttentionGoldenResult
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention, prefill_publish_window,
 )
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
-from prefill_c1a_full import cache_compare
 
 
 # model config
@@ -101,7 +98,6 @@ def prefill_c1a_reuse_attention(
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
         source_ready = pl.system.task_dummy(deps=[])
-        tokens = pl.tensor.dim(x, 0)
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -159,10 +155,10 @@ def golden_prefill_attn_c1a_reuse(
     compressed_cache: torch.Tensor,
     compressed_cache_scale: torch.Tensor,
     compressed_indices: torch.Tensor,
-) -> AttentionGoldenResult:
+) -> dict:
     """Return one rank's FP32 partial output and reference cache state."""
     return golden_compressed_attention(
-        mode=AttentionMode.REUSE, ratio=1,
+        mode='reuse', ratio=1,
         x=x,
         wq_a=wq_a, wq_a_scale=wq_a_scale, q_norm_weight=q_norm_weight, wq_b=wq_b, wq_b_scale=wq_b_scale,
         wkv=wkv, wkv_scale=wkv_scale, kv_norm_weight=kv_norm_weight, attn_sink=attn_sink,
@@ -734,7 +730,18 @@ if __name__ == "__main__":
             "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "attn_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
-            **cache_compare(len(devices), fixture_token_count(args.tokens, args.case), ("window_cache", "window_cache_scale")),
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache_scale",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
         },
     )
     if not result.passed:

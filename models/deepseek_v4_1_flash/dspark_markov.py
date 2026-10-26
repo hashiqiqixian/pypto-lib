@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim
 """V4.1 DSpark five-step Markov sampling."""
 
 import pypto.language as pl
@@ -451,12 +450,8 @@ def l3_markov_sample_from_hidden(
         )
 
 
-def run_markov_case(
-    *,
-    platform: str = "a5sim",
-    device_id: int = 0,
-    compile_only: bool = False,
-):
+def run_markov_case(*, platform: str = "a5sim", device_id: int = 0,
+                    compile_only: bool = False):
     """Validate the complete five-token Markov recurrence."""
     from golden import TensorSpec, run
 

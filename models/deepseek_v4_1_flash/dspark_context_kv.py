@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim
 """Publish one V4.1 DSpark draft layer's context KV into its SWA cache."""
 
 import pypto.language as pl
@@ -14,7 +13,8 @@ import torch
 
 from config import DSPARK_QUERY_WIDTH, FLASH, ORI_BLOCKS_DYN, T_DYN
 from qkv_proj_rope import golden_rope_interleave, kv_proj_rope
-from quant import mxfp8_linear, quantize_mxfp8_cache
+from gemm import golden_mxfp8_linear_grouped_sum
+from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm
 from sparse_attention import publish_window_row
 
@@ -49,7 +49,7 @@ def golden_context_kv_cache(
     updated_cache = cache.clone()
     updated_scale = cache_scale.clone()
     if rows.numel():
-        projected = golden_rms_norm(mxfp8_linear(main_x, weight, weight_scale), norm_weight)
+        projected = golden_rms_norm(golden_mxfp8_linear_grouped_sum(main_x, weight, weight_scale), norm_weight)
         rope_dim = cos.shape[-1] * 2
         kv = torch.cat(
             (projected[..., :-rope_dim], golden_rope_interleave(projected[..., -rope_dim:], cos, sin)),
@@ -152,8 +152,14 @@ def _compare_context_cache(
     )
 
 
-def run_context_case(*, platform: str = "a5sim", device_id: int = 0, compile_only: bool = False):
-    """Compile or numerically validate one draft layer's context publication."""
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="V4.1 DSpark context KV validation")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
     from golden import ScalarSpec, TensorSpec, run
     from quant import pack_mx_b_scale
 
@@ -200,25 +206,14 @@ def run_context_case(*, platform: str = "a5sim", device_id: int = 0, compile_onl
         ScalarSpec("num_tokens", torch.int32, tokens, compile_runtime=True),
     ]
     compare = {name: _compare_context_cache for name in ("window_cache", "window_cache_scale")}
-    return run(
+    result = run(
         fn=dspark_context_kv_test,
         specs=specs,
         golden_fn=golden,
         compare_fn=compare,
-        config={"platform": platform, "device_id": device_id},
-        compile_only=compile_only,
+        config={"platform": args.platform, "device_id": args.device},
+        compile_only=args.compile_only,
     )
-
-
-if __name__ == "__" + "main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="V4.1 DSpark context KV validation")
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-    result = run_context_case(platform=args.platform, device_id=args.device, compile_only=args.compile_only)
     print(result)
     if not result.passed:
         raise SystemExit(1)

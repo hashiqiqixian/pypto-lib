@@ -11,12 +11,8 @@
 """DeepSeek-V4.1-Flash 40-layer decode with final HC, RMSNorm, logits and greedy sampling."""
 
 import argparse
-import inspect
-
 import pypto.language as pl
 import pypto.language.distributed as pld
-import torch
-
 import config as C
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
@@ -29,27 +25,11 @@ C.N_LOCAL_EXPERTS = _shape_options.experts_per_rank
 
 
 from config import (
-    FLASH as M,
-    B_DYN,
-    LOCAL_T_DYN,
-    Q_START_DYN,
-    ROUTE_T_DYN,
-    T_DYN,
-    BLOCK_SIZE,
-    COMPRESSED_CACHE_GROUP,
-    DECODE_MAX_TOKENS,
-    DECODE_INPUT_MAX_TOKENS,
-    INDEX_CACHE_GROUP,
-    STATE_CAPACITY,
-    WINDOW_CACHE_GROUP,
+    FLASH as M, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, COMPRESSED_CACHE_GROUP,
+    DECODE_MAX_TOKENS, DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
+    MOE_TOKENS, DSPARK_DRAFT_LAYERS, DSPARK_TARGET_LAYER_IDS,
 )
-
-from config import MOE_TOKENS
-from config import DSPARK_DRAFT_LAYERS, DSPARK_TARGET_LAYER_IDS
 from compressor import STATE_WIDTH
-from config import TP_SIZE
-
-
 from decode_c1a_full import decode_c1a_full
 from decode_c1a_reindex import decode_c1a_reindex
 from decode_c1a_reuse import decode_c1a_reuse
@@ -58,30 +38,17 @@ from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
-from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
-from utils import paged_slots, window_metadata
-from expert_routed import (
-    MX_PACKED_LANE_COLS,
-    MX_W1_PACKED_ROWS,
-    MX_W2_PACKED_ROWS,
-    MX_W3_PACKED_ROWS,
-)
-from decode_moe import moe
-from decode_moe import SIGNAL_PAD
+from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
+from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from decode_moe import (
-    clear_moe_signals,
-    AUX_WIDTH,
-    EP_SIZE,
-    N_LOCAL_EXPERTS,
-    RECV_MAX,
-    ROUTE_WIDTH,
+    moe, SIGNAL_PAD, clear_moe_signals, AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH,
 )
 
 
 # model config
-LOCAL_H = M.num_attention_heads // TP_SIZE
-LOCAL_O_GROUPS = M.o_groups // TP_SIZE
-LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+LOCAL_H = M.num_attention_heads
+LOCAL_O_GROUPS = M.o_groups
+LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
 D = M.hidden_size
 DSPARK_MAIN_IN = DSPARK_DRAFT_LAYERS * D
 HEAD_DIM = M.head_dim
@@ -801,9 +768,9 @@ def l2_decode_fwd(
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    hidden_done: pld.DistributedTensor[[1, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[1, 1], pl.INT32],
 ):
     compressed_token_rope_cos = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_token_rope_sin = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
@@ -878,7 +845,7 @@ def l2_decode_fwd(
         result, encoder_pre_mix, final_norm_weight, lm_head_weight,
         logit_row_indices, logits, sampled_ids,
         hidden_window, hidden_done, logits_window, logits_done,
-        rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, 1, 1,
+        rank, 0, 1, 1,
     )
     return final_logits, final_sampled_ids
 
@@ -1074,9 +1041,9 @@ def l3_decode_fwd(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
     head_hidden_buffer = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    head_hidden_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    head_hidden_done_buffer = pld.alloc_window_buffer([1, 1], dtype=pl.INT32)
     head_logits_buffer = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-    head_logits_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    head_logits_done_buffer = pld.alloc_window_buffer([1, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
@@ -1100,9 +1067,9 @@ def l3_decode_fwd(
             dtype=pl.INT32,
         )
         head_hidden = pld.window(head_hidden_buffer, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        head_hidden_done = pld.window(head_hidden_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        head_hidden_done = pld.window(head_hidden_done_buffer, [1, 1], dtype=pl.INT32)
         head_logits = pld.window(head_logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-        head_logits_done = pld.window(head_logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        head_logits_done = pld.window(head_logits_done_buffer, [1, 1], dtype=pl.INT32)
         l2_decode_fwd(
             x_hc[rank], pre_mix[rank], dspark_target_hidden[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
@@ -1142,6 +1109,12 @@ def l3_decode_fwd(
             device=rank,
         )
     return logits, sampled_ids, dspark_target_hidden
+
+
+import inspect
+import torch
+from rope_tables import prepare_forward_rope_tables
+from utils import paged_slots, window_metadata
 
 
 def _torch_dtype(dtype):
@@ -1185,10 +1158,7 @@ def build_tensor_specs():
     """Build the TP1 twelve-request decode smoke fixture."""
     from golden import TensorSpec
     from decode_moe import _route_bias
-    from quant import build_mxfp4_pair_lut
-
-    if TP_SIZE != 1:
-        raise ValueError("decode_fwd fixture requires --tp 1")
+    from expert_routed import build_mxfp4_pair_lut
 
     signature = inspect.signature(l3_decode_fwd._func)
     specs = []
@@ -1254,7 +1224,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
+    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--dp", type=int, default=C.DP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--experts-per-rank", type=int, default=N_LOCAL_EXPERTS, help="routed experts on each EP rank")
@@ -1266,7 +1236,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("this forward entry requires hardware; --sim is unsupported")
-    if (args.tp, args.ep, args.dp, args.experts_per_rank) != (TP_SIZE, EP_SIZE, C.DP_SIZE, N_LOCAL_EXPERTS):
+    if (args.tp, args.ep, args.dp, args.experts_per_rank) != (C.TP_SIZE, EP_SIZE, C.DP_SIZE, N_LOCAL_EXPERTS):
         parser.error("--tp/--ep/--dp/--experts-per-rank must match the import-time configuration")
     if args.tp != 1:
         parser.error("the decode_fwd smoke fixture requires --tp 1")

@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compression projections, rotary embedding, cache publication, and ratio-2 ring state."""
 
+from gemm import gemm_bf16_to_bf16_staged
+
 import pypto.language as pl
 import torch
 
@@ -15,7 +17,6 @@ from config import (
     FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
     T_DYN, COMPRESSED_CACHE_GROUP, CMP_BLOCKS_DYN,
 )
-from quant import bf16_gemm_staged
 from rmsnorm import golden_rms_norm
 
 
@@ -31,7 +32,8 @@ M_TILE = 16
 N_TILE = 128
 COMPRESSOR_K_TILE = 64
 COMPRESSOR_QUERY_TILE = 128
-COMPRESSOR_SEGMENTS = 16
+# Limit Cube rounding before the compensated Vector accumulation.
+COMPRESSOR_SEGMENTS = D // COMPRESSOR_K_TILE
 COMPRESSOR_K_CHUNK = D // COMPRESSOR_SEGMENTS
 COMPRESSOR_PROJ_N_TILE = 128
 COMPRESSOR_PROJ_K_TILE = 256
@@ -65,7 +67,37 @@ def _compressed_rope_block(
 
 
 @pl.jit.inline
-def project_ratio2_weights(
+def _sum_ratio2_segments(
+    high_product: pl.Tensor,
+    residual_product: pl.Tensor,
+    output: pl.Tensor,
+    chunk_rows: pl.Scalar[pl.INDEX],
+    begin: pl.Scalar[pl.INDEX],
+    sum_t0: pl.Scalar[pl.INDEX],
+    sum_n0: pl.Scalar[pl.INDEX],
+    sum_rows: pl.Scalar[pl.INDEX],
+):
+    high_sum = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+    low_sum = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+    high_error = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+    low_error = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+    for sum_segment in pl.range(COMPRESSOR_SEGMENTS):
+        high_part = pl.slice(high_product, [M_TILE, N_TILE], [sum_segment * chunk_rows + sum_t0, sum_n0], valid_shape=[sum_rows, N_TILE])
+        low_part = pl.slice(residual_product, [M_TILE, N_TILE], [sum_segment * chunk_rows + sum_t0, sum_n0], valid_shape=[sum_rows, N_TILE])
+        high_delta = pl.sub(high_part, high_error)
+        high_next = pl.add(high_sum, high_delta)
+        high_error = pl.sub(pl.sub(high_next, high_sum), high_delta)
+        high_sum = high_next
+        low_delta = pl.sub(low_part, low_error)
+        low_next = pl.add(low_sum, low_delta)
+        low_error = pl.sub(pl.sub(low_next, low_sum), low_delta)
+        low_sum = low_next
+    output[begin + sum_t0 : begin + sum_t0 + M_TILE, sum_n0 : sum_n0 + N_TILE] = pl.set_validshape(pl.add(high_sum, low_sum), sum_rows, N_TILE)
+    return output
+
+
+@pl.jit.inline
+def _project_ratio2_weights_staged(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
     output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
@@ -83,7 +115,7 @@ def project_ratio2_weights(
     tail_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
     split_blocks = D // COMPRESSOR_K_TILE * (HEAD_DIM // N_TILE)
     split_workers = pl.min(split_blocks, 64)
-    with pl.spmd(split_workers, name_hint="c2a_compressor_split") as split_tid:
+    with pl.spmd(split_workers, name_hint="split_cmp") as split_tid:
         split_worker = pl.tile.get_block_idx()
         for split_block in pl.range(split_worker, split_blocks, split_workers):
             split_k0 = split_block // (HEAD_DIM // N_TILE) * COMPRESSOR_K_TILE
@@ -108,7 +140,7 @@ def project_ratio2_weights(
             blocks = output_blocks * COMPRESSOR_SEGMENTS
             # The synchronous mixed cohort must fit the available runtime clusters.
             workers = pl.min(pl.min(blocks, 16), pl.system.available_cluster_count())
-            with pl.spmd(workers, name_hint="c2a_compressor_cube", deps=[completion[0]], sync_start=True) as cube_tid:
+            with pl.spmd(workers, name_hint="proj_cmp", deps=[completion[0]], sync_start=True) as cube_tid:
                 cube_worker = pl.tile.get_block_idx()
                 for cube_block in pl.range(cube_worker, blocks, workers):
                     cube_segment = cube_block % COMPRESSOR_SEGMENTS
@@ -129,29 +161,85 @@ def project_ratio2_weights(
                         residual_acc = pl.matmul_acc(residual_acc, a, tail)
                     high_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(high_acc, 1.0), cube_rows, N_TILE)
                     residual_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(residual_acc, 1.0), cube_rows, N_TILE)
+            with pl.spmd(pl.min(output_blocks, 16), name_hint="sum_cmp", deps=[cube_tid]) as sum_tid:
+                sum_worker = pl.tile.get_block_idx()
+                for sum_block in pl.range(sum_worker, output_blocks, pl.min(output_blocks, 16)):
+                    sum_t0 = sum_block // (HEAD_DIM // N_TILE) * M_TILE
+                    sum_n0 = sum_block % (HEAD_DIM // N_TILE) * N_TILE
+                    sum_rows = pl.min(M_TILE, chunk_active - sum_t0)
+                    _sum_ratio2_segments(
+                        high_product, residual_product, output,
+                        chunk_rows, begin, sum_t0, sum_n0, sum_rows,
+                    )
+            completion[0] = sum_tid
+    return output
+
+
+@pl.jit.inline
+def _project_ratio2_weights_consumer(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Project one M16 query tile with three BF16 weight terms and compensated segment sums."""
+    if num_tokens > 0:
+        chunk_rows = pl.min(pl.cast(num_tokens, pl.INDEX), COMPRESSOR_QUERY_TILE)
+        high_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
+        residual_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
+        for begin in pl.range(0, num_tokens, chunk_rows):
+            chunk_active = pl.min(chunk_rows, num_tokens - begin)
+            output_blocks = (chunk_active + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
+            blocks = output_blocks * COMPRESSOR_SEGMENTS
+            # The synchronous mixed cohort must fit the available runtime clusters.
+            workers = pl.min(pl.min(blocks, 16), pl.system.available_cluster_count())
+            with pl.spmd(workers, name_hint="c2a_compressor_consumer", sync_start=True) as cube_tid:
+                cube_worker = pl.tile.get_block_idx()
+                for cube_block in pl.range(cube_worker, blocks, workers):
+                    cube_segment = cube_block % COMPRESSOR_SEGMENTS
+                    cube_tile_block = cube_block // COMPRESSOR_SEGMENTS
+                    cube_t0 = cube_tile_block // (HEAD_DIM // N_TILE) * M_TILE
+                    cube_n0 = cube_tile_block % (HEAD_DIM // N_TILE) * N_TILE
+                    cube_rows = pl.min(M_TILE, chunk_active - cube_t0)
+                    high_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+                    residual_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+                    for cube_k0 in pl.range(cube_segment * COMPRESSOR_K_CHUNK, (cube_segment + 1) * COMPRESSOR_K_CHUNK, COMPRESSOR_K_TILE):
+                        a = pl.slice(x, [M_TILE, COMPRESSOR_K_TILE], [begin + cube_t0, cube_k0], valid_shape=[cube_rows, COMPRESSOR_K_TILE])
+                        a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+                        value = weight[cube_k0 : cube_k0 + COMPRESSOR_K_TILE, cube_n0 : cube_n0 + N_TILE]
+                        high = pl.cast(value, pl.BF16, mode="rint")
+                        residual = pl.sub(value, pl.cast(high, pl.FP32))
+                        low = pl.cast(residual, pl.BF16, mode="rint")
+                        tail = pl.cast(pl.sub(residual, pl.cast(low, pl.FP32)), pl.BF16, mode="rint")
+                        high_acc = pl.matmul_acc(high_acc, a, high, init_cond=(cube_k0 == cube_segment * COMPRESSOR_K_CHUNK))
+                        residual_acc = pl.matmul_acc(residual_acc, a, low, init_cond=(cube_k0 == cube_segment * COMPRESSOR_K_CHUNK))
+                        residual_acc = pl.matmul_acc(residual_acc, a, tail)
+                    high_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(high_acc, 1.0), cube_rows, N_TILE)
+                    residual_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(residual_acc, 1.0), cube_rows, N_TILE)
             with pl.spmd(pl.min(output_blocks, 16), name_hint="c2a_compressor_sum", deps=[cube_tid]) as sum_tid:
                 sum_worker = pl.tile.get_block_idx()
                 for sum_block in pl.range(sum_worker, output_blocks, pl.min(output_blocks, 16)):
                     sum_t0 = sum_block // (HEAD_DIM // N_TILE) * M_TILE
                     sum_n0 = sum_block % (HEAD_DIM // N_TILE) * N_TILE
                     sum_rows = pl.min(M_TILE, chunk_active - sum_t0)
-                    high_sum = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-                    low_sum = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-                    high_error = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-                    low_error = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-                    for sum_segment in pl.range(COMPRESSOR_SEGMENTS):
-                        high_part = pl.slice(high_product, [M_TILE, N_TILE], [sum_segment * chunk_rows + sum_t0, sum_n0], valid_shape=[sum_rows, N_TILE])
-                        low_part = pl.slice(residual_product, [M_TILE, N_TILE], [sum_segment * chunk_rows + sum_t0, sum_n0], valid_shape=[sum_rows, N_TILE])
-                        high_delta = pl.sub(high_part, high_error)
-                        high_next = pl.add(high_sum, high_delta)
-                        high_error = pl.sub(pl.sub(high_next, high_sum), high_delta)
-                        high_sum = high_next
-                        low_delta = pl.sub(low_part, low_error)
-                        low_next = pl.add(low_sum, low_delta)
-                        low_error = pl.sub(pl.sub(low_next, low_sum), low_delta)
-                        low_sum = low_next
-                    output[begin + sum_t0 : begin + sum_t0 + M_TILE, sum_n0 : sum_n0 + N_TILE] = pl.set_validshape(pl.add(high_sum, low_sum), sum_rows, N_TILE)
-            completion[0] = sum_tid
+                    _sum_ratio2_segments(
+                        high_product, residual_product, output,
+                        chunk_rows, begin, sum_t0, sum_n0, sum_rows,
+                    )
+    return output
+
+
+@pl.jit.inline
+def project_ratio2_weights(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    if num_tokens > 0 and num_tokens <= M_TILE:
+        _project_ratio2_weights_consumer(x, weight, output, num_tokens)
+    else:
+        _project_ratio2_weights_staged(x, weight, output, num_tokens)
     return output
 
 
@@ -184,7 +272,7 @@ def publish_compressed_cache(
     cache_rows = pl.tensor.dim(cache, 0) * 128
     cache_flat = pl.reshape(cache, [cache_rows, HEAD_DIM // 2])
     scale_flat = pl.reshape(scales, [cache_rows, HEAD_DIM // COMPRESSED_CACHE_GROUP])
-    with pl.spmd(num_tokens, name_hint="c1a_compressed_publish") as publish_tid:
+    with pl.spmd(num_tokens, name_hint="pub_cmp") as publish_tid:
         token = pl.tile.get_block_idx()
         slot_i64 = pl.read(slots, [token])
         if slot_i64 >= 0:
@@ -320,7 +408,7 @@ def compressor_pool(
     """Assemble partners and pool eight rows before updating ring state."""
     state_rows = num_state_blocks * STATE_CAPACITY
     flat = pl.reshape(state_cache, [state_rows, STATE_WIDTH])
-    with pl.spmd(pl.max((num_tokens + 7) // 8, 1), name_hint="c2a_compressor_pool", deps=[pair_ready]) as pool_tid:
+    with pl.spmd(pl.max((num_tokens + 7) // 8, 1), name_hint="pool_cmp", deps=[pair_ready]) as pool_tid:
         group = pl.tile.get_block_idx()
         t = group * 8
         if t < num_tokens:
@@ -397,7 +485,7 @@ def compressor_state_write(
     blocks = pl.tensor.dim(state_cache, 0)
     state_rows = blocks * STATE_CAPACITY
     flat = pl.reshape(state_cache, [state_rows, STATE_WIDTH])
-    with pl.spmd(pl.max(num_tokens, 1), name_hint="c2a_compressor_state", deps=[pair_ready]) as state_tid:
+    with pl.spmd(pl.max(num_tokens, 1), name_hint="state_cmp", deps=[pair_ready]) as state_tid:
         t = pl.tile.get_block_idx()
         if t < num_tokens:
             request = pl.cast(pl.read(token_to_req_indices, [t]), pl.INDEX)
@@ -450,10 +538,11 @@ def prefill_c1a_compressor_project(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     ready = pl.system.task_dummy(deps=[])
-    result, completed = bf16_gemm_staged(
+    result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
         workers=2147483647, name_hint='prefill_bf16_projection_cube',
+        cast_name="bf16_projection_cast",
     )
     return result
 
@@ -489,7 +578,7 @@ def publish_c2a_compressed(
     cache_rows = blocks * 128
     flat = pl.reshape(cache, [cache_rows, (HEAD_DIM // 2)])
     scale_flat = pl.reshape(scales, [cache_rows, (HEAD_DIM // 16)])
-    with pl.spmd(num_tokens, name_hint="c2a_compressed_publish", deps=[cache_ready, latent_ready]) as publish_tid:
+    with pl.spmd(num_tokens, name_hint="pub_cmp", deps=[cache_ready, latent_ready]) as publish_tid:
         t = pl.tile.get_block_idx()
         slot_i64 = pl.read(slots, [t])
         if slot_i64 >= 0:
@@ -539,10 +628,10 @@ def decode_c1a_compressor_project(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = bf16_gemm_staged(
+    result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
-        workers=8, name_hint='c1a_compressor_projection',
+        workers=8, name_hint='proj_cmp', cast_name='cast_cmp',
     )
     return completed
 
@@ -558,7 +647,7 @@ def decode_c1a_compressor_rope(
 ):
     blocks = num_tokens
     workers = pl.min(blocks, 2147483647)
-    with pl.spmd(workers, name_hint='c1a_compressor_rope', deps=[ready]) as rope_tid:
+    with pl.spmd(workers, name_hint='rope_cmp', deps=[ready]) as rope_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
             _compressed_rope_block(x, cos, sin, output, block)
@@ -576,7 +665,7 @@ def decode_c2a_compressor_rope(
 ):
     blocks = num_tokens
     workers = pl.min(blocks, 2147483647)
-    with pl.spmd(workers, name_hint='c2a_compressed_rope', deps=[ready]) as rope_tid:
+    with pl.spmd(workers, name_hint='rope_cmp', deps=[ready]) as rope_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
             _compressed_rope_block(x, cos, sin, output, block)

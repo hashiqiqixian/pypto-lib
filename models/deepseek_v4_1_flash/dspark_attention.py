@@ -6,13 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim
 """DSpark sliding-window attention over history and all five query rows."""
 
 import pypto.language as pl
 
 from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN, TP_SIZE
-from o_proj import o_proj
+from o_proj import GROUPED_WORKER_TILE, o_proj
 from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
 from sparse_attention import publish_window_row
 
@@ -155,8 +154,11 @@ def dspark_attention(
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens,
-           grouped_max_workers=4096)
+    # JIT dependency calls require an explicit constexpr binding.
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin, output, num_tokens, grouped_max_workers=GROUPED_WORKER_TILE,
+    )
     return output, window_cache, window_cache_scale
 
 
@@ -222,25 +224,32 @@ def make_attention_inputs(seed: int = 43):
     return values
 
 
-def run_attention_case(*, platform: str = "a5sim", device_id: int = 0, compile_only: bool = False):
-    """Validate non-causal five-row SWA and its mapped MXFP8 cache writes."""
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="V4.1 DSpark non-causal SWA validation")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
     import torch
 
     from golden import ScalarSpec, TensorSpec, ratio_allclose, run
-    from sparse_attention import SWA_INPUT_NAMES, golden_swa_attention
+    from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
 
     values = make_attention_inputs()
 
     def golden(tensors):
         row_inputs = ("x", "rope_cos", "rope_sin", "window_slots", "window_indices")
-        result = golden_swa_attention(*(
-            tensors[name][:DSPARK_QUERY_WIDTH] if name in row_inputs else tensors[name]
+        reference_inputs = {
+            name: tensors[name][:DSPARK_QUERY_WIDTH] if name in row_inputs else tensors[name]
             for name in SWA_INPUT_NAMES
-        ))
+        }
+        output, cache, cache_scale = swa_official_reference(reference_inputs, key_tile=64)
         tensors["output"].zero_()
-        tensors["output"][:DSPARK_QUERY_WIDTH].copy_(result.output)
-        tensors["window_cache"].copy_(result.window_cache)
-        tensors["window_cache_scale"].copy_(result.window_cache_scale)
+        tensors["output"][:DSPARK_QUERY_WIDTH].copy_(output)
+        tensors["window_cache"].copy_(cache)
+        tensors["window_cache_scale"].copy_(cache_scale)
 
     def compare_payload(actual, expected, **_kwargs):
         return bool(torch.allclose(actual.float(), expected.float(), rtol=0.05, atol=0.05)), "FP8 payload"
@@ -251,7 +260,7 @@ def run_attention_case(*, platform: str = "a5sim", device_id: int = 0, compile_o
         TensorSpec("output", [MOE_TOKENS, D], torch.float32),
         ScalarSpec("num_tokens", torch.int32, DSPARK_QUERY_WIDTH, compile_runtime=True),
     ]
-    return run(
+    result = run(
         fn=dspark_attention_test,
         specs=specs,
         golden_fn=golden,
@@ -260,20 +269,9 @@ def run_attention_case(*, platform: str = "a5sim", device_id: int = 0, compile_o
             "output": ratio_allclose(atol=0.03, rtol=0.03, max_error_ratio=0.001,
                                      valid_rows=DSPARK_QUERY_WIDTH),
         },
-        config={"platform": platform, "device_id": device_id},
-        compile_only=compile_only,
+        config={"platform": args.platform, "device_id": args.device},
+        compile_only=args.compile_only,
     )
-
-
-if __name__ == "__" + "main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="V4.1 DSpark non-causal SWA validation")
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-    result = run_attention_case(platform=args.platform, device_id=args.device, compile_only=args.compile_only)
     print(result)
     if not result.passed:
         raise SystemExit(1)

@@ -19,19 +19,17 @@ from golden import run
 from pypto.ir import DistributedConfig
 
 from moe import (
-    AUX_PAD,
     D,
     EXPERTS_PER_RANK,
     HC_DIM,
     HC_MULT,
-    IDX_PAD,
     MIX_HC,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
     N_RANKS,
-    N_ROUTES,
-    RECV_MAX,
+    PREFILL_MOE_SCALE_PAD,
+    PREFILL_MOE_TOTAL_CAP,
     T,
     TOPK,
     VOCAB,
@@ -153,9 +151,6 @@ LM_HEAD_COMM_EPOCH = 1
 TARGET_LAYER_IDS = (40, 41, 42)  # dspark_target_layer_ids
 MAIN_HIDDEN_DIM = len(TARGET_LAYER_IDS) * D
 
-# tiling
-LOGITS_ZERO_TILE = 4096
-
 if MODEL_NUM_LAYERS != FWD_NUM_LAYERS:
     raise ValueError("DeepSeek-V4 Flash hidden layer count changed")
 if len(TARGET_LAYER_IDS) != 3 or TARGET_LAYER_IDS != tuple(
@@ -164,12 +159,10 @@ if len(TARGET_LAYER_IDS) != 3 or TARGET_LAYER_IDS != tuple(
     raise ValueError(f"DSpark target layers must be the final three layers: {TARGET_LAYER_IDS}")
 if N_RANKS % TP_SIZE:
     raise ValueError(f"EP world size {N_RANKS} must be divisible by CP group size {TP_SIZE}")
-if LM_HEAD_TP_SIZE != TP_SIZE:
-    raise ValueError(f"LM-head TP={LM_HEAD_TP_SIZE} does not match prefill TP={TP_SIZE}")
+if N_RANKS % LM_HEAD_TP_SIZE:
+    raise ValueError(f"EP world size {N_RANKS} must be divisible by LM-head TP={LM_HEAD_TP_SIZE}")
 if LM_HEAD_VOCAB != MODEL_CONFIG.vocab_size:
     raise ValueError(f"LM-head vocab={LM_HEAD_VOCAB} does not match model vocab={MODEL_CONFIG.vocab_size}")
-if MODEL_CONFIG.vocab_size % TP_SIZE:
-    raise ValueError(f"vocab size {MODEL_CONFIG.vocab_size} must be divisible by TP={TP_SIZE}")
 
 # FWD-layer stacked tensors, indexed by layer 0-42.
 FWD_LAYER_STACKED_NAMES = [
@@ -371,12 +364,11 @@ def prefill_fwd(
     grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    routed_y_buf: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
@@ -520,7 +512,7 @@ def prefill_fwd(
                 shared_w1_l0, shared_w1_scale_l0, shared_w3_l0, shared_w3_scale_l0,
                 shared_w2_l0, shared_w2_scale_l0,
                 x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                recv_meta, recv_x, recv_aux, recv_route,
+                recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 gather_window, gather_signal,
@@ -612,7 +604,7 @@ def prefill_fwd(
                 shared_w1_l1, shared_w1_scale_l1, shared_w3_l1, shared_w3_scale_l1,
                 shared_w2_l1, shared_w2_scale_l1,
                 x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                recv_meta, recv_x, recv_aux, recv_route,
+                recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 gather_window, gather_signal,
@@ -776,7 +768,7 @@ def prefill_fwd(
                     shared_w1_csa, shared_w1_scale_csa, shared_w3_csa, shared_w3_scale_csa,
                     shared_w2_csa, shared_w2_scale_csa,
                     x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                    recv_meta, recv_x, recv_aux, recv_route,
+                    recv_meta, recv_x, recv_aux,
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
                     gather_window, gather_signal,
@@ -907,7 +899,7 @@ def prefill_fwd(
                     shared_w1_hca, shared_w1_scale_hca, shared_w3_hca, shared_w3_scale_hca,
                     shared_w2_hca, shared_w2_scale_hca,
                     x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                    recv_meta, recv_x, recv_aux, recv_route,
+                    recv_meta, recv_x, recv_aux,
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
                     gather_window, gather_signal,
@@ -1076,15 +1068,15 @@ def prefill_fwd(
                 shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
                 shared_w2_last, shared_w2_scale_last,
                 x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                recv_meta, recv_x, recv_aux, recv_route,
+                recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 gather_window, gather_signal,
                 group_base, tp_rank, layer_last, my_rank, group_tokens,
             )
 
+    moe_retired_tid = clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
     with pl.scope():
-        clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
         if group_tokens > 0:
             retire_o_proj_weight_signals(
                 layer_completion,
@@ -1113,33 +1105,28 @@ def prefill_fwd(
                 dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = pl.cast(
                     target_hidden_l42, pl.BF16, mode="rint",
                 )
-            layer42_hidden = pl.create_tensor([group_rows, D], dtype=pl.BF16)
-            layer42_hidden = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, layer42_hidden)
-            final_norm_tid = rms_norm(layer42_hidden, final_norm_w, x_out)
-            lm_head(
-                x_out, lm_head_weight, logit_row_indices, logits,
-                lm_head_hidden_window, lm_head_hidden_done,
-                lm_head_logits_window, lm_head_logits_done,
-                group_base, tp_rank,
-                pl.const(LM_HEAD_COMM_EPOCH, pl.INT32), final_norm_tid,
-            )
-            greedy_sample(logits, logit_row_indices, grammar_mask, sampled_ids)
         else:
             for token in pl.spmd(local_tokens, name_hint="prefill_fwd_inactive_target_hidden"):
                 for head in pl.range(MAIN_HIDDEN_DIM // D):
                     zero_target_hidden = pl.full([1, D], dtype=pl.BF16, value=0.0)
                     dspark_target_hidden[token : token + 1, head * D : (head + 1) * D] = zero_target_hidden
-            for token in pl.spmd(pl.tensor.dim(x_out, 0), name_hint="prefill_fwd_inactive_hidden"):
-                x_out[token : token + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
-            for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="prefill_fwd_inactive_sample_rows"):
-                for col in pl.range(0, LM_HEAD_VOCAB // LOGITS_ZERO_TILE * LOGITS_ZERO_TILE, LOGITS_ZERO_TILE):
-                    zero_logits = pl.full([1, LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
-                    logits[row : row + 1, col : col + LOGITS_ZERO_TILE] = zero_logits
-                if LM_HEAD_VOCAB % LOGITS_ZERO_TILE != 0:
-                    logits_tail_start = LM_HEAD_VOCAB // LOGITS_ZERO_TILE * LOGITS_ZERO_TILE
-                    zero_logits_tail = pl.full([1, LM_HEAD_VOCAB % LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
-                    logits[row : row + 1, logits_tail_start:] = zero_logits_tail
-                sampled_ids[row : row + 1, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
+            for token in pl.spmd(group_rows, name_hint="prefill_fwd_inactive_hidden"):
+                x_hc[token : token + 1, :, :] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+
+    # All head-group members participate, including idle attention owners.
+    layer42_hidden = pl.create_tensor([group_rows, D], dtype=pl.BF16)
+    layer42_hidden = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, layer42_hidden)
+    final_norm_tid = rms_norm(layer42_hidden, final_norm_w, x_out)
+    # Retire final MoE epochs before every owner's head collectives.
+    head_ready_tid = pl.system.task_dummy(deps=[final_norm_tid, moe_retired_tid])
+    lm_head(
+        x_out, lm_head_weight, logit_row_indices, logits,
+        lm_head_hidden_window, lm_head_hidden_done,
+        lm_head_logits_window, lm_head_logits_done,
+        my_rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, my_rank % LM_HEAD_TP_SIZE,
+        pl.const(LM_HEAD_COMM_EPOCH, pl.INT32), head_ready_tid,
+    )
+    greedy_sample(logits, logit_row_indices, grammar_mask, sampled_ids)
     return x_out
 
 
@@ -1297,12 +1284,11 @@ def l3_prefill_fwd(
     csa_inner_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
 
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-    recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+    recv_aux_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
+    routed_y_buf_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     stage_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     gather_window_buf = pld.alloc_window_buffer([PREFILL_GROUP_CAP, D], dtype=pl.BF16)
@@ -1318,12 +1304,11 @@ def l3_prefill_fwd(
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+        recv_aux = pld.window(recv_aux_buf, [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
         arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        routed_y_buf = pld.window(routed_y_buf_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         stage_done = pld.window(stage_done_buf, [N_RANKS, 1], dtype=pl.INT32)
         gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
@@ -1386,7 +1371,7 @@ def l3_prefill_fwd(
             final_norm_w[r], lm_head_weight[r], logit_row_indices[r],
             dspark_target_hidden[r],
             x_out[r], logits[r], grammar_mask[r], sampled_ids[r],
-            recv_meta, recv_x, recv_aux, recv_route,
+            recv_meta, recv_x, recv_aux,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             stage_done,
             gather_window, gather_signal,
@@ -1959,8 +1944,8 @@ def build_tensor_specs(
     def init_lm_head_weight():
         from utils import pack_nz
 
-        shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D**0.5).to(torch.bfloat16)
-        return pack_nz(torch.stack([shards[rank % TP_SIZE] for rank in range(N_RANKS)], dim=0))
+        shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D**0.5).to(torch.bfloat16)
+        return pack_nz(torch.stack([shards[rank % LM_HEAD_TP_SIZE] for rank in range(N_RANKS)], dim=0))
 
     # Group leaders publish one last-token row per packed request.
     request_last_rows = (2, 6) if fixture_case == "ragged2" else (num_tokens - 1,)
@@ -2038,8 +2023,8 @@ def golden_prefill_fwd(_tensors):
     """Prefill forward is a topology/liveness witness; layer math is gated by prefill_layer."""
 
 
-def finite_tensor_compare(actual, expected, *, preserve_inactive=False, **kwargs):
-    """Check active results and preserve inactive input/output state."""
+def finite_tensor_compare(actual, expected, *, preserve_inactive=False, zero_inactive=False, **kwargs):
+    """Check active results and preserved or zeroed inactive state."""
     import torch
 
     if actual.numel() == 0:
@@ -2047,6 +2032,8 @@ def finite_tensor_compare(actual, expected, *, preserve_inactive=False, **kwargs
     query_start_loc = kwargs.get("inputs", {}).get("query_start_loc")
     for rank in range(actual.shape[0]):
         if query_start_loc is not None and int(query_start_loc[rank, -1]) == 0:
+            if zero_inactive and bool(torch.count_nonzero(actual[rank])):
+                return False, f"    inactive rank {rank} output is not zero"
             if preserve_inactive and not torch.equal(actual[rank], expected[rank]):
                 return False, f"    inactive rank {rank} output was modified"
             continue
@@ -2156,14 +2143,16 @@ def logits_compare(actual, _expected, **kwargs):
             if not bool(torch.all(actual[rank] == 0)):
                 return False, f"    inactive rank {rank} logits are not zero"
             continue
-        group_base = rank // TP_SIZE * TP_SIZE
+        group_base = rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE
         for row in range(MAX_LOGIT_ROWS):
             source = int(row_indices[rank, row])
             if source < 0:
                 continue
             hidden_row = device_x_out[rank][source].float()
             # Shard tp owns vocabulary rows [tp * VOCAB_PER_TP, (tp + 1) * VOCAB_PER_TP).
-            expected_row = torch.cat([weight[group_base + tp].float() @ hidden_row for tp in range(TP_SIZE)])
+            expected_row = torch.cat([
+                weight[group_base + tp].float() @ hidden_row for tp in range(LM_HEAD_TP_SIZE)
+            ])
             actual_row = actual[rank, row].cpu()
             if not torch.allclose(actual_row, expected_row, rtol=1e-3, atol=1e-3):
                 worst = float((actual_row - expected_row).abs().max())
@@ -2210,8 +2199,9 @@ def compare_functions():
     }
     compare = {name: finite_tensor_compare for name in finite_names}
     compare["dspark_target_hidden"] = dspark_target_hidden_compare
-    for name in CACHE_NAMES | {"x_hc", "attn_stage"}:
+    for name in CACHE_NAMES | {"attn_stage"}:
         compare[name] = partial(finite_tensor_compare, preserve_inactive=True)
+    compare["x_hc"] = partial(finite_tensor_compare, zero_inactive=True)
     compare["x_out"] = x_out_compare
     compare["logits"] = logits_compare
     compare["sampled_ids"] = sampled_ids_compare
@@ -2234,6 +2224,7 @@ def main():
         "--tp", type=int, default=TP_SIZE, choices=[1, 2, 4],
         help="CP group size (parsed at import by the CP attention leaves).",
     )
+    parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=(1, 2, 4, 8, 16))
     default_devices = os.environ.get("TASK_DEVICE", ",".join(str(i) for i in range(N_RANKS)))
     parser.add_argument(
         "-d", "--device", type=str, default=default_devices,
@@ -2266,6 +2257,9 @@ def main():
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--ring-heap-mib", type=int, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("this entry requires hardware; --sim is unsupported")
@@ -2277,6 +2271,10 @@ def main():
         parser.error(f"import-time TP_SIZE must match --tp, got {TP_SIZE} vs {args.tp}")
     if N_RANKS != args.ep:
         parser.error(f"import-time N_RANKS must match --ep, got {N_RANKS} vs {args.ep}")
+    if LM_HEAD_TP_SIZE != args.lm_head_tp:
+        parser.error(
+            f"import-time LM_HEAD_TP_SIZE must match --lm-head-tp, got {LM_HEAD_TP_SIZE} vs {args.lm_head_tp}"
+        )
     if args.ep % args.tp != 0:
         parser.error(f"EP must be divisible by TP/CP, got --ep {args.ep} and --tp {args.tp}")
     if args.case == "ragged2" and TP_SIZE != 2:
@@ -2309,7 +2307,8 @@ def main():
         golden_fn=golden_prefill_fwd,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        save_data=False,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
@@ -2317,7 +2316,7 @@ def main():
             execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
-            ring_heap=PREFILL_RING_HEAP,
+            ring_heap=PREFILL_RING_HEAP if args.ring_heap_mib is None else (args.ring_heap_mib * 1024 * 1024,) * 4,
         ),
         compare_fn=compare_functions(),
     )

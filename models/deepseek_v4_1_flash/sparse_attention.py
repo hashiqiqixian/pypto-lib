@@ -7,14 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """PyPTO sparse MLA with packed-cache dequantization and sink-aware Cube attention."""
-# ci: no-sim
 
 from collections.abc import Callable
 import math
 
 import torch
 
-from config import AttentionMode
+
 from compressor import golden_compressor_ratio1 as compressor_ratio1
 from compressor import golden_compressor_ratio2_paged as compressor_ratio2_paged
 from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
@@ -22,19 +21,11 @@ from qkv_proj_rope import golden_rope_interleave as rope_interleave
 from o_proj import golden_o_proj, golden_grouped_output
 from qkv_proj_rope import golden_rope_tail
 from rmsnorm import golden_rms_norm
-from golden import ScalarSpec, TensorSpec
-from quant import (
-    _publish_quantized_cache,
-    dequantize_mxfp4_cache,
-    dequantize_mxfp8_cache,
-    golden_mxfp8_linear,
-    golden_mxfp8_quantize,
-    quantize_grouped_mxfp8_weight,
-    pack_mx_b_scale,
-    quantize_mxfp4_cache,
-    quantize_mxfp8_cache,
-)
-from utils import AttentionGoldenResult, window_metadata
+from golden import TensorSpec
+from utils import _publish_quantized_cache
+from quant import dequantize_mxfp4_cache, dequantize_mxfp8_cache, quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
+from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
+from utils import packed_query_lengths, window_metadata
 
 from pathlib import Path
 
@@ -92,8 +83,6 @@ PACKED_ATTEND_SLOT_TILE = 1 if TP_SIZE == 1 else 2
 PACKED_KEY_PARTS = SELECTED_KEYS // PACKED_KEY_TILE
 
 
-
-
 # SWA tiling.
 SWA_HEAD_TILE = min(64, max(16, LOCAL_H)) if TP_SIZE == 1 else 32
 # Leave Vector space for the value-preserving query startup before QK.
@@ -116,11 +105,10 @@ def prefill_publish_window(
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
-    with pl.spmd(num_tokens, name_hint="c1a_cache_publish", deps=[cache_ready]) as publish_tid:
+    with pl.spmd(num_tokens, name_hint="pub_win", deps=[cache_ready]) as publish_tid:
         t = pl.tile.get_block_idx()
         _publish_window_row(kv, slots, cache, scales, t)
     return publish_tid
-
 
 
 @pl.jit.inline
@@ -137,7 +125,6 @@ def prefill_publish_window_batched(
         for t in pl.range(worker, num_tokens, 64):
             _publish_window_row(kv, slots, cache, scales, t)
     return publish_tid
-
 
 
 @pl.jit.inline
@@ -184,7 +171,7 @@ def publish_window_row(
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    for t in pl.spmd(num_tokens, name_hint="swa_cache_publish"):
+    for t in pl.spmd(num_tokens, name_hint="pub_win"):
         _publish_window_row(kv, slots, cache, scales, t)
 
 
@@ -203,7 +190,7 @@ def gather_window_batched(
     dst_rows = tokens * SWA_WINDOW
     dst = pl.reshape(selected, [dst_rows, HEAD_DIM])
     workers = pl.max(1, pl.min(num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_batched_gather", allow_early_resolve=True) as gathered:
+    with pl.spmd(workers, name_hint="swa_gather", allow_early_resolve=True) as gathered:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), workers):
             token = block // (SWA_WINDOW // SWA_SELECTED_GATHER_TILE)
@@ -272,7 +259,6 @@ def gather_window_batched(
     return gathered
 
 
-
 @pl.jit.inline(auto_scope=False)
 def gather_window_packed544(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
@@ -286,7 +272,7 @@ def gather_window_packed544(
     dst_rows = tokens * SWA_WINDOW
     dst = pl.reshape(selected, [dst_rows, HEAD_DIM])
     workers = pl.max(1, pl.min(num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_packed544_gather", allow_early_resolve=True) as gathered:
+    with pl.spmd(workers, name_hint="swa_gather_packed", allow_early_resolve=True) as gathered:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), workers):
             token = block // (SWA_WINDOW // SWA_SELECTED_GATHER_TILE)
@@ -357,7 +343,6 @@ def gather_window_packed544(
     return gathered
 
 
-
 @pl.jit.inline(auto_scope=False)
 def attend_window_tiled(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -379,7 +364,7 @@ def attend_window_tiled(
     head_blocks = (LOCAL_H + SWA_HEAD_TILE - 1) // SWA_HEAD_TILE
     workers = pl.max(1, pl.min(num_tokens * head_blocks, SWA_WORKER_TILE))
     with pl.spmd(
-        workers, name_hint="swa_tiled_attention", deps=[ready],
+        workers, name_hint="swa_attn", deps=[ready],
         optimizations=[pl.cross_core_slot(slot_num=1)],
     ) as attention_done:
         worker = pl.tile.get_block_idx()
@@ -450,7 +435,6 @@ def attend_window_tiled(
     return attention_done
 
 
-
 @pl.jit.inline(auto_scope=False)
 def decode_shared_cache(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
@@ -465,7 +449,7 @@ def decode_shared_cache(
     # Physical pages are a multiple of 128 rows; GATHER_TILE=32 has no tail.
     # Decode each physical row once with contiguous transfers.
     workers = pl.max(1, pl.min(rows // SWA_GATHER_TILE, SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_shared_cache_decode") as ready:
+    with pl.spmd(workers, name_hint="swa_decode_cache") as ready:
         worker = pl.tile.get_block_idx()
         if worker == 0:
             value_full = pl.tile.full([32, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -483,7 +467,6 @@ def decode_shared_cache(
     return ready
 
 
-
 @pl.jit.inline(auto_scope=False)
 def decode_shared_cache_packed(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
@@ -496,7 +479,7 @@ def decode_shared_cache_packed(
     # Physical pages are a multiple of 128 rows; GATHER_TILE=32 has no tail.
     # Decode each physical row once with contiguous transfers.
     workers = pl.max(1, pl.min(rows // SWA_GATHER_TILE, SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_shared_packed_decode") as ready:
+    with pl.spmd(workers, name_hint="swa_decode_packed") as ready:
         worker = pl.tile.get_block_idx()
         if worker == 0:
             value_full = pl.tile.full([32, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -524,7 +507,6 @@ def decode_shared_cache_packed(
     return ready
 
 
-
 @pl.jit.inline(auto_scope=False)
 def analyze_index_runs(
     indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
@@ -537,7 +519,7 @@ def analyze_index_runs(
     descriptor_rows = tokens * SWA_RUN_PARTS
     descriptor_flat = pl.reshape(descriptors, [descriptor_rows, SWA_RUN_DESCRIPTOR_WIDTH])
     workers = pl.max(1, pl.min(num_tokens * SWA_RUN_PARTS, SWA_WORKER_TILE * 2))
-    with pl.spmd(workers, name_hint="swa_index_run_analysis") as ready:
+    with pl.spmd(workers, name_hint="swa_plan_runs") as ready:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, num_tokens * SWA_RUN_PARTS, workers):
             token = block // SWA_RUN_PARTS
@@ -575,7 +557,6 @@ def analyze_index_runs(
     return ready
 
 
-
 @pl.jit.inline(auto_scope=False)
 def decode_shared_cache_after_publish(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
@@ -591,7 +572,7 @@ def decode_shared_cache_after_publish(
     # Physical pages are a multiple of 128 rows; GATHER_TILE=32 has no tail.
     # Decode each physical row once with contiguous transfers.
     workers = pl.max(1, pl.min(rows // SWA_GATHER_TILE, SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_shared_cache_decode", deps=[publish_ready]) as ready:
+    with pl.spmd(workers, name_hint="swa_decode_cache", deps=[publish_ready]) as ready:
         worker = pl.tile.get_block_idx()
         if worker == 0:
             value_full = pl.tile.full([32, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -607,7 +588,6 @@ def decode_shared_cache_after_publish(
             decoded = pl.reshape(decoded_bf16, [SWA_GATHER_TILE, HEAD_DIM])
             pl.tile.store(decoded, [row, 0], decoded_flat)
     return ready
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -635,7 +615,7 @@ def attend_shared_cache(
     sink_row = pl.reshape(sink, [1, LOCAL_H])
     workers = pl.max(1, pl.min(num_tokens, SWA_WORKER_TILE))
     with pl.spmd(
-        workers, name_hint="swa_shared_cache_mat_attention", deps=[ready, index_ready],
+        workers, name_hint="swa_attn_shared", deps=[ready, index_ready],
         optimizations=[pl.cross_core_slot(slot_num=SWA_CROSS_CORE_SLOT_TILE)],
     ) as attention_done:
         worker = pl.tile.get_block_idx()
@@ -732,7 +712,6 @@ def attend_shared_cache(
     return attention_done
 
 
-
 @pl.jit.inline(auto_scope=False)
 def attend_shared_cache_plain(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -754,7 +733,7 @@ def attend_shared_cache_plain(
     sink_row = pl.reshape(sink, [1, LOCAL_H])
     workers = pl.max(1, pl.min(num_tokens, SWA_WORKER_TILE))
     with pl.spmd(
-        workers, name_hint="swa_shared_cache_mat_attention", deps=[ready],
+        workers, name_hint="swa_attn_shared", deps=[ready],
         optimizations=[pl.cross_core_slot(slot_num=SWA_CROSS_CORE_SLOT_TILE)],
     ) as attention_done:
         worker = pl.tile.get_block_idx()
@@ -835,7 +814,6 @@ def attend_shared_cache_plain(
     return attention_done
 
 
-
 @pl.jit.inline(auto_scope=False)
 def swa_attention_partial(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -881,7 +859,6 @@ def swa_attention_partial(
     return cache_consumed
 
 
-
 @pl.jit.inline(auto_scope=False)
 def swa_attention(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -895,7 +872,6 @@ def swa_attention(
     """Attend the active query prefix; leave caller-owned inactive rows untouched."""
     swa_attention_partial(query, cache, scales, indices, sink, output, num_tokens)
     return output
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -942,7 +918,6 @@ def _swa_attention_packed_partial(
     return cache_consumed
 
 
-
 @pl.jit.inline(auto_scope=False)
 def swa_attention_packed(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -984,7 +959,6 @@ def l2_sparse_attention_swa_packed(
     return output
 
 
-
 SWA_INPUT_NAMES = (
     "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
     "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
@@ -992,18 +966,18 @@ SWA_INPUT_NAMES = (
 )
 
 
-def swa_official_reference(tensors, *, shared_cache=False):
-    """Evaluate FP8 projections and the selected SWA weight-rounding order."""
+def swa_official_reference(tensors, *, shared_cache=False, key_tile=128):
+    """Evaluate FP8 projections, tiled BF16 attention weights, and FP32 output."""
     t = tensors
     head_dim = t["window_cache"].shape[-1]
     local_heads = t["attn_sink"].numel()
     groups = t["wo_a"].shape[0]
     group_in = t["wo_a"].shape[-2]
 
-    qr = golden_rms_norm(golden_mxfp8_linear(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
-    q = golden_mxfp8_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    qr = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
     q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
-    kv = golden_rms_norm(golden_mxfp8_linear(t["x"], t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(t["x"], t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
     kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
     payload, scales = quantize_mxfp8_cache(kv)
     cache = t["window_cache"].clone()
@@ -1019,10 +993,10 @@ def swa_official_reference(tensors, *, shared_cache=False):
     maximum = torch.full(q.shape[:2], -torch.inf if shared_cache else -1e30)
     denominator = torch.zeros_like(maximum)
     numerator = torch.zeros_like(q, dtype=torch.float32)
-    for start in range(0, idx.shape[-1], 128):
-        keys = selected[:, start:start + 128].float()
+    for start in range(0, idx.shape[-1], key_tile):
+        keys = selected[:, start:start + key_tile].float()
         logits = torch.einsum("thd,tkd->thk", q.float(), keys) * head_dim ** -0.5
-        valid = idx[:, start:start + 128] >= 0
+        valid = idx[:, start:start + key_tile] >= 0
         # Match the device's finite mask so an empty block keeps zero statistics.
         logits = logits.masked_fill(~valid[:, None], -1e30)
         new_maximum = torch.maximum(maximum, logits.amax(-1))
@@ -1046,7 +1020,7 @@ def swa_official_reference(tensors, *, shared_cache=False):
     attended = golden_rope_tail(attended, t["rope_cos"], t["rope_sin"], inverse=True)
     grouped = attended.reshape(-1, groups, group_in)
     latent = golden_grouped_output(grouped, t["wo_a"], t["wo_a_scale"])
-    output = golden_mxfp8_linear(latent.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=True)
+    output = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(latent.flatten(1), t["wo_b"], t["wo_b_scale"]).float()
     return output, cache, cache_scale
 
 
@@ -1056,7 +1030,7 @@ def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
     def rand(*shape):
         return torch.randn(*shape, generator=gen)
     def weight(k, n):
-        payload, scales = golden_mxfp8_quantize(rand(n, k) / math.sqrt(k))
+        payload, scales = quantize_mxfp8_upward_reference(rand(n, k) / math.sqrt(k))
         return payload.T.contiguous(), pack_mx_b_scale(scales.T.contiguous()).view(torch.float8_e8m0fnu)
     qa, qas = weight(D, Q_LORA)
     qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)
@@ -1086,14 +1060,13 @@ def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
     return dict(zip(SWA_INPUT_NAMES, values))
 
 
-def make_packed_swa_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=None):
+def make_packed_swa_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=None, query_lens=None):
     if not 1 <= requests <= min(MAX_BATCH_PER_DP, tokens):
         raise ValueError(f"requests must be in [1, min({MAX_BATCH_PER_DP}, tokens)]")
     values = make_swa_inputs(1, seed=seed)
     gen = torch.Generator().manual_seed(seed + 1000)
-    lengths = torch.full((requests,), tokens // requests, dtype=torch.int64)
-    lengths[:tokens % requests] += 1
-    if requests > 1 and lengths[-1] > 16:
+    lengths = torch.tensor(packed_query_lengths(tokens, requests, query_lens), dtype=torch.int64)
+    if query_lens is None and requests > 1 and lengths[-1] > 16:
         lengths[0] += 7
         lengths[-1] -= 7
     prefixes = torch.zeros(requests, dtype=torch.int64)
@@ -1149,116 +1122,6 @@ def make_packed_swa_inputs(tokens=257, requests=4, seed=17, case="mixed", start_
     return values
 
 
-def build_swa_leaf_specs(args, mode):
-    """Build shape-only specs; replay and compile-only never generate random weights."""
-    world_size = TP_SIZE * args.dp
-    packed = (getattr(args, "start_pos", None) is not None or mode == "prefill" or args.tokens > MAX_BATCH_PER_DP
-              or args.requests != args.tokens or args.case in ("prefix", "shuffle"))
-    if packed:
-        lengths = [args.tokens // args.requests + (r < args.tokens % args.requests) for r in range(args.requests)]
-        if args.requests > 1 and lengths[-1] > 16:
-            lengths[0] += 7
-            lengths[-1] -= 7
-        prefixes = ([127, 128, 511, 1048000] * 8)[:args.requests] if args.case == "prefix" else [0] * args.requests
-        if getattr(args, "start_pos", None) is not None:
-            prefixes = args.start_pos
-        pages = 1 + sum((p + n + 128) // 128 - max(0, p - 127) // 128 + 1 for p, n in zip(prefixes, lengths))
-    else:
-        pages = args.tokens + 1
-    shapes = (
-        [args.tokens, D], [D, Q_LORA], [D // 32, Q_LORA], [Q_LORA],
-        [Q_LORA, LOCAL_H * HEAD_DIM], [Q_LORA // 32, LOCAL_H * HEAD_DIM],
-        [D, HEAD_DIM], [D // 32, HEAD_DIM], [HEAD_DIM], [LOCAL_H],
-        [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA],
-        [LOCAL_O_WIDTH, D], [LOCAL_O_WIDTH // 32, D],
-        [args.tokens, ROPE_DIM // 2], [args.tokens, ROPE_DIM // 2], [args.tokens], [args.tokens, 128],
-        [pages, 128, 1, HEAD_DIM], [pages, 128, 1, HEAD_DIM // 32],
-    )
-    bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
-    dtypes = (bf, fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, fp, mx, fp, mx,
-              torch.float32, torch.float32, torch.int64, torch.int32, fp, bf)
-    values = {}
-
-    def initialize(name):
-        if not values:
-            ranks = []
-            for rank in range(world_size):
-                seed = args.seed + rank
-                if packed:
-                    value = make_packed_swa_inputs(
-                        args.tokens, args.requests, seed, args.case, getattr(args, 'start_pos', None),
-                    )
-                else:
-                    value = make_swa_inputs(args.tokens, seed)
-                if not packed:
-                    if args.case == "masked":
-                        value["window_slots"].fill_(-1)
-                        value["window_indices"].fill_(-1)
-                    elif args.case == "zero":
-                        value["x"].zero_()
-                        value["window_cache"].view(torch.uint8).zero_()
-                    elif args.case == "sink":
-                        value["attn_sink"].fill_(1000)
-                ranks.append(value)
-            replicated = ("x", "wq_a", "wq_a_scale", "q_norm_weight", "wkv", "wkv_scale",
-                          "kv_norm_weight", "rope_cos", "rope_sin", "window_slots", "window_indices",
-                          "window_cache", "window_cache_scale")
-            for rank, value in enumerate(ranks):
-                for key in replicated:
-                    value[key] = ranks[rank // TP_SIZE * TP_SIZE][key]
-            for key in SWA_INPUT_NAMES:
-                dtype = ranks[0][key].dtype
-                shards = [r[key].view(torch.uint8) if dtype in (fp, mx) else r[key] for r in ranks]
-                values[key] = torch.stack(shards).view(dtype)
-        return values[name]
-
-    specs = [
-        TensorSpec(name, [world_size, *shape], dtype, init_value=lambda n=name: initialize(n), resident="stacked")
-        for name, shape, dtype in zip(SWA_INPUT_NAMES, shapes, dtypes)
-    ]
-    swa_benchmark_step = 1 if args.bench else None
-    output_tokens = (args.tokens + TP_SIZE - 1) // TP_SIZE if mode == "decode" else args.tokens
-    specs += [
-        TensorSpec("output", [world_size, output_tokens, D], bf, resident="stacked"),
-        ScalarSpec("num_tokens", torch.int32, args.tokens),
-        ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=swa_benchmark_step),
-    ]
-    return specs
-
-
-def golden_swa_leaf(tensors, sharded=False, *, mode="decode"):
-    """Reference each TP shard independently, then perform the FP32 TP reduction.
-
-    With ``sharded`` the summed rows are handed out as the contiguous token slabs
-    the kernel ReduceScatter produces, one per rank.
-    """
-    world_size = tensors["x"].shape[0]
-    active = int(tensors["num_tokens"])
-    for base in range(0, world_size, TP_SIZE):
-        partials = []
-        for rank in range(base, base + TP_SIZE):
-            inputs = {name: tensors[name][rank] for name in SWA_INPUT_NAMES}
-            cache_rows = inputs["window_cache"].shape[0] * 128
-            shared_cache = mode == "prefill" or (active >= 32 and cache_rows <= active * 128)
-            partial, cache, scale = swa_official_reference(inputs, shared_cache=shared_cache)
-            partials.append(partial)
-            tensors["window_cache"][rank].copy_(cache)
-            tensors["window_cache_scale"][rank].copy_(scale)
-        reduced = sum(partials).bfloat16()
-        if sharded:
-            # Ownership follows the fixed physical slab, so the active count only
-            # masks its suffix and T < TP keeps the AllGather row mapping.
-            width = tensors["output"].shape[1]
-            for offset in range(TP_SIZE):
-                first = min(offset * width, active)
-                count = max(0, min(width, active - first))
-                tensors["output"][base + offset].zero_()
-                if count:
-                    tensors["output"][base + offset][:count].copy_(reduced[first : first + count])
-        else:
-            tensors["output"][base:base + TP_SIZE].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
-
-
 GOLDEN_SELECTED_KEY_TILE = 64
 GOLDEN_PREFILL_KEY_TILE = 128
 
@@ -1296,7 +1159,6 @@ def golden_selected_attention(q, window_value, window_indices, compressed_value,
     correction = torch.exp(maximum - final_maximum)
     denominator = denominator * correction + torch.exp(sink_value - final_maximum)
     return (numerator * (correction / denominator).unsqueeze(-1)).to(q.dtype)
-
 
 
 def golden_prefill_c1a_attention(
@@ -1407,6 +1269,7 @@ def gather_packed(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
     max_workers: pl.constexpr,
+    name_hint: pl.constexpr,
 ):
     """Gather packed cache rows and dequantize them once for all query heads."""
     window_rows = pl.tensor.dim(window, 0) * 128
@@ -1418,7 +1281,7 @@ def gather_packed(
     selected_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
     dst = pl.reshape(selected, [selected_rows, HEAD_DIM])
     workers = pl.max(1, pl.min(num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), max_workers))
-    with pl.spmd(workers, name_hint="sparse_packed_gather", deps=[ready]) as gathered:
+    with pl.spmd(workers, name_hint=name_hint, deps=[ready]) as gathered:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), workers):
             token = block // (SELECTED_KEYS // GATHER_KEY_TILE)
@@ -1495,6 +1358,7 @@ def gather_packed_chunk(
     selected, combined, gathered = gather_packed(
         window_cache, window_scales, compressed_cache, compressed_scales,
         window_chunk, compressed_chunk, selected, combined, active, chunk_done, max_workers=GATHER_WORKERS,
+        name_hint="c2a_gather",
     )
     return gathered
 
@@ -1511,6 +1375,7 @@ def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY
         chunk_start: pl.Scalar[pl.INT32],
         active: pl.Scalar[pl.INT32],
         gather_ready: pl.Scalar[pl.TASK_ID],
+        name_hint: pl.constexpr,
     ):
         """Attend one chunk over the window and compressed rows under a single sink."""
         tokens = pl.tensor.dim(query, 0)
@@ -1523,7 +1388,7 @@ def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY
         if TP_SIZE == 1:
             workers = pl.min(attend_tasks, 32)
         with pl.spmd(
-            workers, name_hint="c2a_sparse_attention", deps=[gather_ready],
+            workers, name_hint=name_hint, deps=[gather_ready],
             optimizations=[pl.cross_core_slot(slot_num=PACKED_ATTEND_SLOT_TILE)],
         ) as attend_tid:
             worker = pl.tile.get_block_idx()
@@ -1932,6 +1797,7 @@ def _attend_packed_block(
     selected, indices, gathered = gather_packed(
         window, window_scale, compressed, compressed_scale,
         window_indices, compressed_indices, selected, indices, num_tokens, query_ready, max_workers=GATHER_WORKERS,
+        name_hint="c2a_gather",
     )
     attended = attend_selected(query, selected, indices, sink, output, num_tokens, gathered)
     return attended
@@ -1971,6 +1837,7 @@ def attend_packed(
             ready = attend_packed_cohorts(
                 query, window_indices, window, window_scale, compressed_indices,
                 compressed, compressed_scale, sink, output, num_tokens, ready,
+                gather_name="c2a_gather", attn_name="c2a_sparse_attn",
             )
         else:
             capacity = pl.max(1, pl.min(TOKEN_TILE, num_tokens))
@@ -2054,6 +1921,8 @@ def attend_packed_cohorts(
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     rows: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
+    gather_name: pl.constexpr,
+    attn_name: pl.constexpr,
 ):
     selected_a = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
     selected_b = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
@@ -2070,10 +1939,10 @@ def attend_packed_cohorts(
         output_a = pl.slice(output, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
         selected_a, combined_a, gathered_a = gather_packed(
             window, window_scale, compressed, compressed_scale,
-            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32,
+            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32, name_hint=gather_name,
         )
         done_a = _attend_cohort(
-            query_a, selected_a, combined_a, sink, output_a, 0, active_a, gathered_a,
+            query_a, selected_a, combined_a, sink, output_a, 0, active_a, gathered_a, name_hint=attn_name,
         )
         if start + width < rows:
             active_b = pl.min(PACKED_COHORT_TILE, rows - start - width)
@@ -2083,10 +1952,10 @@ def attend_packed_cohorts(
             output_b = pl.slice(output, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
             selected_b, combined_b, gathered_b = gather_packed(
                 window, window_scale, compressed, compressed_scale,
-                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32,
+                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32, name_hint=gather_name,
             )
             done_b = _attend_cohort(
-                query_b, selected_b, combined_b, sink, output_b, 0, active_b, gathered_b,
+                query_b, selected_b, combined_b, sink, output_b, 0, active_b, gathered_b, name_hint=attn_name,
             )
     complete = pl.system.task_dummy(deps=[done_a, done_b])
     return complete
@@ -2113,6 +1982,7 @@ def l2_c2a_attention(
         done = attend_packed_cohorts(
             query, window_indices, window, window_scale, compressed_indices,
             compressed, compressed_scale, sink, output, rows, source_ready,
+            gather_name="c2a_gather", attn_name="c2a_sparse_attn",
         )
     else:
         selected = pl.create_tensor([PACKED_QUERY_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
@@ -2124,7 +1994,9 @@ def l2_c2a_attention(
                 window, window_scale, window_indices, compressed, compressed_scale,
                 compressed_indices, selected, combined, start, active, done,
             )
-            done = attend_c2a_chunk(query, selected, combined, sink, output, start, active, gathered)
+            done = attend_c2a_chunk(
+                query, selected, combined, sink, output, start, active, gathered, name_hint="c2a_sparse_attn",
+            )
     return output
 
 
@@ -2274,9 +2146,6 @@ def validate_swa_core(args):
     return records
 
 
-
-
-
 def golden_swa_attention(
     x: torch.Tensor,
     wq_a: torch.Tensor,
@@ -2298,7 +2167,7 @@ def golden_swa_attention(
     window_indices: torch.Tensor,
     window_cache: torch.Tensor,
     window_cache_scale: torch.Tensor,
-) -> AttentionGoldenResult:
+) -> dict:
     """Evaluate SWA and publish the current token KV rows."""
     query, window_kv, _ = qkv_proj_rope(
         x,
@@ -2326,13 +2195,24 @@ def golden_swa_attention(
     output = golden_o_proj(
         attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale, wo_a_scale=wo_a_scale,
     )
-    return AttentionGoldenResult(
-        output, window_payload, updated_window_scale, None, None, None, None, None, None, None
-    )
+    return {
+        'output': output,
+        'window_cache': window_payload,
+        'window_cache_scale': updated_window_scale,
+        'compressed_cache': None,
+        'compressed_cache_scale': None,
+        'index_cache': None,
+        'index_cache_scale': None,
+        'state_cache': None,
+        'topk_indices': None,
+        'candidate_mask': None,
+        'pool_block_ids': None,
+        'pool_block_counts': None,
+    }
 
 
 def golden_compressed_attention(
-    mode: AttentionMode,
+    mode: str,
     ratio: int,
     x: torch.Tensor,
     wq_a: torch.Tensor,
@@ -2385,7 +2265,7 @@ def golden_compressed_attention(
     indexer_fn: Callable | None = None,
     index_key_fn: Callable | None = None,
     pool_selector_fn: Callable | None = None,
-) -> AttentionGoldenResult:
+) -> dict:
     """Evaluate C2A/C1A full, reindex, or reuse with paged cache state."""
     query, window_kv, query_latent = qkv_proj_rope(
         x,
@@ -2427,7 +2307,7 @@ def golden_compressed_attention(
     pool_ids = None
     pool_counts = None
 
-    if mode is AttentionMode.FULL:
+    if mode == 'full':
         if compressor_wkv is None or compressor_norm_weight is None or compressed_slots is None:
             raise ValueError("full mode requires compressor weights and compressed slots")
         if compressed_rope_cos is None or compressed_rope_sin is None or quantized_index is None:
@@ -2500,7 +2380,7 @@ def golden_compressed_attention(
             scale_format="e8m0",
         ).to(query.dtype)
 
-    if mode in (AttentionMode.FULL, AttentionMode.REINDEX):
+    if mode in ('full', 'reindex'):
         if index_wq_b is None or index_weights_proj is None:
             raise ValueError("indexing modes require query and score weights")
         if (
@@ -2517,7 +2397,7 @@ def golden_compressed_attention(
             index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
         )
         scores, topk_indices = indexer_fn(*index_args, topk=M.index_topk)
-        if ratio == 1 and mode is AttentionMode.FULL:
+        if ratio == 1 and mode == 'full':
             if pool_selector_fn is None:
                 raise ValueError("C1A Full requires a candidate-pool reference")
             pool_width = index_block_table.shape[-1] * 128
@@ -2534,26 +2414,23 @@ def golden_compressed_attention(
         attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale,
         wo_a_scale=wo_a_scale, output_dtype=output_dtype, sequential_projection=sequential_query,
     )
-    return AttentionGoldenResult(
-        output,
-        window_payload,
-        updated_window_scale,
-        compressed_payload,
-        updated_compressed_scale,
-        index_payload,
-        updated_index_scale,
-        updated_state,
-        topk_indices,
-        candidates,
-        pool_ids,
-        pool_counts,
-    )
-
-
+    return {
+        'output': output,
+        'window_cache': window_payload,
+        'window_cache_scale': updated_window_scale,
+        'compressed_cache': compressed_payload,
+        'compressed_cache_scale': updated_compressed_scale,
+        'index_cache': index_payload,
+        'index_cache_scale': updated_index_scale,
+        'state_cache': updated_state,
+        'topk_indices': topk_indices,
+        'candidate_mask': candidates,
+        'pool_block_ids': pool_ids,
+        'pool_block_counts': pool_counts,
+    }
 
 
 prefill_attend_sparse = make_attend_selected_chunk(vector_query=True)
-
 
 
 if __name__ == "__main__":
@@ -2581,8 +2458,6 @@ if __name__ == "__main__":
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--runtime-dir", type=str)
     args = parser.parse_args()
-    if args.execution_mode:
-        parser.error("this entry requires hardware; --sim is unsupported")
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
     if args.mode == "c2a" and TP_SIZE != 1:
