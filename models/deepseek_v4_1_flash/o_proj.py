@@ -181,14 +181,14 @@ def grouped_output(
 
 @pl.jit.inline(auto_scope=False)
 def o_proj(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    attended: pl.Tensor,
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     grouped_max_workers: pl.constexpr = GROUPED_WORKER_TILE,
 ):
