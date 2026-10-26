@@ -176,7 +176,6 @@ def grouped_output(
             rows = pl.min(M_TILE, num_tokens - t0)
             value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
             output[t0:t0 + M_TILE, n0:n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
-    return output
 
 
 @pl.jit.inline(auto_scope=False)
