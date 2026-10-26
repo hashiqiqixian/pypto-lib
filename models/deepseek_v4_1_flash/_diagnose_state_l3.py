@@ -88,9 +88,10 @@ def golden_accept(values):
         values["first_query_positions"][rank, 0] = 10 + accepted
 
 
-check("accept_target", S.l3_accept_target, common + [
+check("accept_target", S.l3_accept_target, [common[0], common[1],
     TensorSpec("active_widths", [RANKS, BATCH], torch.int32, init_value=widths),
     TensorSpec("sampled_ids", list(sampled.shape), torch.int32, init_value=sampled),
+    common[2], common[3],
     TensorSpec("accepted_ids", [RANKS, BATCH, ROWS], torch.int32),
     TensorSpec("accepted_counts", [RANKS, BATCH], torch.int32),
     TensorSpec("context_valid", [RANKS, BATCH, ROWS], torch.int32),
