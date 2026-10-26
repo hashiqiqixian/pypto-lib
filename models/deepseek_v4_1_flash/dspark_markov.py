@@ -81,7 +81,6 @@ HIDDEN_TILE = 256
 MARKOV_CORES = 48
 ARGMAX_ROWS = 8
 RESULT_STRIDE = 16
-MARKOV_ROWS_DYN = pl.dynamic("V41_DSPARK_MARKOV_ROWS_DYN")
 
 assert VOCAB % VOCAB_TILE == 0
 assert D % HIDDEN_TILE == 0
@@ -336,7 +335,8 @@ def _markov_sample_from_hidden(
     confidences.bind_dynamic(0, B_DYN)
     batch = pl.tensor.dim(num_sampled, 0)
     rows = batch * DSPARK_QUERY_WIDTH
-    flat_hidden: pl.Tensor[[MARKOV_ROWS_DYN, D], pl.BF16] = pl.reshape(head_hidden, [rows, D])
+    flat_hidden = pl.create_tensor([rows, D], dtype=pl.BF16)
+    flat_hidden[:, :] = pl.reshape(head_hidden, [rows, D])
     normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
     for block in pl.spmd((rows + 7) // 8, name_hint="dspark_final_norm"):
         rms_norm_tiled(flat_hidden, final_norm_weight, normalized, block, rows, output_fp32=False)
