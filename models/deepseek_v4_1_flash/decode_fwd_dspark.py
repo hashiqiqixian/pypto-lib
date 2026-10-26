@@ -233,12 +233,13 @@ def golden_prepare_target_decode(values: Mapping[str, Any]) -> None:
     values["x_hc"].copy_(embedded[:, None, :].expand(-1, HC_MULT, -1))
 
 
-def run_prepare_target_decode_case(*, platform: str = "a5", device_id: int = 0,
+def run_prepare_target_decode_case(*, platform: str = "a5", devices: tuple[int, ...] = (0,),
                                    compile_only: bool = False):
-    """Exercise six-row and idle request metadata on one NPU, as in V4 cases."""
+    """Exercise six-row, partial, and idle requests on one rank or all EP ranks."""
     import torch
 
     from golden import TensorSpec, run
+    from pypto.ir import DistributedConfig
 
     widths = torch.tensor([6, 6, 1, 0] + [0] * (BATCH - 4), dtype=torch.int32)
     ids = torch.arange(TARGET_ROWS, dtype=torch.int64).reshape(BATCH, ROWS) % 32
@@ -249,11 +250,12 @@ def run_prepare_target_decode_case(*, platform: str = "a5", device_id: int = 0,
     tables = torch.arange(BATCH * 2, dtype=torch.int32).reshape(BATCH, 2)
     c2a_table = torch.arange(BATCH, dtype=torch.int32).reshape(BATCH, 1)
     c1a_table = (tables + BATCH * 2).contiguous()
+    embedding = (torch.arange(32 * D).reshape(32, D).remainder(257) / 64).to(torch.bfloat16)
     specs = [
         TensorSpec("input_ids", [BATCH, ROWS], torch.int64, init_value=ids),
         TensorSpec("positions", [BATCH, ROWS], torch.int32, init_value=positions),
         TensorSpec("active_widths", [BATCH], torch.int32, init_value=widths),
-        TensorSpec("embedding_weight", [32, D], torch.bfloat16),
+        TensorSpec("embedding_weight", [32, D], torch.bfloat16, init_value=embedding),
         TensorSpec("window_table", [BATCH, 2], torch.int32, init_value=tables),
         TensorSpec("c2a_table", [BATCH, 1], torch.int32, init_value=c2a_table),
         TensorSpec("c1a_table", [BATCH, 2], torch.int32, init_value=c1a_table),
@@ -267,10 +269,31 @@ def run_prepare_target_decode_case(*, platform: str = "a5", device_id: int = 0,
         TensorSpec("c1a_slots", [PADDED_ROWS], torch.int64),
         TensorSpec("query_starts", [BATCH + 1], torch.int32),
     ]
-    return run(
-        fn=prepare_target_decode_rank, specs=specs, golden_fn=golden_prepare_target_decode,
-        config={"platform": platform, "device_id": device_id}, compile_only=compile_only,
-    )
+    if len(devices) == 1:
+        fn = prepare_target_decode_rank
+        golden_fn = golden_prepare_target_decode
+        config = {"platform": platform, "device_id": devices[0]}
+    elif len(devices) == EP_SIZE:
+        fn = l3_prepare_target_decode
+        rank_specs = specs
+        specs = []
+        for spec in rank_specs:
+            initial = spec.init_value
+            if isinstance(initial, torch.Tensor):
+                initial = initial.unsqueeze(0).expand(EP_SIZE, *initial.shape).clone()
+            specs.append(TensorSpec(spec.name, [EP_SIZE, *spec.shape], spec.dtype, init_value=initial))
+
+        def golden_fn(values):
+            for rank in range(EP_SIZE):
+                golden_prepare_target_decode({name: value[rank] for name, value in values.items()})
+
+        config = {
+            "backend_type": platform,
+            "distributed_config": DistributedConfig(device_ids=list(devices), num_sub_workers=0),
+        }
+    else:
+        raise ValueError(f"provide one device or EP_SIZE={EP_SIZE} devices, got {devices}")
+    return run(fn=fn, specs=specs, golden_fn=golden_fn, config=config, compile_only=compile_only)
 
 
 StageRunner = Callable[[Any, Mapping[str, Any]], None]
@@ -457,11 +480,17 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
-    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
+    parser.add_argument("--ep", type=int, default=EP_SIZE)
+    parser.add_argument("--dp", type=int, default=EP_SIZE)
+    parser.add_argument("-d", "--device", default="0")
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    if (args.tp, args.ep, args.dp) != (TP_SIZE, EP_SIZE, EP_SIZE):
+        parser.error("--tp/--ep/--dp must match the import-time TP1/DP=EP configuration")
+    devices = tuple(int(value) for value in args.device.split(","))
     result = run_prepare_target_decode_case(
-        platform=args.platform, device_id=args.device, compile_only=args.compile_only,
+        platform=args.platform, devices=devices, compile_only=args.compile_only,
     )
     if not result.passed:
         raise SystemExit(str(result))
