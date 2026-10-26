@@ -296,6 +296,36 @@ def run_prepare_target_decode_case(*, platform: str = "a5", devices: tuple[int, 
     return run(fn=fn, specs=specs, golden_fn=golden_fn, config=config, compile_only=compile_only)
 
 
+def run_copy_target_hidden_case(*, devices: tuple[int, ...], compile_only: bool = False):
+    """Check that the three target-layer taps retain request-major row order."""
+    import torch
+
+    from golden import TensorSpec, run
+    from pypto.ir import DistributedConfig
+
+    if len(devices) != EP_SIZE:
+        raise ValueError(f"copy case requires EP_SIZE={EP_SIZE} devices, got {devices}")
+    padded = torch.arange(EP_SIZE * PADDED_ROWS * MAIN_IN, dtype=torch.int32)
+    padded = padded.reshape(EP_SIZE, PADDED_ROWS, MAIN_IN).remainder(1024).to(torch.bfloat16)
+
+    def golden(values):
+        values["compact"].copy_(values["padded"][:, :TARGET_ROWS])
+
+    return run(
+        fn=l3_copy_target_hidden,
+        specs=[
+            TensorSpec("padded", [EP_SIZE, PADDED_ROWS, MAIN_IN], torch.bfloat16, init_value=padded),
+            TensorSpec("compact", [EP_SIZE, TARGET_ROWS, MAIN_IN], torch.bfloat16),
+        ],
+        golden_fn=golden,
+        config={
+            "backend_type": "a5",
+            "distributed_config": DistributedConfig(device_ids=list(devices), num_sub_workers=0),
+        },
+        compile_only=compile_only,
+    )
+
+
 StageRunner = Callable[[Any, Mapping[str, Any]], None]
 
 
@@ -494,3 +524,7 @@ if __name__ == "__main__":
     )
     if not result.passed:
         raise SystemExit(str(result))
+    if len(devices) == EP_SIZE:
+        result = run_copy_target_hidden_case(devices=devices, compile_only=args.compile_only)
+        if not result.passed:
+            raise SystemExit(str(result))
