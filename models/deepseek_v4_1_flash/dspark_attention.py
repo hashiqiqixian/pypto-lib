@@ -117,7 +117,7 @@ def attend_dspark_window(
 
 @pl.jit.inline(auto_scope=False)
 def dspark_attention(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    x: pl.Tensor,
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -131,13 +131,13 @@ def dspark_attention(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    window_slots: pl.Tensor,
+    window_indices: pl.Tensor,
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x, 0)
