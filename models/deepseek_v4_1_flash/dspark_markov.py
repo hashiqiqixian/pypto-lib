@@ -348,12 +348,13 @@ def _markov_sample_from_hidden(
     completed_epochs = logits_epoch + chunks - 1
     for chunk in pl.range(chunks):
         row_indices = pl.create_tensor([MAX_LOGIT_ROWS], dtype=pl.INT32)
-        for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="dspark_logit_rows"):
-            source = pl.cast(-1, pl.INT32)
-            global_row = chunk * MAX_LOGIT_ROWS + row
-            if global_row < rows:
-                source = pl.cast(global_row, pl.INT32)
-            pl.write(row_indices, [row], source)
+        with pl.spmd(1, name_hint="dspark_logit_rows"):
+            for row in pl.range(MAX_LOGIT_ROWS):
+                source = pl.cast(-1, pl.INT32)
+                global_row = chunk * MAX_LOGIT_ROWS + row
+                if global_row < rows:
+                    source = pl.cast(global_row, pl.INT32)
+                pl.write(row_indices, [row], source)
         logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
         lm_head(
             normalized,
@@ -377,11 +378,12 @@ def _markov_sample_from_hidden(
                         row : row + 1, offset : offset + VOCAB_TILE
                     ]
     anchor_ids = pl.create_tensor([batch], dtype=pl.INT64)
-    for request in pl.spmd(batch, name_hint="dspark_markov_anchor"):
-        anchor = pl.read(next_prefill_tokens, [request])
-        if pl.read(num_sampled, [request]) > 0:
-            anchor = pl.read(last_sampled, [request])
-        pl.write(anchor_ids, [request], anchor)
+    with pl.spmd(1, name_hint="dspark_markov_anchor"):
+        for request in pl.range(batch):
+            anchor = pl.read(next_prefill_tokens, [request])
+            if pl.read(num_sampled, [request]) > 0:
+                anchor = pl.read(last_sampled, [request])
+            pl.write(anchor_ids, [request], anchor)
     markov_sample_inline(
         base_logits,
         head_hidden,
