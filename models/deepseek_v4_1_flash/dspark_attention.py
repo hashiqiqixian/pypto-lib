@@ -149,7 +149,6 @@ def dspark_attention(
                 max_workers=64 if TP_SIZE == 1 else 2147483647)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     return output, window_cache, window_cache_scale
 
 
