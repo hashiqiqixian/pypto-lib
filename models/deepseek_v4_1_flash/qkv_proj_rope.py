@@ -273,11 +273,11 @@ def _q_proj_rope_from_mx_m80(
 
 @pl.jit.inline(auto_scope=False)
 def q_proj_rope(
-    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+    query_latent: pl.Tensor,
     wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
     wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
     query: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     max_workers: pl.constexpr = 2147483647,
