@@ -250,8 +250,8 @@ def kv_proj_rope(
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    projected: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    projected: pl.Tensor,
+    window_kv: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     gemm_bf16_via_mxfp8_to_bf16_staged(
