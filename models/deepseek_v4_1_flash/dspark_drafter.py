@@ -14,7 +14,7 @@ import pypto.language.distributed as pld
 import torch
 
 import config as C
-from config import BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, PREFILL_MAX_TOKENS, TP_SIZE, T_DYN, TABLE_DYN
+from config import BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, TP_SIZE, T_DYN, TABLE_DYN
 from o_proj import prefill_tp_output_all_reduce
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
 from hc import hc_head, hc_post, hc_pre, zero_bf16_padding
