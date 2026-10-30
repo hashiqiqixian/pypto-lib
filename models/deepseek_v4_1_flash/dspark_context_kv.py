@@ -11,7 +11,7 @@
 import pypto.language as pl
 import torch
 
-from config import DSPARK_QUERY_WIDTH, FLASH, ORI_BLOCKS_DYN, T_DYN
+from config import DSPARK_QUERY_WIDTH, FLASH, ORI_BLOCKS_DYN
 from qkv_proj_rope import golden_rope_interleave, quantize_projection_input, kv_proj_rope
 from gemm import golden_mxfp8_linear_grouped_sum
 from quant import quantize_mxfp8_cache
@@ -19,6 +19,7 @@ from rmsnorm import golden_rms_norm
 from sparse_attention import publish_window_row
 
 
+T_DYN = pl.dynamic("V41_DSPARK_CONTEXT_T_DYN")
 D = FLASH.hidden_size
 HEAD_DIM = FLASH.head_dim
 ROPE_DIM = FLASH.qk_rope_head_dim
@@ -167,7 +168,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark context KV validation")
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
@@ -224,10 +225,8 @@ if __name__ == "__main__":
         specs=specs,
         golden_fn=golden,
         compare_fn=compare,
-        config={
-            "backend_type": args.backend_type, "execution_mode": args.execution_mode,
-            "device_id": args.device,
-        },
+        config={"backend_type": "a5", "device_id": args.device,
+                "execution_mode": args.execution_mode or args.platform == "a5sim"},
         compile_only=args.compile_only,
     )
     print(result)
