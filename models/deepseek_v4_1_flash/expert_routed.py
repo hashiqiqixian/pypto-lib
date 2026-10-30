@@ -57,6 +57,7 @@ MX_W2_D_OUT_TILE = 256
 MX_W2_TASK_TILE = 1024
 MX_PACKED_LANE_ROWS = MX_K_TILE // 2
 MX_PACKED_LANE_COLS = MX_MM_INTER_TILE // 2
+MX_PACKED_GATHER_ROWS = 32
 MX_W1_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W3_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * MX_PACKED_LANE_ROWS
@@ -112,6 +113,7 @@ def expert_routed_scatter(
                         w1_lane = block_idx % 2
                         n_base = nb_idx * MX_MM_TASK_TILE
                         w1_lut_tile = pl.load(mxfp4_pair_lut, [w1_lane, 0], [1, 256], target_memory=pl.Mem.Vec)
+                        w1_lut_tile = pl.cast(w1_lut_tile, target_type=pl.INT32)
                         for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
                             n0 = n_base + ng * MX_MM_INTER_TILE
                             for k0 in pl.pipeline(0, D, MX_K_TILE, stage=2):
@@ -121,19 +123,21 @@ def expert_routed_scatter(
                                 w1_packed_row = (
                                     w1_tile_id * 2 * MX_PACKED_LANE_ROWS + w1_lane * MX_PACKED_LANE_ROWS
                                 )
-                                w1_packed_tile = pl.load(
-                                    routed_w1_packed_e, [w1_packed_row, 0], [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
-                                    target_memory=pl.Mem.Vec,
-                                )
-                                w1_packed_u16 = pl.cast(w1_packed_tile, target_type=pl.UINT16)
-                                w1_packed_indices = pl.reinterpret_view(w1_packed_u16, pl.INT16)
-                                w1_gather_tmp = pl.create_tile(
-                                    [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS], dtype=pl.INT16, target_memory=pl.Mem.Vec,
-                                )
-                                w1_pair_codes = pl.tile.gather(w1_lut_tile, w1_packed_indices, w1_gather_tmp)
-                                w1_bytes = pl.reinterpret_view(w1_pair_codes, pl.INT8, shape=[MX_PACKED_LANE_ROWS, MX_MM_INTER_TILE])
-                                w1_mxfp8_reinterpret_view = pl.reinterpret_view(w1_bytes, pl.FP8E4M3FN)
-                                w1_mxfp8 = pl.store(w1_mxfp8_reinterpret_view, [k0 + w1_lane * MX_PACKED_LANE_ROWS, n0], w1_mxfp8)
+                                for packed_row in pl.range(0, MX_PACKED_LANE_ROWS, MX_PACKED_GATHER_ROWS):
+                                    w1_packed_tile = pl.load(
+                                        routed_w1_packed_e, [w1_packed_row + packed_row, 0], [MX_PACKED_GATHER_ROWS, MX_PACKED_LANE_COLS],
+                                        target_memory=pl.Mem.Vec,
+                                    )
+                                    w1_packed_u16 = pl.cast(w1_packed_tile, target_type=pl.UINT16)
+                                    w1_packed_indices = pl.cast(pl.reinterpret_view(w1_packed_u16, pl.INT16), target_type=pl.INT32)
+                                    w1_gather_tmp = pl.create_tile(
+                                        [MX_PACKED_GATHER_ROWS, MX_PACKED_LANE_COLS], dtype=pl.INT32, target_memory=pl.Mem.Vec,
+                                    )
+                                    w1_pair_codes = pl.tile.gather(w1_lut_tile, w1_packed_indices, w1_gather_tmp)
+                                    w1_pair_codes = pl.cast(w1_pair_codes, target_type=pl.INT16)
+                                    w1_bytes = pl.reinterpret_view(w1_pair_codes, pl.INT8, shape=[MX_PACKED_GATHER_ROWS, MX_MM_INTER_TILE])
+                                    w1_mxfp8_view = pl.reinterpret_view(w1_bytes, pl.FP8E4M3FN)
+                                    w1_mxfp8 = pl.store(w1_mxfp8_view, [k0 + w1_lane * MX_PACKED_LANE_ROWS + packed_row, n0], w1_mxfp8)
 
                     w3_mxfp8 = pl.create_tensor([D, MOE_INTER], dtype=pl.FP8E4M3FN)
                     with pl.spmd(2 * (MOE_INTER // MX_MM_TASK_TILE), name_hint='exp_up_mxfp4_aiv') as up_mxfp4_aiv_tid:
@@ -142,6 +146,7 @@ def expert_routed_scatter(
                         w3_lane = block_idx % 2
                         n_base = nb_idx * MX_MM_TASK_TILE
                         w3_lut_tile = pl.load(mxfp4_pair_lut, [w3_lane, 0], [1, 256], target_memory=pl.Mem.Vec)
+                        w3_lut_tile = pl.cast(w3_lut_tile, target_type=pl.INT32)
                         for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
                             n0 = n_base + ng * MX_MM_INTER_TILE
                             for k0 in pl.pipeline(0, D, MX_K_TILE, stage=2):
@@ -151,19 +156,21 @@ def expert_routed_scatter(
                                 w3_packed_row = (
                                     w3_tile_id * 2 * MX_PACKED_LANE_ROWS + w3_lane * MX_PACKED_LANE_ROWS
                                 )
-                                w3_packed_tile = pl.load(
-                                    routed_w3_packed_e, [w3_packed_row, 0], [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
-                                    target_memory=pl.Mem.Vec,
-                                )
-                                w3_packed_u16 = pl.cast(w3_packed_tile, target_type=pl.UINT16)
-                                w3_packed_indices = pl.reinterpret_view(w3_packed_u16, pl.INT16)
-                                w3_gather_tmp = pl.create_tile(
-                                    [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS], dtype=pl.INT16, target_memory=pl.Mem.Vec,
-                                )
-                                w3_pair_codes = pl.tile.gather(w3_lut_tile, w3_packed_indices, w3_gather_tmp)
-                                w3_bytes = pl.reinterpret_view(w3_pair_codes, pl.INT8, shape=[MX_PACKED_LANE_ROWS, MX_MM_INTER_TILE])
-                                w3_mxfp8_reinterpret_view = pl.reinterpret_view(w3_bytes, pl.FP8E4M3FN)
-                                w3_mxfp8 = pl.store(w3_mxfp8_reinterpret_view, [k0 + w3_lane * MX_PACKED_LANE_ROWS, n0], w3_mxfp8)
+                                for packed_row in pl.range(0, MX_PACKED_LANE_ROWS, MX_PACKED_GATHER_ROWS):
+                                    w3_packed_tile = pl.load(
+                                        routed_w3_packed_e, [w3_packed_row + packed_row, 0], [MX_PACKED_GATHER_ROWS, MX_PACKED_LANE_COLS],
+                                        target_memory=pl.Mem.Vec,
+                                    )
+                                    w3_packed_u16 = pl.cast(w3_packed_tile, target_type=pl.UINT16)
+                                    w3_packed_indices = pl.cast(pl.reinterpret_view(w3_packed_u16, pl.INT16), target_type=pl.INT32)
+                                    w3_gather_tmp = pl.create_tile(
+                                        [MX_PACKED_GATHER_ROWS, MX_PACKED_LANE_COLS], dtype=pl.INT32, target_memory=pl.Mem.Vec,
+                                    )
+                                    w3_pair_codes = pl.tile.gather(w3_lut_tile, w3_packed_indices, w3_gather_tmp)
+                                    w3_pair_codes = pl.cast(w3_pair_codes, target_type=pl.INT16)
+                                    w3_bytes = pl.reinterpret_view(w3_pair_codes, pl.INT8, shape=[MX_PACKED_GATHER_ROWS, MX_MM_INTER_TILE])
+                                    w3_mxfp8_view = pl.reinterpret_view(w3_bytes, pl.FP8E4M3FN)
+                                    w3_mxfp8 = pl.store(w3_mxfp8_view, [k0 + w3_lane * MX_PACKED_LANE_ROWS + packed_row, n0], w3_mxfp8)
 
                     for t in pl.parallel(n_tiles):
                         t0 = t * RECV_TILE
@@ -274,6 +281,7 @@ def expert_routed_scatter(
                             w2_lane = block_idx % 2
                             d_base = wb_idx * MX_W2_TASK_TILE
                             w2_lut_tile = pl.load(mxfp4_pair_lut, [w2_lane, 0], [1, 256], target_memory=pl.Mem.Vec)
+                            w2_lut_tile = pl.cast(w2_lut_tile, target_type=pl.INT32)
                             for dg in pl.range(MX_W2_TASK_TILE // MX_W2_D_OUT_TILE):
                                 d0 = d_base + dg * MX_W2_D_OUT_TILE
                                 for k0 in pl.pipeline(0, MOE_INTER, MX_K_TILE, stage=2):
@@ -283,19 +291,21 @@ def expert_routed_scatter(
                                     w2_packed_row = (
                                         w2_tile_id * 2 * MX_PACKED_LANE_ROWS + w2_lane * MX_PACKED_LANE_ROWS
                                     )
-                                    w2_packed_tile = pl.load(
-                                        routed_w2_packed_e, [w2_packed_row, 0], [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
-                                        target_memory=pl.Mem.Vec,
-                                    )
-                                    w2_packed_u16 = pl.cast(w2_packed_tile, target_type=pl.UINT16)
-                                    w2_packed_indices = pl.reinterpret_view(w2_packed_u16, pl.INT16)
-                                    w2_gather_tmp = pl.create_tile(
-                                        [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS], dtype=pl.INT16, target_memory=pl.Mem.Vec,
-                                    )
-                                    w2_pair_codes = pl.tile.gather(w2_lut_tile, w2_packed_indices, w2_gather_tmp)
-                                    w2_bytes = pl.reinterpret_view(w2_pair_codes, pl.INT8, shape=[MX_PACKED_LANE_ROWS, MX_W2_D_OUT_TILE])
-                                    w2_mxfp8_reinterpret_view = pl.reinterpret_view(w2_bytes, pl.FP8E4M3FN)
-                                    w2_mxfp8 = pl.store(w2_mxfp8_reinterpret_view, [k0 + w2_lane * MX_PACKED_LANE_ROWS, d0], w2_mxfp8)
+                                    for packed_row in pl.range(0, MX_PACKED_LANE_ROWS, MX_PACKED_GATHER_ROWS):
+                                        w2_packed_tile = pl.load(
+                                            routed_w2_packed_e, [w2_packed_row + packed_row, 0], [MX_PACKED_GATHER_ROWS, MX_PACKED_LANE_COLS],
+                                            target_memory=pl.Mem.Vec,
+                                        )
+                                        w2_packed_u16 = pl.cast(w2_packed_tile, target_type=pl.UINT16)
+                                        w2_packed_indices = pl.cast(pl.reinterpret_view(w2_packed_u16, pl.INT16), target_type=pl.INT32)
+                                        w2_gather_tmp = pl.create_tile(
+                                            [MX_PACKED_GATHER_ROWS, MX_PACKED_LANE_COLS], dtype=pl.INT32, target_memory=pl.Mem.Vec,
+                                        )
+                                        w2_pair_codes = pl.tile.gather(w2_lut_tile, w2_packed_indices, w2_gather_tmp)
+                                        w2_pair_codes = pl.cast(w2_pair_codes, target_type=pl.INT16)
+                                        w2_bytes = pl.reinterpret_view(w2_pair_codes, pl.INT8, shape=[MX_PACKED_GATHER_ROWS, MX_W2_D_OUT_TILE])
+                                        w2_mxfp8_view = pl.reinterpret_view(w2_bytes, pl.FP8E4M3FN)
+                                        w2_mxfp8 = pl.store(w2_mxfp8_view, [k0 + w2_lane * MX_PACKED_LANE_ROWS + packed_row, d0], w2_mxfp8)
 
                         for tt in pl.parallel(e_tiles):
                             tt0 = tt * RECV_TILE

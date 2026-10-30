@@ -168,9 +168,9 @@ def _q_normalize_to_mx(
     payload: pl.Tensor,
     scale_backing: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    output_row: pl.Scalar[pl.INT32],
     workers: pl.constexpr,
 ):
-    weight_row = pl.tensor.view(q_norm_weight, [1, Q_LORA])
     for worker in pl.spmd(workers, name_hint="attention_q_norm_quant"):
         normalized_rows = pl.create_tile([MX_M_TILE, Q_LORA], dtype=pl.BF16)
         for half in pl.unroll(2):
@@ -189,12 +189,12 @@ def _q_normalize_to_mx(
             rms_argument = pl.add(mean, EPS)
             rsqrt_tmp = pl.create_tile([8, 1], dtype=pl.FP32)
             row_inverse = pl.tile.rsqrt(rms_argument, tmp=rsqrt_tmp)
-            gamma = pl.cast(pl.load(weight_row, [0, 0], [1, Q_LORA]), pl.FP32)
+            gamma = pl.reshape(pl.cast(pl.load(q_norm_weight, [0], [Q_LORA]), pl.FP32), [1, Q_LORA])
             normalized = pl.col_expand_mul(pl.row_expand_mul(value, row_inverse), gamma)
             rounded = pl.cast(normalized, pl.BF16, mode="rint")
             rounded_valid = pl.set_validshape(rounded, rows, Q_LORA)
             if worker == 0 and num_tokens > t:
-                query_latent = pl.store(rounded_valid, [t, 0], query_latent)
+                query_latent = pl.store(rounded_valid, [output_row + t, 0], query_latent)
             padded = pl.set_validshape(pl.fillpad(rounded_valid, pad_value=pl.PadValue.zero), 8, Q_LORA)
             padded_bits = pl.reinterpret_view(padded, pl.INT16)
             zero_bits = pl.tile.full([8, Q_LORA], dtype=pl.INT16, value=0)
@@ -233,8 +233,9 @@ def _q_normalize_to_mx(
             pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
             packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=QUANT_SCALE_TILE)
             packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
-            payload = pl.store(quantized_tile, [0, k0], payload)
-            scale_offset = k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32)
+            payload = pl.store(quantized_tile, [output_row, k0], payload)
+            scale_offset = (output_row * (Q_LORA // 32)
+                            + k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32))
             packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
             scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
     return query_latent, payload, scale_backing
@@ -265,9 +266,12 @@ def q_proj_rope(
         scale_start = group_start * (D // 32)
         group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
         projected = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.BF16)
-        # Projection blocks own disjoint columns; no simultaneous start is required.
-        with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a"):
-            projected = _proj_q_a(group_payload, wq_a, group_scales, wq_a_scale, projected, group_rows)
+        with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a", sync_start=True):
+            # PTOAS 0.70 returns the output tensor for an Out argument.  Keep
+            # that tensor alias for subsequent loads; the return is not a Tile.
+            projected = _proj_q_a(
+                group_payload, wq_a, group_scales, wq_a_scale, projected, group_rows,
+            )
         qb_payload_group = pl.tensor.slice(qb_payload, [PROJ_M_TILE, Q_LORA], [group_start, 0])
         qb_scale_start = group_start * (Q_LORA // 32)
         qb_scales_group = pl.tensor.slice(
@@ -277,22 +281,15 @@ def q_proj_rope(
             q_local = q_mt * MX_M_TILE
             q_start = group_start + pl.min(q_local, group_rows)
             q_rows = pl.max(pl.min(MX_M_TILE, group_rows - q_local), 0)
-            projected_tile = pl.slice(projected, [q_rows, Q_LORA], [q_local, 0])
-            latent_tile = pl.slice(query_latent, [q_rows, Q_LORA], [q_start, 0])
-            qb_payload_tile = pl.tensor.slice(qb_payload_group, [MX_M_TILE, Q_LORA], [q_local, 0])
-            qb_scale_offset = q_local * (Q_LORA // 32)
-            qb_scales_tile = pl.tensor.slice(
-                qb_scales_group, [1, MX_M_TILE * (Q_LORA // 32)], [0, qb_scale_offset],
-            )
+            # PTOAS 0.70 keeps ``pl.slice`` as a TileView, which cannot be
+            # passed to ``pl.load`` inside the normalizer.  Use the tensor
+            # slice form so the callee receives a loadable Tensor view.
             _q_normalize_to_mx(
-                projected_tile, q_norm_weight, latent_tile,
-                qb_payload_tile, qb_scales_tile, q_rows, 5,
+                projected, q_norm_weight, query_latent,
+                qb_payload, qb_scales, q_rows, q_start, 5,
             )
         group_tokens = pl.cast(group_rows, pl.INT32)
-        qb_workers = pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE)
-        qb_workers = pl.min(qb_workers, pl.system.available_cluster_count())
-        qb_workers = pl.max(1, qb_workers)
-        with pl.spmd(qb_workers, name_hint="proj_q_b"):
+        with pl.spmd(pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE), name_hint="proj_q_b", sync_start=True):
             query = _proj_q_b(
                 qb_payload_group, wq_b, qb_scales_group, wq_b_scale,
                 query, group_rows, LOCAL_H * HEAD_DIM, group_start,

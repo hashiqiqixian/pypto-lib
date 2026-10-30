@@ -131,8 +131,8 @@ def prefill_publish_window_batched(
 
 @pl.jit.inline
 def _publish_window_row(
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
+    kv: pl.Tensor,
+    slots: pl.Tensor,
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     t: pl.Scalar[pl.INT32],
@@ -167,8 +167,8 @@ def _publish_window_row(
 
 @pl.jit.inline(auto_scope=False)
 def publish_window_row(
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
+    kv: pl.Tensor,
+    slots: pl.Tensor,
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
