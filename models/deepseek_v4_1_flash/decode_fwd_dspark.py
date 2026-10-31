@@ -516,7 +516,12 @@ def prefill_bootstrap_dspark(
 def run_decode_chain_case(devices: tuple[int, ...], *, compile_only: bool = False,
                           manifest_path: str | None = None,
                           persistent_chain: bool = False) -> None:
-    """Compare a complete deterministic target-to-draft round with Torch."""
+    """Compare two deterministic target-to-draft rounds with Torch.
+
+    The second round is intentional: it consumes the draft block committed by
+    the first round, so a passing first round alone cannot hide a broken state
+    handoff.
+    """
     import inspect
     import json
     import math
@@ -874,7 +879,52 @@ def run_decode_chain_case(devices: tuple[int, ...], *, compile_only: bool = Fals
         ):
             if not torch.equal(actual, expected):
                 raise AssertionError(f"rank {rank}: {label} mismatch")
-    print("[chain] target decode -> drafter -> Markov -> state numerical PASS", flush=True)
+    # Re-enter the same target-to-draft path with the state published above.
+    # This checks that the accepted anchor and five drafts become the next
+    # target slab, rather than merely checking one isolated invocation.
+    recurrent_tokens = state.tokens.clone()
+    recurrent_meta = state.meta.clone()
+    decode_fwd_dspark(
+        runner, state, workspace, target_model, draft_model, markov_model, cache_tables, rope_tables,
+        attention_epoch=2, moe_epoch=2, logits_epoch=2,
+    )
+    for rank in range(EP_SIZE):
+        expected_ids, expected_positions, expected_widths = golden_prepare_target(
+            state.slot_ids[rank], state.generations[rank], recurrent_tokens[rank], recurrent_meta[rank],
+        )
+        if not torch.equal(workspace["input_ids"][rank], expected_ids):
+            raise AssertionError(f"rank {rank}: recurrent target input IDs mismatch")
+        if not torch.equal(workspace["target_positions"][rank], expected_positions):
+            raise AssertionError(f"rank {rank}: recurrent target positions mismatch")
+        if not torch.equal(workspace["active_widths"][rank], expected_widths):
+            raise AssertionError(f"rank {rank}: recurrent active widths mismatch")
+        expected_target_sampled = torch.zeros_like(workspace["target_sampled_ids"][rank])
+        for request, width in enumerate(expected_widths.tolist()):
+            if width > 0:
+                expected_target_sampled[request * ROWS:request * ROWS + width, 0] = 1
+        if not torch.equal(workspace["target_sampled_ids"][rank], expected_target_sampled):
+            raise AssertionError(f"rank {rank}: recurrent target sampled IDs mismatch")
+        expected_tokens, expected_meta, accepted_ids, accepted_counts = golden_accept_target(
+            state.slot_ids[rank], state.generations[rank], expected_widths,
+            workspace["target_sampled_ids"][rank], recurrent_tokens[rank], recurrent_meta[rank],
+        )
+        expected_drafts = torch.zeros(BATCH, ROWS - 1, dtype=torch.int32)
+        expected_drafts[0] = torch.tensor([0, 1, 0, 1, 0], dtype=torch.int32)
+        expected_tokens, expected_meta, expected_committed = golden_commit_drafts(
+            state.slot_ids[rank], state.generations[rank], expected_drafts, expected_tokens, expected_meta,
+        )
+        for actual, expected, label in (
+            (workspace["accepted_ids"][rank], accepted_ids, "recurrent accepted IDs"),
+            (workspace["accepted_counts"][rank], accepted_counts, "recurrent accepted counts"),
+            (state.tokens[rank], expected_tokens, "recurrent state tokens"),
+            (state.meta[rank], expected_meta, "recurrent state metadata"),
+            (workspace["committed"][rank], expected_committed, "recurrent commit flags"),
+        ):
+            if not torch.equal(actual, expected):
+                raise AssertionError(f"rank {rank}: {label} mismatch")
+        if not torch.equal(workspace["anchor_ids"][rank, :1], torch.ones(1, dtype=torch.int64)):
+            raise AssertionError(f"rank {rank}: recurrent anchor handoff mismatch")
+    print("[chain] target decode -> drafter -> Markov -> state numerical PASS (2 rounds)", flush=True)
 
 
 if __name__ == "__main__":
