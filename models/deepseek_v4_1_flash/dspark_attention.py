@@ -12,7 +12,7 @@ import pypto.language as pl
 
 from config import (
     DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN,
-    TP_SIZE,
+    TP_SIZE, T_DYN,
 )
 from o_proj import o_proj
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
@@ -38,8 +38,8 @@ SOFTMAX_SCALE = HEAD_DIM**-0.5
 def gather_dspark_window(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
-    selected: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    selected: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     cache_rows = pl.tensor.dim(cache, 0) * 128
@@ -64,15 +64,16 @@ def gather_dspark_window(
 
 @pl.jit.inline
 def attend_dspark_window(
-    query: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
-    selected: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    selected: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    head_rows = MOE_TOKENS * LOCAL_H
-    cache_rows = MOE_TOKENS * DSPARK_SWA_INDEX_WIDTH
+    tokens = pl.tensor.dim(query, 0)
+    head_rows = tokens * LOCAL_H
+    cache_rows = tokens * DSPARK_SWA_INDEX_WIDTH
     qflat = pl.reshape(query, [head_rows, HEAD_DIM])
     kflat = pl.reshape(selected, [cache_rows, HEAD_DIM])
     oflat = pl.reshape(output, [head_rows, HEAD_DIM])
@@ -119,7 +120,7 @@ def attend_dspark_window(
 
 @pl.jit.inline(auto_scope=False)
 def dspark_attention(
-    x: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
+    x: pl.Tensor,
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -133,21 +134,18 @@ def dspark_attention(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[MOE_TOKENS, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[MOE_TOKENS, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[MOE_TOKENS], pl.INT64],
-    window_indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    window_slots: pl.Tensor,
+    window_indices: pl.Tensor,
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    output: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
+    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    # The drafter always runs on the fixed padded capacity.  ``num_tokens``
-    # masks inactive rows; keeping every intermediate on that same static
-    # extent avoids PTOAS inferring a second dynamic row symbol in qkv/o_proj.
-    qr = pl.create_tensor([MOE_TOKENS, Q_LORA], dtype=pl.BF16)
-    q = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([MOE_TOKENS, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([T_DYN, Q_LORA], dtype=pl.BF16)
+    q = pl.create_tensor([T_DYN, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([T_DYN, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
     q_proj_rope(
         proj_payload, proj_scales,
@@ -157,7 +155,7 @@ def dspark_attention(
         qr, q,
         num_tokens,
     )
-    kv_projection = pl.create_tensor([MOE_TOKENS, HEAD_DIM], dtype=pl.BF16)
+    kv_projection = pl.create_tensor([T_DYN, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(
         proj_payload, proj_scales,
         wkv, wkv_scale, kv_norm_weight,
@@ -166,9 +164,9 @@ def dspark_attention(
         num_tokens,
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
-    selected = pl.create_tensor([MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
+    selected = pl.create_tensor([T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
-    attended = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attended = pl.create_tensor([T_DYN, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
     # JIT dependency calls require an explicit constexpr binding.
     o_proj(
