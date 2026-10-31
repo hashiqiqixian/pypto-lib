@@ -168,6 +168,7 @@ def _q_normalize_to_mx(
     payload: pl.Tensor,
     scale_backing: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    input_row: pl.Scalar[pl.INT32],
     output_row: pl.Scalar[pl.INT32],
     workers: pl.constexpr,
 ):
@@ -179,7 +180,10 @@ def _q_normalize_to_mx(
             zero_source = pl.tile.full([8, Q_LORA], dtype=pl.BF16, value=0.0)
             source = pl.fillpad(zero_source, pad_value=pl.PadValue.zero)
             if num_tokens > t:
-                loaded = pl.load(projected, [t, 0], [8, Q_LORA], valid_shape=[rows, Q_LORA])
+                loaded = pl.load(
+                    projected, [input_row + t, 0], [8, Q_LORA],
+                    valid_shape=[rows, Q_LORA],
+                )
                 source = pl.set_validshape(pl.fillpad(loaded, pad_value=pl.PadValue.zero), 8, Q_LORA)
             value = pl.cast(source, pl.FP32)
             squared = pl.mul(value, value)
@@ -266,7 +270,7 @@ def q_proj_rope(
         scale_start = group_start * (D // 32)
         group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
         projected = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.BF16)
-        with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a", sync_start=True):
+        with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a"):
             # PTOAS 0.70 returns the output tensor for an Out argument.  Keep
             # that tensor alias for subsequent loads; the return is not a Tile.
             projected = _proj_q_a(
@@ -286,10 +290,13 @@ def q_proj_rope(
             # slice form so the callee receives a loadable Tensor view.
             _q_normalize_to_mx(
                 projected, q_norm_weight, query_latent,
-                qb_payload, qb_scales, q_rows, q_start, 5,
+                qb_payload, qb_scales, q_rows, q_local, q_start, 5,
             )
         group_tokens = pl.cast(group_rows, pl.INT32)
-        with pl.spmd(pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE), name_hint="proj_q_b", sync_start=True):
+        qb_workers = pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE)
+        qb_workers = pl.min(qb_workers, pl.system.available_cluster_count())
+        qb_workers = pl.max(1, qb_workers)
+        with pl.spmd(qb_workers, name_hint="proj_q_b"):
             query = _proj_q_b(
                 qb_payload_group, wq_b, qb_scales_group, wq_b_scale,
                 query, group_rows, LOCAL_H * HEAD_DIM, group_start,
