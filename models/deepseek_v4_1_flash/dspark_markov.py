@@ -12,8 +12,18 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-import config as C
-from config import B_DYN, DSPARK_MARKOV_RANK, DSPARK_QUERY_WIDTH, FLASH, MAX_BATCH_PER_DP, TP_SIZE
+from config import (
+    B_DYN,
+    DP_SIZE,
+    DSPARK_MARKOV_RANK,
+    DSPARK_QUERY_WIDTH,
+    EP_SIZE,
+    FLASH,
+    MAX_BATCH_PER_DP,
+    SUPPORTED_EP_SIZES,
+    SUPPORTED_TP_SIZES,
+    TP_SIZE,
+)
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, TP_SIZE as LM_HEAD_TP_SIZE, VOCAB_PER_TP, lm_head
 from rmsnorm import rms_norm_tiled
 
@@ -85,8 +95,8 @@ MAX_LOGIT_CHUNKS = (MAX_BATCH_PER_DP * DSPARK_QUERY_WIDTH + MAX_LOGIT_ROWS - 1) 
 
 assert VOCAB % VOCAB_TILE == 0
 assert D % HIDDEN_TILE == 0
-if LM_HEAD_TP_SIZE != C.TP_SIZE:
-    raise ValueError(f"DSpark LM head TP={LM_HEAD_TP_SIZE} differs from drafter TP={C.TP_SIZE}")
+if LM_HEAD_TP_SIZE != TP_SIZE:
+    raise ValueError(f"DSpark LM head TP={LM_HEAD_TP_SIZE} differs from drafter TP={TP_SIZE}")
 
 
 @pl.jit.inline
@@ -534,9 +544,9 @@ def _markov_sample_from_hidden(
     draft_ids: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
     confidences: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     logits_epoch: pl.Scalar[pl.INT32],
 ):
@@ -615,18 +625,18 @@ l2_markov_sample_from_hidden = pl.jit(auto_scope=False)(_markov_sample_from_hidd
 
 @pl.jit.host
 def l3_markov_sample_from_hidden(
-    head_hidden: pl.Tensor[[C.EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
-    final_norm_weight: pl.Tensor[[C.EP_SIZE, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[C.EP_SIZE, VOCAB_PER_TP, D], pl.BF16],
-    num_sampled: pl.Tensor[[C.EP_SIZE, B_DYN], pl.INT32],
-    last_sampled: pl.Tensor[[C.EP_SIZE, B_DYN], pl.INT64],
-    next_prefill_tokens: pl.Tensor[[C.EP_SIZE, B_DYN], pl.INT64],
-    anchor_ids: pl.Tensor[[C.EP_SIZE, B_DYN], pl.INT64],
-    markov_w1: pl.Tensor[[C.EP_SIZE, VOCAB, MARKOV_RANK], pl.BF16],
-    markov_w2: pl.Tensor[[C.EP_SIZE, VOCAB, MARKOV_RANK], pl.BF16],
-    confidence_weight: pl.Tensor[[C.EP_SIZE, 1, D + MARKOV_RANK], pl.FP32],
-    draft_ids: pl.Out[pl.Tensor[[C.EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
-    confidences: pl.Out[pl.Tensor[[C.EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
+    head_hidden: pl.Tensor[[EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
+    final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[EP_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    num_sampled: pl.Tensor[[EP_SIZE, B_DYN], pl.INT32],
+    last_sampled: pl.Tensor[[EP_SIZE, B_DYN], pl.INT64],
+    next_prefill_tokens: pl.Tensor[[EP_SIZE, B_DYN], pl.INT64],
+    anchor_ids: pl.Tensor[[EP_SIZE, B_DYN], pl.INT64],
+    markov_w1: pl.Tensor[[EP_SIZE, VOCAB, MARKOV_RANK], pl.BF16],
+    markov_w2: pl.Tensor[[EP_SIZE, VOCAB, MARKOV_RANK], pl.BF16],
+    confidence_weight: pl.Tensor[[EP_SIZE, 1, D + MARKOV_RANK], pl.FP32],
+    draft_ids: pl.Out[pl.Tensor[[EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
+    confidences: pl.Out[pl.Tensor[[EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
     logits_epoch: pl.Scalar[pl.INT32],
 ):
     head_hidden.bind_dynamic(1, B_DYN)
@@ -733,14 +743,14 @@ if __name__ == "__" + "main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark Markov validation")
-    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=C.SUPPORTED_TP_SIZES)
-    parser.add_argument("--dp", type=int, default=C.DP_SIZE)
-    parser.add_argument("--ep", type=int, default=C.EP_SIZE, choices=C.SUPPORTED_EP_SIZES)
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=SUPPORTED_TP_SIZES)
+    parser.add_argument("--dp", type=int, default=DP_SIZE)
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=SUPPORTED_EP_SIZES)
     parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    if (args.tp, args.dp, args.ep) != (C.TP_SIZE, C.DP_SIZE, C.EP_SIZE):
+    if (args.tp, args.dp, args.ep) != (TP_SIZE, DP_SIZE, EP_SIZE):
         parser.error("--tp/--dp/--ep must match the import-time configuration")
     result = run_markov_case(
         platform=args.platform,
