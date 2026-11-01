@@ -40,6 +40,12 @@ PROJ_M_TILE = 80
 ROPE_WORKER_TILE = 32
 
 
+@pl.jit.inline(auto_scope=False)
+def projection_padded_rows(capacity: pl.Scalar[pl.INDEX]):
+    """Return the physical M80 row capacity used by Q/KV input quantization."""
+    return ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+
+
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _proj_q_a(
@@ -92,7 +98,7 @@ def quantize_projection_input(
 ):
     """Quantize shared Q/KV input into M80-padded payload and M16-packed scales."""
     capacity = pl.tensor.dim(x, 0)
-    padded_rows = ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+    padded_rows = projection_padded_rows(capacity)
     payload = pl.create_tensor([padded_rows, D], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, padded_rows * (D // 32)], dtype=pl.FP8E8M0)
     quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
@@ -165,14 +171,16 @@ def _q_normalize_to_mx(
     projected: pl.Tensor,
     q_norm_weight: pl.Tensor,
     query_latent: pl.Tensor,
-    payload: pl.Tensor,
-    scale_backing: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scale_backing: pl.Out[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     input_row: pl.Scalar[pl.INT32],
     output_row: pl.Scalar[pl.INT32],
     workers: pl.constexpr,
+    ready: pl.Scalar[pl.TASK_ID],
 ):
-    for worker in pl.spmd(workers, name_hint="attention_q_norm_quant"):
+    with pl.spmd(workers, name_hint="attention_q_norm_quant", deps=[ready]) as norm_tid:
+        worker = pl.tile.get_block_idx()
         normalized_rows = pl.create_tile([MX_M_TILE, Q_LORA], dtype=pl.BF16)
         for half in pl.unroll(2):
             t = half * 8
@@ -214,6 +222,8 @@ def _q_normalize_to_mx(
             maximum = pl.row_max(magnitude, tmp_tile=reduce_tmp)
             bits = pl.reinterpret_view(maximum, pl.INT32)
             biased_exponent = pl.shrs(bits, 23)
+            # Match the OCP MXFP8 activation quantizer used by the projection
+            # golden: floor(log2(maximum)) - 8, clamped at zero.
             scale_exponent = pl.sub(biased_exponent, 8)
             exponent = pl.maximum(scale_exponent, 0)
             # Scale code zero has a zero reciprocal.
@@ -237,12 +247,17 @@ def _q_normalize_to_mx(
             pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
             packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=QUANT_SCALE_TILE)
             packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
-            payload = pl.store(quantized_tile, [output_row, k0], payload)
-            scale_offset = (output_row * (Q_LORA // 32)
-                            + k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32))
-            packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
-            scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
-    return query_latent, payload, scale_backing
+            # A zero-row M16 worker still builds a padded tile for the local
+            # quantization math, but must not publish it.  In PTOAS 0.70 the
+            # packed MX-A scale address is physical rather than row-major;
+            # publishing an inactive tile can overwrite valid rows.
+            if num_tokens > 0:
+                payload = pl.store(quantized_tile, [output_row, k0], payload)
+                scale_offset = (output_row * (Q_LORA // 32)
+                                + k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32))
+                packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
+                scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
+    return query_latent, payload, scale_backing, norm_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -258,29 +273,24 @@ def q_proj_rope(
     rope_sin: pl.Tensor,
     query_latent: pl.Tensor,
     query: pl.Tensor,
+    qb_payload: pl.Tensor,
+    qb_scales: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Project NZ QA/QB weights, rotate Q, and retain M80 QB input for Index-Q."""
-    payload_rows = pl.tensor.dim(payload, 0)
-    qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
-    qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+    norm_tids = pl.array.create(PROJ_M_TILE // MX_M_TILE, pl.TASK_ID)
     for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
         group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
         group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
         scale_start = group_start * (D // 32)
         group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
         projected = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.BF16)
-        with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a"):
+        with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a") as qa_tid:
             # PTOAS 0.70 returns the output tensor for an Out argument.  Keep
             # that tensor alias for subsequent loads; the return is not a Tile.
             projected = _proj_q_a(
                 group_payload, wq_a, group_scales, wq_a_scale, projected, group_rows,
             )
-        qb_payload_group = pl.tensor.slice(qb_payload, [PROJ_M_TILE, Q_LORA], [group_start, 0])
-        qb_scale_start = group_start * (Q_LORA // 32)
-        qb_scales_group = pl.tensor.slice(
-            qb_scales, [1, PROJ_M_TILE * (Q_LORA // 32)], [0, qb_scale_start],
-        )
         for q_mt in pl.parallel(PROJ_M_TILE // MX_M_TILE):
             q_local = q_mt * MX_M_TILE
             q_start = group_start + pl.min(q_local, group_rows)
@@ -288,18 +298,26 @@ def q_proj_rope(
             # PTOAS 0.70 keeps ``pl.slice`` as a TileView, which cannot be
             # passed to ``pl.load`` inside the normalizer.  Use the tensor
             # slice form so the callee receives a loadable Tensor view.
-            query_latent, qb_payload, qb_scales = _q_normalize_to_mx(
+            query_latent, qb_payload, qb_scales, norm_tid = _q_normalize_to_mx(
                 projected, q_norm_weight, query_latent,
-                qb_payload, qb_scales, q_rows, q_local, q_start, 5,
+                qb_payload, qb_scales, q_rows, q_local, q_start, 5, qa_tid,
             )
+            norm_tids[q_mt] = norm_tid
+        norm_ready = pl.system.task_dummy(deps=[norm_tids])
         group_tokens = pl.cast(group_rows, pl.INT32)
         qb_workers = pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE)
         qb_workers = pl.min(qb_workers, pl.system.available_cluster_count())
         qb_workers = pl.max(1, qb_workers)
-        with pl.spmd(qb_workers, name_hint="proj_q_b"):
-            query = _proj_q_b(
+        qb_scale_start = group_start * (Q_LORA // 32)
+        query_group = pl.tensor.slice(query, [PROJ_M_TILE, LOCAL_H * HEAD_DIM], [group_start, 0])
+        qb_payload_group = pl.tensor.slice(qb_payload, [PROJ_M_TILE, Q_LORA], [group_start, 0])
+        qb_scales_group = pl.tensor.slice(
+            qb_scales, [1, PROJ_M_TILE * (Q_LORA // 32)], [0, qb_scale_start],
+        )
+        with pl.spmd(qb_workers, name_hint="proj_q_b", deps=[norm_ready]) as qb_tid:
+            query_group = _proj_q_b(
                 qb_payload_group, wq_b, qb_scales_group, wq_b_scale,
-                query, group_rows, LOCAL_H * HEAD_DIM, group_start,
+                query_group, group_rows, LOCAL_H * HEAD_DIM, group_start,
             )
         query = _rope_inplace(
             query, rope_cos, rope_sin, group_start, group_tokens, LOCAL_H, "attention_q_rope",

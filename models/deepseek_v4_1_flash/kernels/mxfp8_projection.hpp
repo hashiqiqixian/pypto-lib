@@ -9,6 +9,7 @@
 // MXFP8 projections: four K256 L1 slots, two K128 L0 slots, and resident scales.
 #pragma once
 
+#include <cstdint>
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"

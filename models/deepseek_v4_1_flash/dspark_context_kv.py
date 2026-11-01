@@ -84,14 +84,14 @@ def dspark_context_kv(
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_input_payload, kv_input_scales = quantize_projection_input(main_x, num_tokens)
-    kv_proj_rope(
+    kv_proj_result = kv_proj_rope(
         kv_input_payload, kv_input_scales,
         wkv, wkv_scale, kv_norm_weight,
         rope_cos, rope_sin,
         projected, rotated,
         num_tokens,
     )
-    publish_window_row(rotated, context_slots, window_cache, window_cache_scale, num_tokens)
+    publish_result = publish_window_row(rotated, context_slots, window_cache, window_cache_scale, num_tokens)
     return window_cache, window_cache_scale
 
 

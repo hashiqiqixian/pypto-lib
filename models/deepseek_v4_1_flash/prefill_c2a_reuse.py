@@ -29,7 +29,7 @@ from prefill_c2a_full import (
     CMP_PACKED, CMP_SCALES, REUSE_INPUT_NAMES, make_c2a_inputs, golden_reference_c2a,
     _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
 )
-from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import golden_rope_tail, projection_padded_rows, quantize_projection_input, q_proj_rope, kv_proj_rope
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk,
     prefill_attend_sparse, prefill_publish_window,
@@ -103,15 +103,18 @@ def prefill_c2a_reuse_attention(
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-    q_proj_rope(
+    proj_rows = projection_padded_rows(pl.tensor.dim(x, 0))
+    qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+    q_proj_result = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
-        qr, query,
+        qr, query, qb_payload, qb_scales,
         num_tokens,
     )
-    kv_proj_rope(
+    kv_proj_result = kv_proj_rope(
         proj_payload, proj_scales,
         wkv, wkv_scale, kv_norm_weight,
         rope_cos, rope_sin,
@@ -135,7 +138,7 @@ def prefill_c2a_reuse_attention(
             query, selected, combined, attn_sink, attended, start, active, gather_tid, name_hint="c2a_sparse_attn",
         )
 
-    o_proj(
+    o_proj_result = o_proj(
         attended, wo_a, wo_a_scale, wo_b,
         wo_b_scale, rope_cos, rope_sin,
         partial, num_tokens,

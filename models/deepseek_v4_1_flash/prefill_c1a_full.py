@@ -37,7 +37,7 @@ from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import projection_padded_rows, quantize_projection_input, q_proj_rope, kv_proj_rope
 from compressor import c1a_compressor_project, compressor_rope, c1a_compressor_publish
 from prefill_indexer import (
     prefill_indexer, publish_c1a_index_key, golden_prefill_indexer,
@@ -156,6 +156,9 @@ def prefill_c1a_full_attention(
     query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
+    proj_rows = projection_padded_rows(pl.tensor.dim(x, 0))
+    qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     publication = pl.array.create(1, pl.TASK_ID)
     publication[0] = pl.system.task_dummy(deps=[])
     if num_tokens > 0:
@@ -164,12 +167,12 @@ def prefill_c1a_full_attention(
             compressed_rope_cos, compressed_rope_sin, compressed_slots,
             compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, num_tokens,
         )
-        q_proj_rope(
+        q_proj_result = q_proj_rope(
             proj_payload, proj_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
-            query_latent, query,
+            query_latent, query, qb_payload, qb_scales,
             num_tokens,
         )
         publication[0] = published
@@ -200,7 +203,7 @@ def prefill_c1a_full_attention(
             attn_sink, attended,
             num_tokens, window_ready,
         )
-        o_proj(
+        o_proj_result = o_proj(
             attended, wo_a, wo_a_scale, wo_b,
             wo_b_scale, rope_cos, rope_sin,
             partial, num_tokens,
