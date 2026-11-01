@@ -288,7 +288,7 @@ def q_proj_rope(
             # PTOAS 0.70 keeps ``pl.slice`` as a TileView, which cannot be
             # passed to ``pl.load`` inside the normalizer.  Use the tensor
             # slice form so the callee receives a loadable Tensor view.
-            _q_normalize_to_mx(
+            query_latent, qb_payload, qb_scales = _q_normalize_to_mx(
                 projected, q_norm_weight, query_latent,
                 qb_payload, qb_scales, q_rows, q_local, q_start, 5,
             )
@@ -301,7 +301,9 @@ def q_proj_rope(
                 qb_payload_group, wq_b, qb_scales_group, wq_b_scale,
                 query, group_rows, LOCAL_H * HEAD_DIM, group_start,
             )
-        _rope_inplace(query, rope_cos, rope_sin, group_start, group_tokens, LOCAL_H, "attention_q_rope")
+        query = _rope_inplace(
+            query, rope_cos, rope_sin, group_start, group_tokens, LOCAL_H, "attention_q_rope",
+        )
     return query_latent, query, qb_payload, qb_scales
 
 
@@ -333,7 +335,9 @@ def kv_proj_rope(
         group_tokens = pl.cast(group_rows, pl.INT32)
         for norm_worker in pl.spmd((group_tokens + 7) // 8, name_hint="norm_kv"):
             rms_norm(projection_group, kv_norm_weight, normalized_group, norm_worker, group_tokens, width=HEAD_DIM)
-        _rope_inplace(window_kv, rope_cos, rope_sin, group_start, group_tokens, 1, "rope_kv")
+        window_kv = _rope_inplace(
+            window_kv, rope_cos, rope_sin, group_start, group_tokens, 1, "rope_kv",
+        )
     return kv_projection, window_kv
 
 

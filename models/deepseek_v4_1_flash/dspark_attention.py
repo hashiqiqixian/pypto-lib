@@ -120,7 +120,7 @@ def attend_dspark_window(
 
 @pl.jit.inline(auto_scope=False)
 def dspark_attention(
-    x: pl.Tensor,
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -134,20 +134,21 @@ def dspark_attention(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor,
-    rope_sin: pl.Tensor,
-    window_slots: pl.Tensor,
-    window_indices: pl.Tensor,
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    output: pl.Tensor,
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    qr = pl.create_tensor([T_DYN, Q_LORA], dtype=pl.BF16)
-    q = pl.create_tensor([T_DYN, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([T_DYN, HEAD_DIM], dtype=pl.BF16)
+    tokens = pl.tensor.dim(x, 0)
+    qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+    q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-    q_proj_rope(
+    qr_out, q_out, qb_payload_out, qb_scales_out = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -155,21 +156,23 @@ def dspark_attention(
         qr, q,
         num_tokens,
     )
-    kv_projection = pl.create_tensor([T_DYN, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(
+    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    kv_projection_out, kv_out = kv_proj_rope(
         proj_payload, proj_scales,
         wkv, wkv_scale, kv_norm_weight,
         rope_cos, rope_sin,
         kv_projection, kv,
         num_tokens,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
-    selected = pl.create_tensor([T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
+    window_cache, window_cache_scale = publish_window_row(
+        kv, window_slots, window_cache, window_cache_scale, num_tokens,
+    )
+    selected = pl.create_tensor([tokens, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
-    attended = pl.create_tensor([T_DYN, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
     # JIT dependency calls require an explicit constexpr binding.
-    o_proj(
+    output = o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin, output, num_tokens,
     )
@@ -201,6 +204,12 @@ def dspark_attention_test(
     output: pl.Out[pl.Tensor[[DSPARK_QUERY_WIDTH, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
+    x.bind_dynamic(0, T_DYN)
+    rope_cos.bind_dynamic(0, T_DYN)
+    rope_sin.bind_dynamic(0, T_DYN)
+    window_slots.bind_dynamic(0, T_DYN)
+    window_indices.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     window_cache_scale.bind_dynamic(0, ORI_BLOCKS_DYN)
     return dspark_attention(
