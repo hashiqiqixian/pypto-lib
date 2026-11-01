@@ -193,6 +193,9 @@ jobs:
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
           toolchain: bundle
+          # PTOAS 0.70 requires the deferred-completion C-linkage fix from
+          # PyPTO #3236; remove this temporary pin after that PR lands on main.
+          pypto-ref: 44b1ea4bd3d1f4ee4c9e7ba0507b8052dc71d4f1
           # A5 simulation uses the MXFP8 scale dtype torch.float8_e8m0fnu.
           torch-version: ${{ matrix.platform == 'a5sim' && 'torch==2.10.0' || 'torch==2.6.0' }}
 
