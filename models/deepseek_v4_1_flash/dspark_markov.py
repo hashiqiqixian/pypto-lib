@@ -530,6 +530,25 @@ markov_sample = pl.jit(auto_scope=False)(_markov_sample)
 markov_sample_from_state_inline = pl.jit.inline(auto_scope=False)(_markov_sample_from_state)
 
 
+@pl.jit(auto_scope=False)
+def markov_sample_validation(
+    base_logits: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, VOCAB], pl.FP32],
+    head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
+    anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
+    markov_w1: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
+    markov_w2: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
+    confidence_weight: pl.Tensor[[1, D + MARKOV_RANK], pl.FP32],
+    draft_ids: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
+    confidences: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
+):
+    """Validation entry without the optional cross-program task dependency."""
+    ready_tid = pl.system.task_dummy(deps=[])
+    return markov_sample_inline(
+        base_logits, head_hidden, anchor_ids, markov_w1, markov_w2,
+        confidence_weight, draft_ids, confidences, ready_tid,
+    )
+
+
 def _markov_sample_from_hidden(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
@@ -727,7 +746,7 @@ def run_markov_case(*, platform: str = "a5sim", device_id: int = 0,
         TensorSpec("confidences", [batch, DSPARK_QUERY_WIDTH], torch.float32),
     ]
     return run(
-        fn=markov_sample,
+        fn=markov_sample_validation,
         specs=specs,
         golden_fn=golden,
         compare_fn={"draft_ids": exact_ids},
