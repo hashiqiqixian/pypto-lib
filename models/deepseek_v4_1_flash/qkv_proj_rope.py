@@ -309,15 +309,14 @@ def q_proj_rope(
         qb_workers = pl.min(qb_workers, pl.system.available_cluster_count())
         qb_workers = pl.max(1, qb_workers)
         qb_scale_start = group_start * (Q_LORA // 32)
-        query_group = pl.tensor.slice(query, [PROJ_M_TILE, LOCAL_H * HEAD_DIM], [group_start, 0])
         qb_payload_group = pl.tensor.slice(qb_payload, [PROJ_M_TILE, Q_LORA], [group_start, 0])
         qb_scales_group = pl.tensor.slice(
             qb_scales, [1, PROJ_M_TILE * (Q_LORA // 32)], [0, qb_scale_start],
         )
         with pl.spmd(qb_workers, name_hint="proj_q_b", deps=[norm_ready]) as qb_tid:
-            query_group = _proj_q_b(
+            query = _proj_q_b(
                 qb_payload_group, wq_b, qb_scales_group, wq_b_scale,
-                query_group, group_rows, LOCAL_H * HEAD_DIM, group_start,
+                query, group_rows, LOCAL_H * HEAD_DIM, group_start,
             )
         query = _rope_inplace(
             query, rope_cos, rope_sin, group_start, group_tokens, LOCAL_H, "attention_q_rope",
