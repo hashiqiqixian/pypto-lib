@@ -309,14 +309,32 @@ jobs:
             if [ "$ndev" -gt 1 ]; then
               device_flags+=(--device-num "$ndev" --ignore-whitelist)
             fi
+            task_log=$(mktemp)
             if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 600 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE"; then
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE" 2>&1 | tee "$task_log"; then
               status=pass
             else
-              status=fail
-              failed+=("$f")
-              echo "::error file=${f}::FAIL"
+              # A5 workers can sporadically terminate the Python host with
+              # SIGSEGV while the device/runtime itself is healthy. Retry
+              # only that infrastructure signature; numerical and compile
+              # failures remain hard failures on the first attempt.
+              if grep -Eq 'Segmentation fault|core dumped|exit=139' "$task_log"; then
+                echo "::warning file=${f}::A5 runtime segfault; retrying once"
+                if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 600 \
+                  --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE"; then
+                  status=pass
+                else
+                  status=fail
+                  failed+=("$f")
+                  echo "::error file=${f}::FAIL after A5 runtime retry"
+                fi
+              else
+                status=fail
+                failed+=("$f")
+                echo "::error file=${f}::FAIL"
+              fi
             fi
+            rm -f "$task_log"
             echo "[device][$CI_PLATFORM] $f: $status"
             echo "::endgroup::"
           done
