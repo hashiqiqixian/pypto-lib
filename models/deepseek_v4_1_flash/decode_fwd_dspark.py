@@ -594,6 +594,10 @@ def run_decode_chain_case(devices: tuple[int, ...], *, compile_only: bool = Fals
     # The target fixture is otherwise zero-weighted; this small nonzero path
     # keeps the anchor handoff deterministic without changing model code.
     target_model["embedding_weight"][:, 0, :32] = 0.25
+    # The recurrent round starts from the accepted anchor (token 1).  Give it
+    # the same embedding contribution so the target fixture remains stable
+    # across the target -> accept -> draft handoff.
+    target_model["embedding_weight"][:, 1, :32] = 0.25
     target_model["lm_head_weight"][:, 1, :32] = 1.0
     target_model["attention_num_tokens"].fill_(ROWS)
     target_model["moe_num_tokens"].fill_(ROWS)
@@ -691,6 +695,8 @@ def run_decode_chain_case(devices: tuple[int, ...], *, compile_only: bool = Fals
     artifacts = json.loads(manifest_file.read_text()) if manifest_file and manifest_file.exists() else {}
     compiled_programs = {}
     persistent_inputs = {}
+    active_runner = None
+    persistent_worker = None
 
     def refresh_state_handoff(name):
         """Republish accept outputs so the next L3 program cannot reuse stale state."""
@@ -757,25 +763,30 @@ def run_decode_chain_case(devices: tuple[int, ...], *, compile_only: bool = Fals
                     tensor.share_memory_()
         primary = next(iter(compiled_programs.values()))
         extras = [program for program in compiled_programs.values() if program is not primary]
-        worker = primary.prepare(config=config, extra_compiled=extras)
-        try:
-            def persistent_runner(program, inputs):
-                name = program._func.__name__
-                compiled, ordered = compile_stage(program, inputs)
-                worker.run(compiled, *ordered, config=config)
-                refresh_state_handoff(name)
-                print(f"[chain] {name} PASS", flush=True)
+        persistent_worker = primary.prepare(
+            config=config,
+            extra_compiled=extras,
+            persistent=True,
+            reset_persistent_windows=False,
+        )
 
-            decode_fwd_dspark(
-                persistent_runner, state, workspace, target_model, draft_model,
-                markov_model, cache_tables, rope_tables,
-                attention_epoch=1, moe_epoch=1, logits_epoch=1,
-            )
-        finally:
-            worker.close()
-    else:
+        def persistent_runner(program, inputs):
+            name = program._func.__name__
+            compiled, ordered = compile_stage(program, inputs)
+            persistent_worker.run(compiled, *ordered, config=config)
+            refresh_state_handoff(name)
+            print(f"[chain] {name} PASS", flush=True)
+
+        active_runner = persistent_runner
         decode_fwd_dspark(
-            runner, state, workspace, target_model, draft_model, markov_model, cache_tables, rope_tables,
+            active_runner, state, workspace, target_model, draft_model,
+            markov_model, cache_tables, rope_tables,
+            attention_epoch=1, moe_epoch=1, logits_epoch=1,
+        )
+    else:
+        active_runner = runner
+        decode_fwd_dspark(
+            active_runner, state, workspace, target_model, draft_model, markov_model, cache_tables, rope_tables,
             attention_epoch=1, moe_epoch=1, logits_epoch=1,
         )
     if compile_only:
@@ -885,9 +896,12 @@ def run_decode_chain_case(devices: tuple[int, ...], *, compile_only: bool = Fals
     recurrent_tokens = state.tokens.clone()
     recurrent_meta = state.meta.clone()
     decode_fwd_dspark(
-        runner, state, workspace, target_model, draft_model, markov_model, cache_tables, rope_tables,
+        active_runner, state, workspace, target_model, draft_model, markov_model, cache_tables, rope_tables,
         attention_epoch=2, moe_epoch=2, logits_epoch=2,
     )
+    if persistent_worker is not None:
+        persistent_worker.close()
+        persistent_worker = None
     for rank in range(EP_SIZE):
         expected_ids, expected_positions, expected_widths = golden_prepare_target(
             state.slot_ids[rank], state.generations[rank], recurrent_tokens[rank], recurrent_meta[rank],
@@ -903,7 +917,13 @@ def run_decode_chain_case(devices: tuple[int, ...], *, compile_only: bool = Fals
             if width > 0:
                 expected_target_sampled[request * ROWS:request * ROWS + width, 0] = 1
         if not torch.equal(workspace["target_sampled_ids"][rank], expected_target_sampled):
-            raise AssertionError(f"rank {rank}: recurrent target sampled IDs mismatch")
+            raise AssertionError(
+                f"rank {rank}: recurrent target sampled IDs mismatch "
+                f"actual={workspace['target_sampled_ids'][rank, :, 0].tolist()} "
+                f"expected={expected_target_sampled[:, 0].tolist()} "
+                f"widths={expected_widths.tolist()} "
+                f"input={workspace['input_ids'][rank, :, 0].tolist()}"
+            )
         expected_tokens, expected_meta, accepted_ids, accepted_counts = golden_accept_target(
             state.slot_ids[rank], state.generations[rank], expected_widths,
             workspace["target_sampled_ids"][rank], recurrent_tokens[rank], recurrent_meta[rank],
