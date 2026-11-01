@@ -281,8 +281,13 @@ jobs:
               # SIGSEGV while the device/runtime itself is healthy. Retry
               # only that infrastructure signature; numerical and compile
               # failures remain hard failures on the first attempt.
-              if grep -Eq 'Segmentation fault|core dumped|exit=139' "$task_log"; then
-                echo "::warning file=${f}::A5 runtime segfault; retrying once"
+              if grep -Eq 'Segmentation fault|core dumped|exit=139|任务提交失败|failed to submit' "$task_log"; then
+                if grep -Eq 'Segmentation fault|core dumped|exit=139' "$task_log"; then
+                  echo "::warning file=${f}::A5 runtime segfault; retrying once"
+                else
+                  echo "::warning file=${f}::A5 task submission failed; retrying once"
+                fi
+                sleep 5
                 if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 600 \
                   --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE"; then
                   status=pass
