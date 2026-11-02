@@ -344,7 +344,7 @@ def l2_gate(
         x_mixed,
         norm_w, gate_w, gate_bias,
         num_tokens,
-        x_norm_mx, x_norm_scale, indices, weights,
+        x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
     )
     return x_norm_mx, x_norm_scale, indices, weights
 

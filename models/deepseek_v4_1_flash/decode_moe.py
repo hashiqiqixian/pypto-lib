@@ -378,7 +378,6 @@ def moe(
     topk: pl.constexpr = TOPK,
 ) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
     """Run delayed mHC pre-mix, MoE, and residual expansion."""
-    n_experts = EP_SIZE * local_experts
     t = MOE_TOKENS
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -395,7 +394,7 @@ def moe(
         weights = pl.create_tensor([t, topk], dtype=pl.FP32)
         gate(
             x_mixed, norm_weight, gate_weight, correction_bias, num_tokens,
-            x_norm_mx, x_norm_scale, indices, weights, n_experts=n_experts, topk=topk,
+            x_norm_mx, x_norm_scale, indices, weights, n_experts=EP_SIZE * local_experts, topk=topk,
         )
         if BALANCED_ROUTING:
             for token in pl.spmd(num_tokens, name_hint="moe_forced_routes"):
@@ -503,7 +502,7 @@ def l2_moe(
         next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         arrived, data_arrived, routed_output, combine_arrived,
-        local_num_tokens, ep_rank, moe_epoch, force_topk,
+        local_num_tokens, ep_rank, moe_epoch, force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_next

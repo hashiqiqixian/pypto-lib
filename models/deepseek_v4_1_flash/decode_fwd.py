@@ -397,7 +397,7 @@ def decode_encoder(
                 arrived, data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
-                force_topk,
+                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
             )
     return x_hc, pre_mix, token_rope_cos, token_rope_sin
 
@@ -676,7 +676,7 @@ def decode_decoder(
                 arrived, data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
-                force_topk,
+                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
             )
         if layer >= DSPARK_TARGET_LAYER_IDS[0]:
             target_column = (layer - DSPARK_TARGET_LAYER_IDS[0]) * D

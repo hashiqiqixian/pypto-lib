@@ -571,7 +571,7 @@ def l2_expert_routed(
         routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale,
         mxfp4_pair_lut, recv_route, recv_meta,
-        routed_output, input_ready,
+        routed_output, input_ready, local_experts=N_LOCAL_EXPERTS,
     )
     with pl.spmd(ROUTE_ROWS // COPY_TILE, name_hint="routed_output_copy", deps=[scatter_done]):
         row0 = pl.tile.get_block_idx() * COPY_TILE
