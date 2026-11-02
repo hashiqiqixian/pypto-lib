@@ -38,7 +38,6 @@ from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERT
 from gate import gate
 from expert_shared import expert_shared
 from expert_routed import (
-    INPUT_SCALE_ROWS, OUTPUT_SCALE_ROWS,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
 )
 from hc import hc_pre, hc_post
@@ -347,11 +346,11 @@ def moe(
     gate_weight: pl.Tensor,
     correction_bias: pl.Tensor,
     routed_w1: pl.Tensor,
-    routed_w1_scale: pl.Tensor[[INPUT_SCALE_ROWS, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w1_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
     routed_w2: pl.Tensor,
-    routed_w2_scale: pl.Tensor[[OUTPUT_SCALE_ROWS, D], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w2_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
     routed_w3: pl.Tensor,
-    routed_w3_scale: pl.Tensor[[INPUT_SCALE_ROWS, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],

@@ -49,10 +49,6 @@ from config import ROUTE_T_DYN, N_LOCAL_EXPERTS
 from quant import pack_mxfp4_weight_tiles, unpack_mxfp4_weight_tiles
 
 
-# Dynamic shape variables.
-INPUT_SCALE_ROWS = pl.dynamic("V41_ROUTED_INPUT_SCALE_ROWS")
-OUTPUT_SCALE_ROWS = pl.dynamic("V41_ROUTED_OUTPUT_SCALE_ROWS")
-
 # model config
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
@@ -164,11 +160,11 @@ def expert_routed_scatter(
     recv_weights: pl.Tensor,
     recv_expert_count: pl.Tensor,
     routed_w1_packed: pl.Tensor,
-    routed_w1_scale: pl.Tensor[[INPUT_SCALE_ROWS, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w1_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
     routed_w3_packed: pl.Tensor,
-    routed_w3_scale: pl.Tensor[[INPUT_SCALE_ROWS, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
     routed_w2_packed: pl.Tensor,
-    routed_w2_scale: pl.Tensor[[OUTPUT_SCALE_ROWS, D], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w2_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
     recv_route: pl.Tensor,
     recv_meta: pl.Tensor,
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
