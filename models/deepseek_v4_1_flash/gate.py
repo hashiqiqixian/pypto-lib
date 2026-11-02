@@ -261,32 +261,33 @@ def gate_from_fp32(
 
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
     # does not emit an invalid function for a route_hash path that does no work.
-    task_route_tiles = (task_tokens + GATE_T_TILE - 1) // GATE_T_TILE
+    # Odd TopK uses 16 rows so each scalar-writing block owns whole 64-byte lines.
+    task_route_tiles = (task_tokens + GATE_T_TILE * (1 + topk % 2) - 1) // (GATE_T_TILE * (1 + topk % 2))
     for ts_idx in pl.spmd(task_route_tiles, name_hint="route_sort"):
-            t1 = ts_idx * GATE_T_TILE
+            t1 = ts_idx * GATE_T_TILE * (1 + topk % 2)
             # ptoas pto.tmrgsort requires a single source row.
-            topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            topk_idx_tile = pl.create_tensor([GATE_T_TILE * (1 + topk % 2), TOPK_PAD], dtype=pl.INT32)
             sr_idx_init = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
             sr_index_range = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
             sr_idx_init[:, :] = sr_index_range
-            for sr_tt in pl.range(GATE_T_TILE):
+            for sr_tt in pl.range(GATE_T_TILE * (1 + topk % 2)):
                 sr_t = t1 + sr_tt
                 sr_row = pl.slice(biased_scores_buf, [1, SCORE_PAD], [sr_t, 0])
                 sr_i = route_topk_row(sr_row, sr_idx_init)
                 topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
 
-            local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
-            local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE, :]
+            local_scores = pl.create_tensor([GATE_T_TILE * (1 + topk % 2), SCORE_PAD], dtype=pl.FP32)
+            local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE * (1 + topk % 2), :]
             gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
-            gather_valid = pl.set_validshape(gather_all, GATE_T_TILE, topk)
+            gather_valid = pl.set_validshape(gather_all, GATE_T_TILE * (1 + topk % 2), topk)
             topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
-            topk_idx_read = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            topk_idx_read = pl.create_tensor([GATE_T_TILE * (1 + topk % 2), TOPK_PAD], dtype=pl.INT32)
             topk_idx_read[:, :] = topk_idx_tile[:, :]
             topk_sum = pl.row_sum(topk_vals_pad)
-            denom = pl.reshape(topk_sum, [GATE_T_TILE, 1])
+            denom = pl.reshape(topk_sum, [GATE_T_TILE * (1 + topk % 2), 1])
             topk_normalized = pl.row_expand_div(topk_vals_pad, denom)
             normalized_weights = pl.mul(topk_normalized, ROUTE_SCALE)
-            for wt_tt in pl.range(GATE_T_TILE):
+            for wt_tt in pl.range(GATE_T_TILE * (1 + topk % 2)):
                 wt_out_t = t1 + wt_tt
                 if wt_out_t < active_tokens:
                     for wt_k in pl.range(topk):
