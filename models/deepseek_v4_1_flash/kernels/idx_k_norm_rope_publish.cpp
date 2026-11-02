@@ -54,7 +54,7 @@ __tf__ __aicore__ inline void postprocess(
             float value = static_cast<float>(src[head * 128 + lane]);
             square += value * value;
         }
-        float inv = 1.0f / std::sqrt(square / 128.0f + 1.0e-6f);
+        float inv = 1.0f / std::sqrt(square / 128.0f + 1.0e-20f);
         for (int lane = 0; lane < 128; ++lane)
             values[lane] = static_cast<float>(static_cast<bfloat16_t>(
                 static_cast<float>(src[head * 128 + lane]) * inv * static_cast<float>(gamma[lane])));
@@ -110,7 +110,7 @@ __tf__ __aicore__ inline void postprocess(
             vcadd(square1, square1, full, MODE_ZEROING);
             vadd(inverse, square0, square1, full, MODE_ZEROING);
             vmuls(inverse, inverse, 1.0f / 128.0f, full, MODE_ZEROING);
-            vadds(inverse, inverse, 1.0e-6f, full, MODE_ZEROING);
+            vadds(inverse, inverse, 1.0e-20f, full, MODE_ZEROING);
             vsqrt(inverse, inverse, full, MODE_ZEROING);
             vdup(one, 1.0f, full, MODE_ZEROING);
             vdiv(inverse, one, inverse, full, MODE_ZEROING);

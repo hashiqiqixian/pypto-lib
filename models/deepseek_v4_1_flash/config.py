@@ -191,7 +191,7 @@ FLASH = DeepSeekV41Config(
     o_lora_rank=1024,
     o_groups=8,
     sliding_window=128,
-    rms_norm_eps=1e-6,
+    rms_norm_eps=1e-20,
     max_position_embeddings=1048576,
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
@@ -241,6 +241,9 @@ STATE_CAPACITY = 4
 MAX_BATCH_PER_DP = 12
 DSPARK_SPEC_TOKENS = 5
 DSPARK_DRAFT_LAYERS = 3
+DSPARK_N_ROUTED_EXPERTS = 128
+DSPARK_NUM_EXPERTS_PER_TOK = 3
+DSPARK_TARGET_LAYER_IDS = (37, 38, 39)
 DSPARK_QUERY_WIDTH = DSPARK_SPEC_TOKENS
 DSPARK_SWA_INDEX_WIDTH = (FLASH.sliding_window + DSPARK_QUERY_WIDTH + 63) // 64 * 64
 DSPARK_MARKOV_RANK = 256
@@ -294,9 +297,14 @@ if FLASH.num_attention_heads % TP_SIZE or FLASH.o_groups % TP_SIZE:
 
 def get_ep_size() -> int:
     """Resolve the EP size independently of the attention TP size."""
-    size = _parse_parallel_size("ep", 2)
+    dp = _parse_parallel_size("dp", 0)
+    size = _parse_parallel_size("ep", TP_SIZE * dp if dp else 2)
     if size not in SUPPORTED_EP_SIZES:
         raise ValueError(f"--ep must be one of {SUPPORTED_EP_SIZES}, got {size}")
+    if size % TP_SIZE:
+        raise ValueError(f"EP{size} must be divisible by TP{TP_SIZE}")
+    if dp and size != TP_SIZE * dp:
+        raise ValueError(f"--ep {size} must equal --tp {TP_SIZE} * --dp {dp}")
     if FLASH.n_routed_experts % size:
         raise ValueError(f"{FLASH.n_routed_experts} routed experts cannot be evenly sharded across EP{size}")
     return size
@@ -313,6 +321,7 @@ def set_moe_tokens(tokens: int) -> None:
 
 # Shared MoE deployment dimensions
 EP_SIZE = get_ep_size()
+DP_SIZE = EP_SIZE // TP_SIZE
 N_LOCAL_EXPERTS = FLASH.n_routed_experts // EP_SIZE
 MOE_TOKENS = (DECODE_MAX_TOKENS + 15) // 16 * 16
 MOE_RECV_MAX = EP_SIZE * MOE_TOKENS
