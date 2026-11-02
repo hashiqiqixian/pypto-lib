@@ -607,7 +607,9 @@ if __name__ == "__main__":
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
             ring_heap=PREFILL_ATTN_RING_HEAP,
         ),
-        compare_fn=make_compare("reuse", len(devices), args.tokens),
+        compare_fn=make_compare(
+            "reuse", len(devices), args.tokens, initial_state, reference=golden_reference_c2a_reuse,
+        ),
     )
     if args.compile_only and result.passed:
         print("[C2A-HC] Compilation passed; device accuracy was NOT validated.")
