@@ -211,6 +211,33 @@ def c2a_compressor_publish(
     return completed
 
 
+@pl.jit.graph
+def c2a_state_feedback_step(
+    kv: pl.Tensor[[8, HEAD_DIM], pl.FP32],
+    score: pl.Tensor[[8, HEAD_DIM], pl.FP32],
+    positions: pl.Tensor[[8], pl.INT32],
+    request_ids: pl.Tensor[[8], pl.INT32],
+    query_starts: pl.Tensor[[16], pl.INT32],
+    state_blocks: pl.Tensor[[8], pl.INT32],
+    slots: pl.Tensor[[8], pl.INT64],
+    norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cosine: pl.Tensor[[8, ROPE_DIM // 2], pl.FP32],
+    sine: pl.Tensor[[8, ROPE_DIM // 2], pl.FP32],
+    state_cache: pl.InOut[pl.Tensor[[3, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
+    latent: pl.InOut[pl.Tensor[[8, HEAD_DIM], pl.BF16]],
+    cache: pl.InOut[pl.Tensor[[1, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+    scales: pl.InOut[pl.Tensor[[1, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+):
+    """Expose native writeback identities for the sequential feedback validation."""
+    with pl.spmd(1, name_hint="c2a_feedback_state"):
+        _c2a_compress(
+            kv, score, state_cache, positions, norm_weight, latent,
+            query_starts, request_ids, state_blocks, slots, cosine, sine, cache, scales,
+            pl.cast(6, pl.INT32), pl.cast(3, pl.INT32),
+        )
+    return state_cache, latent, cache, scales
+
+
 @pl.jit
 def c2a_state_feedback_test(
     kv: pl.Tensor[[2, 8, HEAD_DIM], pl.FP32],
@@ -229,18 +256,14 @@ def c2a_state_feedback_test(
     """Feed the verification ring into a second window after prefix acceptance."""
     cache = pl.create_tensor([1, 128, 1, HEAD_DIM // 2], dtype=pl.UINT8)
     scales = pl.create_tensor([1, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], dtype=pl.BF16)
-    with pl.spmd(1, name_hint="c2a_verify_state") as verified:
-        _c2a_compress(
-            kv[0], score[0], state_cache, positions[0], norm_weight, latent[0],
-            query_starts, request_ids, state_blocks, slots, cosine, sine, cache, scales,
-            pl.cast(6, pl.INT32), pl.cast(3, pl.INT32),
-        )
-    with pl.spmd(1, name_hint="c2a_accepted_state", deps=[verified]):
-        _c2a_compress(
-            kv[1], score[1], state_cache, positions[1], norm_weight, latent[1],
-            query_starts, request_ids, state_blocks, slots, cosine, sine, cache, scales,
-            pl.cast(6, pl.INT32), pl.cast(3, pl.INT32),
-        )
+    state_cache, first_latent, cache, scales = c2a_state_feedback_step(
+        kv[0], score[0], positions[0], request_ids, query_starts, state_blocks,
+        slots, norm_weight, cosine, sine, state_cache, latent[0], cache, scales,
+    )
+    state_cache, second_latent, cache, scales = c2a_state_feedback_step(
+        kv[1], score[1], positions[1], request_ids, query_starts, state_blocks,
+        slots, norm_weight, cosine, sine, state_cache, latent[1], cache, scales,
+    )
     return state_cache, latent
 
 
