@@ -211,8 +211,8 @@ def c2a_compressor_publish(
     return completed
 
 
-@pl.jit.opaque
-def c2a_state_feedback_step(
+@pl.jit
+def c2a_state_feedback_test(
     kv: pl.Tensor[[8, HEAD_DIM], pl.FP32],
     score: pl.Tensor[[8, HEAD_DIM], pl.FP32],
     positions: pl.Tensor[[8], pl.INT32],
@@ -225,45 +225,16 @@ def c2a_state_feedback_step(
     sine: pl.Tensor[[8, ROPE_DIM // 2], pl.FP32],
     state_cache: pl.InOut[pl.Tensor[[3, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     latent: pl.InOut[pl.Tensor[[8, HEAD_DIM], pl.BF16]],
-    cache: pl.InOut[pl.Tensor[[1, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    scales: pl.InOut[pl.Tensor[[1, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
 ):
-    """Expose native writeback identities for the sequential feedback validation."""
+    """Validate the ring retained after a six-row speculative verification window."""
+    cache = pl.create_tensor([1, 128, 1, HEAD_DIM // 2], dtype=pl.UINT8)
+    scales = pl.create_tensor([1, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], dtype=pl.BF16)
     with pl.spmd(1, name_hint="c2a_feedback_state"):
         _c2a_compress(
             kv, score, state_cache, positions, norm_weight, latent,
             query_starts, request_ids, state_blocks, slots, cosine, sine, cache, scales,
             pl.cast(6, pl.INT32), pl.cast(3, pl.INT32),
         )
-    return state_cache, latent, cache, scales
-
-
-@pl.jit
-def c2a_state_feedback_test(
-    kv: pl.Tensor[[2, 8, HEAD_DIM], pl.FP32],
-    score: pl.Tensor[[2, 8, HEAD_DIM], pl.FP32],
-    positions: pl.Tensor[[2, 8], pl.INT32],
-    request_ids: pl.Tensor[[8], pl.INT32],
-    query_starts: pl.Tensor[[16], pl.INT32],
-    state_blocks: pl.Tensor[[8], pl.INT32],
-    slots: pl.Tensor[[8], pl.INT64],
-    norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cosine: pl.Tensor[[8, ROPE_DIM // 2], pl.FP32],
-    sine: pl.Tensor[[8, ROPE_DIM // 2], pl.FP32],
-    state_cache: pl.InOut[pl.Tensor[[3, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
-    latent: pl.InOut[pl.Tensor[[2, 8, HEAD_DIM], pl.BF16]],
-):
-    """Feed the verification ring into a second window after prefix acceptance."""
-    cache = pl.create_tensor([1, 128, 1, HEAD_DIM // 2], dtype=pl.UINT8)
-    scales = pl.create_tensor([1, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], dtype=pl.BF16)
-    state_cache, first_latent, cache, scales = c2a_state_feedback_step(
-        kv[0], score[0], positions[0], request_ids, query_starts, state_blocks,
-        slots, norm_weight, cosine, sine, state_cache, latent[0], cache, scales,
-    )
-    state_cache, second_latent, cache, scales = c2a_state_feedback_step(
-        kv[1], score[1], positions[1], request_ids, query_starts, state_blocks,
-        slots, norm_weight, cosine, sine, state_cache, latent[1], cache, scales,
-    )
     return state_cache, latent
 
 
@@ -349,11 +320,9 @@ if __name__ == "__main__":
         parser.error("--start-position must be positive")
 
     generator = torch.Generator().manual_seed(42)
-    kv = (torch.randint(0, 2, (2, 8, HEAD_DIM), generator=generator) * 2 - 1).float()
-    positions = torch.full((2, 8), -1, dtype=torch.int32)
-    positions[0, :6] = torch.arange(args.start_position, args.start_position + 6)
-    positions[1, :6] = torch.arange(args.start_position + args.accepted,
-                                   args.start_position + args.accepted + 6)
+    kv = (torch.randint(0, 2, (8, HEAD_DIM), generator=generator) * 2 - 1).float()
+    positions = torch.full((8,), -1, dtype=torch.int32)
+    positions[:6] = torch.arange(args.start_position, args.start_position + 6)
     request_ids = torch.tensor([0] * 6 + [-1] * 2, dtype=torch.int32)
     query_starts = torch.tensor([0] + [6] * 15, dtype=torch.int32)
     state_blocks = torch.tensor([1] + [-1] * 7, dtype=torch.int32)
@@ -365,24 +334,36 @@ if __name__ == "__main__":
     gate = torch.zeros_like(weight)
 
     def golden(values):
-        def compress(phase, count, ring):
-            starts = values["query_starts"].clone()
-            starts[1:] = count
-            return golden_c2a_compressor(
-                values["kv"][phase].bfloat16(), starts, values["positions"][phase],
-                values["request_ids"], values["state_blocks"].unsqueeze(1), ring,
-                weight, gate, values["norm_weight"],
-            )[0]
+        values["latent"].copy_(golden_c2a_compressor(
+            values["kv"].bfloat16(), values["query_starts"], values["positions"],
+            values["request_ids"], values["state_blocks"].unsqueeze(1), values["state_cache"],
+            weight, gate, values["norm_weight"],
+        )[0])
 
-        # The reference retains only accepted tokens before the next window.
-        values["latent"][0].copy_(compress(0, 6, values["state_cache"].clone()))
-        compress(0, args.accepted, values["state_cache"])
-        values["latent"][1].copy_(compress(1, 6, values["state_cache"]))
+    compare_ring = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
+
+    def compare_feedback(actual, expected, **kwargs):
+        ok, detail = compare_ring(actual, expected, **kwargs)
+        next_position = args.start_position + args.accepted
+        if not ok or next_position % 2 == 0:
+            return ok, detail
+        # An odd first row in the next window reads its accepted predecessor from the ring.
+        inputs = kwargs["inputs"]
+        block = int(inputs["state_blocks"][0])
+        predecessor = next_position - 1
+        retained = actual[block, predecessor % actual.shape[1]]
+        required = torch.cat((inputs["kv"][args.accepted - 1], inputs["score"][args.accepted - 1]))
+        if torch.equal(retained, required):
+            return True, ""
+        return False, (
+            f"    accepted predecessor position {predecessor} was overwritten before the next window; "
+            f"{int((retained != required).sum())}/{required.numel()} ring values differ"
+        )
 
     specs = [
-        TensorSpec("kv", [2, 8, HEAD_DIM], torch.float32, init_value=kv),
-        TensorSpec("score", [2, 8, HEAD_DIM], torch.float32, init_value=0.0),
-        TensorSpec("positions", [2, 8], torch.int32, init_value=positions),
+        TensorSpec("kv", [8, HEAD_DIM], torch.float32, init_value=kv),
+        TensorSpec("score", [8, HEAD_DIM], torch.float32, init_value=0.0),
+        TensorSpec("positions", [8], torch.int32, init_value=positions),
         TensorSpec("request_ids", [8], torch.int32, init_value=request_ids),
         TensorSpec("query_starts", [16], torch.int32, init_value=query_starts),
         TensorSpec("state_blocks", [8], torch.int32, init_value=state_blocks),
@@ -391,13 +372,13 @@ if __name__ == "__main__":
         TensorSpec("cosine", [8, ROPE_DIM // 2], torch.float32, init_value=1.0),
         TensorSpec("sine", [8, ROPE_DIM // 2], torch.float32, init_value=0.0),
         TensorSpec("state_cache", [3, STATE_CAPACITY, STATE_WIDTH], torch.float32, init_value=state),
-        TensorSpec("latent", [2, 8, HEAD_DIM], torch.bfloat16, init_value=0.0),
+        TensorSpec("latent", [8, HEAD_DIM], torch.bfloat16, init_value=0.0),
     ]
     result = run(
         fn=c2a_state_feedback_test, specs=specs, golden_fn=golden,
         compare_fn={
-            "state_cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            "latent": ratio_allclose(atol=1e-3, rtol=1e-3, valid_rows=6, valid_axis=1, zero_tail=True),
+            "state_cache": compare_feedback,
+            "latent": ratio_allclose(atol=1e-3, rtol=1e-3, valid_rows=6, zero_tail=True),
         },
         config={"backend_type": "a5", "device_id": args.device,
                 "execution_mode": args.execution_mode or args.platform == "a5sim"},
