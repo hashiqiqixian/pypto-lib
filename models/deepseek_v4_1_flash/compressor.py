@@ -211,7 +211,7 @@ def c2a_compressor_publish(
     return completed
 
 
-@pl.jit.graph
+@pl.jit
 def c2a_state_feedback_step(
     kv: pl.Tensor[[8, HEAD_DIM], pl.FP32],
     score: pl.Tensor[[8, HEAD_DIM], pl.FP32],
