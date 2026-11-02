@@ -193,7 +193,7 @@ __aicore__ inline void flush_rows(__gm__ int64_t* args, int rows, Vec<int64_t, 8
         TASSIGN(payload, 10240 + row * 512);
         TASSIGN(codes, 14336 + row * 32);
         GM<uint8_t, 512> output_gm(data<uint8_t>(args, 5) + slot * 512);
-        GM<uint8_t, 32> scale_gm(data<uint8_t>(args, 6) + slot * 32);
+        GM<uint8_t, 32> scale_gm(reinterpret_cast<__gm__ uint8_t*>(data<bfloat16_t>(args, 6)) + slot * 32);
         TSTORE(output_gm, payload);
         TSTORE(scale_gm, codes);
         // Preserve input order for repeated slots and adjacent short scale writes.
