@@ -28,13 +28,15 @@ from expert_routed import (
 )
 from input_pack import pack_x_hc
 from utils import paged_slots
-from decode_moe import AUX_WIDTH, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
+from decode_moe import AUX_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
 
 from dspark_attention import dspark_attention
 from dspark_context_kv import dspark_context_kv
 from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes
 from config import (
     DSPARK_DRAFT_LAYERS,
+    DSPARK_N_ROUTED_EXPERTS,
+    DSPARK_NUM_EXPERTS_PER_TOK,
     DSPARK_NOISE_TOKEN_ID,
     DSPARK_QUERY_WIDTH,
     DSPARK_SWA_INDEX_WIDTH,
@@ -54,10 +56,11 @@ O_LORA = FLASH.o_lora_rank
 O_GROUP_IN = FLASH.num_attention_heads * HEAD_DIM // FLASH.o_groups
 LOCAL_O_WIDTH = LOCAL_O_GROUPS * O_LORA
 VOCAB = FLASH.vocab_size
-N_EXPERTS = C.EP_SIZE * N_LOCAL_EXPERTS
+N_EXPERTS = DSPARK_N_ROUTED_EXPERTS
+N_LOCAL_EXPERTS = N_EXPERTS // EP_SIZE
 MOE_INTER = FLASH.moe_intermediate_size
 MX_GROUP = FLASH.weight_block_size[0]
-TOPK = FLASH.num_experts_per_tok
+TOPK = DSPARK_NUM_EXPERTS_PER_TOK
 
 MAIN_IN = DSPARK_DRAFT_LAYERS * D
 DSPARK_WINDOW = FLASH.sliding_window
@@ -443,7 +446,7 @@ def draft_layer(
         num_tokens,
         rank,
         moe_epoch,
-        force_topk,
+        force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
     )
     return x_next, next_pre_mix
 

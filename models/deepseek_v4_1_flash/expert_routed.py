@@ -70,30 +70,31 @@ COPY_TILE = max(tile for tile in (16, 12, 8, 6, 4, 3, 2, 1) if ROUTE_ROWS % tile
 
 @pl.jit.inline(auto_scope=False)
 def expert_routed_scatter(
-    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
-    recv_mx_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
-    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    routed_w1_packed: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3_packed: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2_packed: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
+    recv_x: pl.Tensor,
+    recv_mx_scale: pl.Tensor,
+    recv_weights: pl.Tensor,
+    recv_expert_count: pl.Tensor,
+    routed_w1_packed: pl.Tensor,
+    routed_w1_scale: pl.Tensor,
+    routed_w3_packed: pl.Tensor,
+    routed_w3_scale: pl.Tensor,
+    routed_w2_packed: pl.Tensor,
+    routed_w2_scale: pl.Tensor,
     mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
-    recv_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_meta: pl.Tensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_route: pl.Tensor,
+    recv_meta: pl.Tensor,
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     input_ready: pl.Scalar[pl.TASK_ID],
+    local_experts: pl.constexpr = N_LOCAL_EXPERTS,
 ):
-    hidden_completion_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
-    expert_completion_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
-    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    recv_mx_scale_view = pl.tensor.view(recv_mx_scale, [N_LOCAL_EXPERTS * RECV_MAX, K_SCALE], layout=pl.MX_A_ZZ)
+    hidden_completion_tids = pl.array.create(local_experts, pl.TASK_ID)
+    expert_completion_tids = pl.array.create(local_experts, pl.TASK_ID)
+    recv_x_flat = pl.reshape(recv_x, [local_experts * RECV_MAX, D])
+    recv_mx_scale_view = pl.tensor.view(recv_mx_scale, [local_experts * RECV_MAX, K_SCALE], layout=pl.MX_A_ZZ)
     with pl.scope():
-        h_mx = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.FP8E4M3FN)
-        h_scale_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * H_SCALE], dtype=pl.FP8E8M0)
-        for local_i in pl.parallel(N_LOCAL_EXPERTS):
+        h_mx = pl.create_tensor([local_experts * RECV_MAX, MOE_INTER], dtype=pl.FP8E4M3FN)
+        h_scale_backing = pl.create_tensor([1, local_experts * RECV_MAX * H_SCALE], dtype=pl.FP8E8M0)
+        for local_i in pl.parallel(local_experts):
             tile_completion_tids = pl.array.create((RECV_MAX // RECV_TILE), pl.TASK_ID)
             for tile in pl.range((RECV_MAX // RECV_TILE)):
                 tile_completion_tids[tile] = pl.system.task_dummy(deps=[])
@@ -262,7 +263,7 @@ def expert_routed_scatter(
                             tile_completion_tids[t] = gate_up_act_quant_tid
             hidden_completion_tids[local_i] = pl.system.task_dummy(deps=[tile_completion_tids])
         with pl.scope():
-            for local_e in pl.parallel(N_LOCAL_EXPERTS):
+            for local_e in pl.parallel(local_experts):
                 tile_completion_tids = pl.array.create((RECV_MAX // RECV_TILE), pl.TASK_ID)
                 for tile in pl.range((RECV_MAX // RECV_TILE)):
                     tile_completion_tids[tile] = pl.system.task_dummy(deps=[])
@@ -361,7 +362,7 @@ def expert_routed_scatter(
                             tile_completion_tids[tt] = scatter_tid
                 expert_completion_tids[local_e] = pl.system.task_dummy(deps=[tile_completion_tids])
 
-    scatter_done = pl.system.task_dummy(deps=[expert_completion_tids[local_e] for local_e in range(N_LOCAL_EXPERTS)])
+    scatter_done = pl.system.task_dummy(deps=[expert_completion_tids[local_e] for local_e in range(local_experts)])
     return scatter_done
 
 
