@@ -895,9 +895,14 @@ def run_decode_chain_case(devices: tuple[int, ...], *, compile_only: bool = Fals
     # target slab, rather than merely checking one isolated invocation.
     recurrent_tokens = state.tokens.clone()
     recurrent_meta = state.meta.clone()
+    # Persistent windows retain one epoch for every draft chunk and layer.
+    draft_epoch = 1
+    if persistent_chain:
+        draft_chunks = (BATCH + drafter.DSPARK_CHUNK_REQUESTS - 1) // drafter.DSPARK_CHUNK_REQUESTS
+        draft_epoch += draft_chunks * DSPARK_DRAFT_LAYERS
     decode_fwd_dspark(
         active_runner, state, workspace, target_model, draft_model, markov_model, cache_tables, rope_tables,
-        attention_epoch=2, moe_epoch=2, logits_epoch=2,
+        attention_epoch=draft_epoch, moe_epoch=draft_epoch, logits_epoch=2,
     )
     if persistent_worker is not None:
         persistent_worker.close()
