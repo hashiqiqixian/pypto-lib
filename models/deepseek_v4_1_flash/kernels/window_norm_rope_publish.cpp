@@ -111,9 +111,9 @@ __tf__ __aicore__ inline void postprocess(
             vcadd(sum, sum, full, MODE_ZEROING);
             vmuls(inverse, sum, 1.0f / 512.0f, full, MODE_ZEROING);
             vadds(inverse, inverse, 1.0e-20f, full, MODE_ZEROING);
-            vsqrt(inverse, inverse, full, MODE_ZEROING);
+            SqrtFloatImpl<float, RegTensor<float>>(square, inverse, full);
             vdup(one, 1.0f, full, MODE_ZEROING);
-            vdiv(inverse, one, inverse, full, MODE_ZEROING);
+            DivIEEE754FloatImpl<float, RegTensor<float>>(inverse, one, square, full);
             vdup(inverse, inverse, full, POS_LOWEST, MODE_ZEROING);
             vlds(cosv, cp, row * 32, NORM);
             vlds(sinv, sp, row * 32, NORM);
