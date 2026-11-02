@@ -1100,6 +1100,8 @@ def golden_dspark_drafter(tensors):
 
 if __name__ == "__main__":
     import argparse
+    import subprocess
+    import sys
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark drafter validation")
     parser.add_argument("--mode", choices=("projection", "metadata", "drafter", "all"), default="all")
@@ -1113,7 +1115,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if (args.tp, args.dp, args.ep) != (C.TP_SIZE, C.DP_SIZE, C.EP_SIZE):
         parser.error("--tp/--dp/--ep must match the import-time configuration")
-    if args.mode in ("projection", "all"):
+    if args.mode == "all":
+        # Isolate L2 and L3 runtime lifetimes (hw-native-sys/simpler#2839).
+        for mode in ("projection", "metadata", "drafter"):
+            command = [sys.executable, "-u", __file__, *sys.argv[1:], "--mode", mode]
+            result = subprocess.run(command, check=False)
+            if result.returncode:
+                raise SystemExit(result.returncode)
+        raise SystemExit(0)
+
+    if args.mode == "projection":
         import torch
 
         from golden import ScalarSpec, TensorSpec, run
@@ -1153,7 +1164,7 @@ if __name__ == "__main__":
         if not result.passed:
             raise SystemExit(1)
 
-    if args.mode in ("metadata", "all"):
+    if args.mode == "metadata":
         import torch
 
         from golden import TensorSpec, run
@@ -1204,7 +1215,7 @@ if __name__ == "__main__":
         if not result.passed:
             raise SystemExit(1)
 
-    if args.mode in ("drafter", "all"):
+    if args.mode == "drafter":
         from golden import run
         from pypto.ir import DistributedConfig
 
