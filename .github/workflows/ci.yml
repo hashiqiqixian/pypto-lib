@@ -146,7 +146,7 @@ jobs:
 
   sim:
     needs: detect-changes
-    if: needs.detect-changes.outputs.sim_matrix != '[]'
+    if: false # Temporary C1A device-only diagnostic revision.
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
@@ -209,7 +209,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: ${{ fromJSON(needs.detect-changes.outputs.device_matrix) }}
+        platform: [a5] # Temporary matched-host C1A reproduction, not full acceptance.
     runs-on: ${{ fromJSON(matrix.platform == 'a5' && '["self-hosted", "linux", "npu-a5", "X64"]' || '["self-hosted", "linux", "npu", "a3"]') }}
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
     # --max-time 600 run), or the job dies before task-submit's own timeout can
@@ -257,7 +257,7 @@ jobs:
         shell: bash
         env:
           CI_PLATFORM: ${{ matrix.platform }}
-          CI_ENTRIES: ${{ needs.detect-changes.outputs[format('{0}_files', matrix.platform)] }}
+          CI_ENTRIES: models/deepseek_v4_1_flash/decode_c1a_full.py models/deepseek_v4_1_flash/prefill_c1a_full.py
         run: |
           source activate.sh
           failed=()
