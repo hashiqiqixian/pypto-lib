@@ -49,19 +49,21 @@ __tf__ __aicore__ inline void postprocess(
 #if defined(__CPU_SIM)
     for (int row = 0; row < rows; ++row) {
         float values[512];
-        float partial[64] = {};
+        float sum = 0.0f;
         for (int segment = 0; segment < 8; ++segment) {
+            float partial[64];
             for (int lane = 0; lane < 64; ++lane) {
                 float value = static_cast<float>(src[row * 512 + segment * 64 + lane]);
-                partial[lane] += value * value;
+                partial[lane] = value * value;
             }
-        }
-        for (int width = 64; width > 1; width /= 2) {
-            for (int lane = 0; lane < width / 2; ++lane) {
-                partial[lane] = partial[lane * 2] + partial[lane * 2 + 1];
+            for (int width = 64; width > 1; width /= 2) {
+                for (int lane = 0; lane < width / 2; ++lane) {
+                    partial[lane] = partial[lane * 2] + partial[lane * 2 + 1];
+                }
             }
+            sum += partial[0];
         }
-        float inv = 1.0f / std::sqrt(partial[0] / 512.0f + 1.0e-20f);
+        float inv = 1.0f / std::sqrt(sum / 512.0f + 1.0e-20f);
         for (int lane = 0; lane < 512; ++lane) {
             values[lane] = static_cast<float>(static_cast<bfloat16_t>(
                 static_cast<float>(src[row * 512 + lane]) * inv * static_cast<float>(gamma[lane])));
@@ -106,9 +108,10 @@ __tf__ __aicore__ inline void postprocess(
                 vlds(bf, src, row * 512 + segment * 64, UNPK_B16);
                 vcvt(source, bf, full, PART_EVEN);
                 vmul(square, source, source, full, MODE_ZEROING);
+                // Reduce each register before accumulating chunk sums, as TROWSUM does.
+                vcadd(square, square, full, MODE_ZEROING);
                 vadd(sum, sum, square, full, MODE_ZEROING);
             }
-            vcadd(sum, sum, full, MODE_ZEROING);
             vmuls(inverse, sum, 1.0f / 512.0f, full, MODE_ZEROING);
             vadds(inverse, inverse, 1.0e-20f, full, MODE_ZEROING);
             vsqrt(inverse, inverse, full, MODE_ZEROING);
