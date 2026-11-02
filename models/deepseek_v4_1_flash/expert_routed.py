@@ -66,6 +66,8 @@ QUANT_TILE = 768
 # Rows per routed-output copy task.
 # 16 BF16 rows x D stays well under UB.
 COPY_TILE = max(tile for tile in (16, 12, 8, 6, 4, 3, 2, 1) if ROUTE_ROWS % tile == 0)
+INPUT_SCALE_ROWS = pl.dynamic("V41_ROUTED_INPUT_SCALE_ROWS")
+OUTPUT_SCALE_ROWS = pl.dynamic("V41_ROUTED_OUTPUT_SCALE_ROWS")
 
 
 @pl.jit.inline(auto_scope=False)
@@ -75,11 +77,11 @@ def expert_routed_scatter(
     recv_weights: pl.Tensor,
     recv_expert_count: pl.Tensor,
     routed_w1_packed: pl.Tensor,
-    routed_w1_scale: pl.Tensor,
+    routed_w1_scale: pl.Tensor[[INPUT_SCALE_ROWS, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     routed_w3_packed: pl.Tensor,
-    routed_w3_scale: pl.Tensor,
+    routed_w3_scale: pl.Tensor[[INPUT_SCALE_ROWS, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     routed_w2_packed: pl.Tensor,
-    routed_w2_scale: pl.Tensor,
+    routed_w2_scale: pl.Tensor[[OUTPUT_SCALE_ROWS, D], pl.FP8E8M0, pl.MX_B_NN],
     mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     recv_route: pl.Tensor,
     recv_meta: pl.Tensor,
