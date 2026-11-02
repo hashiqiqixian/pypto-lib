@@ -197,6 +197,7 @@ __aicore__ inline void flush(__gm__ int64_t* args, int rows, uint16_t active,
 
 __aicore__ inline void run(__gm__ int64_t* args) {
     int count_tokens = args[14], blocks = args[15];
+    int capacity = reinterpret_cast<__gm__ Tensor*>(args[2])->shapes[1];
     int worker = get_block_idx(args), workers = get_block_num(args);
     int request_count = reinterpret_cast<__gm__ Tensor*>(args[8])->shapes[0];
     using Meta = Tile<TileType::Vec, int32_t, 1, 32, BLayout::RowMajor, 1, DYNAMIC>;
@@ -268,7 +269,7 @@ __aicore__ inline void run(__gm__ int64_t* args) {
             if (start < 0) start = 0;
             if (end > count_tokens) end = count_tokens;
             if (phase == 1 && !valid_block) continue;
-            int begin = phase == 1 && end - 4 > start ? end - 4 : start;
+            int begin = phase == 1 && end - capacity > start ? end - capacity : start;
             for (int base = begin; base < end; base += 32) {
                 int count = end - base < 32 ? end - base : 32;
                 positions.SetValidCol(count);
@@ -298,7 +299,7 @@ __aicore__ inline void run(__gm__ int64_t* args) {
                         TLOAD(score, score_gm);
                         set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
                         wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-                        int64_t slot = (int64_t)block * 4 + position % 4;
+                        int64_t slot = (int64_t)block * capacity + position % capacity;
                         GM<float, 512> state_kv(data<float>(args, 2) + slot * 1024);
                         GM<float, 512> state_score(data<float>(args, 2) + slot * 1024 + 512);
                         TSTORE(state_kv, kv);
@@ -330,7 +331,7 @@ __aicore__ inline void run(__gm__ int64_t* args) {
                             prev_kv = data<float>(args, 0) + (int64_t)(token - 1) * 512;
                             prev_score = data<float>(args, 1) + (int64_t)(token - 1) * 512;
                         } else {
-                            int64_t slot = (int64_t)block * 4 + (position - 1) % 4;
+                            int64_t slot = (int64_t)block * capacity + (position - 1) % capacity;
                             prev_kv = data<float>(args, 2) + slot * 1024;
                             prev_score = prev_kv + 512;
                         }

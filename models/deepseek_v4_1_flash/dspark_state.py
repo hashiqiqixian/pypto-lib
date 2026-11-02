@@ -83,6 +83,26 @@ def golden_bootstrap(
     return tokens, meta
 
 
+def golden_bootstrap_inputs(tensors, _params):
+    """Keep the sampled anchor while disabling draft queries beyond the limit."""
+    tokens = tensors["next_prefill_tokens"]
+    first = tensors["first_query_positions"]
+    tokens.zero_()
+    first.fill_(-1)
+    for request, slot in enumerate(tensors["slot_ids"].tolist()):
+        row = int(tensors["sampled_rows"][request])
+        prompt = int(tensors["prompt_lengths"][request])
+        limit = int(tensors["position_limits"][request])
+        if not (0 <= slot < BATCH and 0 <= row < PREFILL_SAMPLE_ROWS and 0 < prompt < limit):
+            continue
+        meta = tensors["state_meta"][slot]
+        if int(meta[STATE_VALID]) != 0 or int(meta[STATE_GENERATION]) != int(tensors["generations"][request]):
+            continue
+        tokens[request] = tensors["sampled_ids"][row, 0]
+        if prompt + DSPARK_QUERY_WIDTH < limit:
+            first[request] = prompt
+
+
 @pl.jit
 def bootstrap_inputs_rank(
     slot_ids: pl.Tensor[[BATCH], pl.INT32],
@@ -98,7 +118,7 @@ def bootstrap_inputs_rank(
     for _core in pl.spmd(1, name_hint="dspark_bootstrap_inputs"):
         for request in pl.range(BATCH):
             pl.write(next_prefill_tokens, [request], pl.cast(0, pl.INT64))
-            pl.write(first_query_positions, [request], pl.cast(0, pl.INT32))
+            pl.write(first_query_positions, [request], pl.cast(-1, pl.INT32))
             slot = pl.read(slot_ids, [request])
             row = pl.read(sampled_rows, [request])
             prompt = pl.read(prompt_lengths, [request])
@@ -110,7 +130,8 @@ def bootstrap_inputs_rank(
                 if valid == 0 and generation == expected and prompt > 0 and prompt < limit:
                     token = pl.read(sampled_ids, [row, 0])
                     pl.write(next_prefill_tokens, [request], pl.cast(token, pl.INT64))
-                    pl.write(first_query_positions, [request], prompt)
+                    if prompt + DSPARK_QUERY_WIDTH < limit:
+                        pl.write(first_query_positions, [request], prompt)
     return next_prefill_tokens, first_query_positions
 
 
@@ -668,3 +689,46 @@ def l3_prepare_prefill_drafter_geometry(
             context_slots[rank], context_rope_cos[rank], context_rope_sin[rank],
             query_rope_cos[rank], query_rope_sin[rank], device=rank,
         )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from golden import TensorSpec, run
+
+    parser = argparse.ArgumentParser(description="V4.1 DSpark bootstrap context-boundary validation")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    slots = torch.arange(BATCH, dtype=torch.int32)
+    sampled_rows = slots.clone()
+    prompts = torch.tensor([1, 122, 123, 125, 127, 128, 0, 125, 125, 125, 125, 125], dtype=torch.int32)
+    meta = torch.zeros(BATCH, STATE_META_WIDTH, dtype=torch.int32)
+    meta[:, STATE_GENERATION] = 7
+    meta[7, STATE_GENERATION] = 6
+    meta[8, STATE_VALID] = 1
+    slots[9] = -1
+    sampled_rows[10] = -1
+    sampled_rows[11] = PREFILL_SAMPLE_ROWS
+    sampled_ids = torch.zeros(PREFILL_SAMPLE_ROWS, SAMPLED_STRIDE, dtype=torch.int32)
+    sampled_ids[:, 0] = torch.arange(100, 100 + PREFILL_SAMPLE_ROWS)
+    specs = [
+        TensorSpec("slot_ids", [BATCH], torch.int32, init_value=slots),
+        TensorSpec("generations", [BATCH], torch.int32, init_value=7),
+        TensorSpec("prompt_lengths", [BATCH], torch.int32, init_value=prompts),
+        TensorSpec("position_limits", [BATCH], torch.int32, init_value=128),
+        TensorSpec("sampled_rows", [BATCH], torch.int32, init_value=sampled_rows),
+        TensorSpec("sampled_ids", [PREFILL_SAMPLE_ROWS, SAMPLED_STRIDE], torch.int32, init_value=sampled_ids),
+        TensorSpec("state_meta", [BATCH, STATE_META_WIDTH], torch.int32, init_value=meta),
+        TensorSpec("next_prefill_tokens", [BATCH], torch.int64),
+        TensorSpec("first_query_positions", [BATCH], torch.int32),
+    ]
+    result = run(
+        fn=bootstrap_inputs_rank, specs=specs, golden_fn=golden_bootstrap_inputs, rtol=0.0, atol=0.0,
+        config={"backend_type": "a5", "device_id": args.device, "execution_mode": args.platform == "a5sim"},
+        compile_only=args.compile_only,
+    )
+    print(result)
+    if not result.passed:
+        raise SystemExit(1)
