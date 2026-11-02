@@ -725,7 +725,8 @@ if __name__ == "__main__":
         TensorSpec("first_query_positions", [BATCH], torch.int32),
     ]
     result = run(
-        fn=bootstrap_inputs_rank, specs=specs, golden_fn=golden_bootstrap_inputs, rtol=0.0, atol=0.0,
+        fn=bootstrap_inputs_rank, specs=specs,
+        golden_fn=lambda tensors: golden_bootstrap_inputs(tensors, {}), rtol=0.0, atol=0.0,
         config={"backend_type": "a5", "device_id": args.device, "execution_mode": args.platform == "a5sim"},
         compile_only=args.compile_only,
     )
