@@ -63,10 +63,12 @@ def main():
     sys.path[:0] = [str(model), str(args.lib_root.resolve())]
     import torch
 
+    from hc import golden_hc_collapse
+    from quant import _quantize_mxfp8_activation
+    from rmsnorm import EPS, golden_rms_norm
+
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
-    from hc import golden_hc_collapse
-    from rmsnorm import EPS, golden_rms_norm
 
     def sha256(value):
         raw = value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
@@ -124,23 +126,45 @@ def main():
             total = total + item
         return total
 
-    square = source.square()
-    means = {"original_whole_mean": full_mean[row, 0]}
-    means["torch_512_chunks"] = serial([part.sum() for part in square.reshape(10, 512)]) * (1.0 / 5120)
-    for name, reduce64 in (("adjacent", adjacent), ("halves", halves)):
-        partials = [serial([reduce64(chunk) for chunk in part.reshape(8, 64)])
-                    for part in square.reshape(10, 512)]
-        means[f"modeled_TROWSUM64_{name}_then512_chunks"] = serial(partials) * (1.0 / 5120)
+    def compensated(values):
+        # Match _rms_norm_tiled(compensated=True) across the same ten partials.
+        total = torch.zeros((), dtype=torch.float32)
+        correction = torch.zeros((), dtype=torch.float32)
+        for item in values:
+            delta = item - correction
+            next_sum = total + delta
+            correction = (next_sum - total) - delta
+            total = next_sum
+        return total
+
+    def reduction_models(row_value, original_mean):
+        square = row_value.square()
+        partial_sets = {"torch_512_chunks": [part.sum() for part in square.reshape(10, 512)]}
+        for name, reduce64 in (("adjacent", adjacent), ("halves", halves)):
+            partial_sets[f"modeled_TROWSUM64_{name}_then512_chunks"] = [
+                serial([reduce64(chunk) for chunk in part.reshape(8, 64)])
+                for part in square.reshape(10, 512)
+            ]
+        models = {"original_whole_mean": original_mean}
+        for name, partials in partial_sets.items():
+            models[name] = serial(partials) * (1.0 / 5120)
+            models[name + "_compensated"] = compensated(partials) * (1.0 / 5120)
+        return models
+
+    all_models = [reduction_models(value[index], full_mean[index, 0]) for index in range(72)]
+    means = all_models[row]
 
     variants = []
     truth = []
     with localcontext() as context:
         context.prec = 100
-        exact_sum = sum((Decimal.from_float(float(item)) ** 2 for item in source), Decimal(0))
-        exact_mean = exact_sum / Decimal(5120)
+        exact_means = [sum((Decimal.from_float(item) ** 2 for item in values), Decimal(0)) / Decimal(5120)
+                       for values in value.tolist()]
+        for index, exact in enumerate(exact_means):
+            all_models[index]["independent_mean_rounded_fp32"] = torch.tensor(rounded_fp32(exact), dtype=torch.float32)
+        exact_mean = exact_means[row]
         exact_variance = exact_mean + Decimal.from_float(EPS)
         exact_inverse = Decimal(1) / exact_variance.sqrt()
-        means["independent_mean_rounded_fp32"] = torch.tensor(rounded_fp32(exact_mean), dtype=torch.float32)
 
         for name, mean in means.items():
             variance = mean + EPS
@@ -210,6 +234,53 @@ def main():
                        "inverse_decimal": str(exact_inverse), "inverse_fp64": float(exact_inverse)}
 
     bit_diff = actual.view(torch.int16) != golden.view(torch.int16)
+    golden_payload, golden_scales = _quantize_mxfp8_activation(golden, scale_alg=0)
+    actual_payload, actual_scales = _quantize_mxfp8_activation(actual, scale_alg=0)
+    all_row_statistics = {}
+    with localcontext() as context:
+        context.prec = 100
+        for name in means:
+            model_means = torch.stack([item[name] for item in all_models]).reshape(72, 1)
+            errors = [float(Decimal.from_float(float(model_means[index, 0])) - exact_means[index])
+                      for index in range(72)]
+            ulps = [fp32_bits(float(model_means[index, 0])) - fp32_bits(rounded_fp32(exact_means[index]))
+                    for index in range(72)]
+            worst_row = max(range(72), key=lambda index: abs(errors[index]))
+            inverse_values = []
+            for variance in (model_means + EPS).flatten().tolist():
+                sqrt32 = rounded_fp32(Decimal.from_float(variance).sqrt())
+                inverse_values.append(rounded_fp32(Decimal(1) / Decimal.from_float(sqrt32)))
+            model_inverse = torch.tensor(inverse_values, dtype=torch.float32).reshape(72, 1)
+            prediction = ((value * model_inverse) * gamma).bfloat16()
+            against_golden = prediction.view(torch.int16) != golden.view(torch.int16)
+            against_actual = prediction.view(torch.int16) != actual.view(torch.int16)
+            predicted_payload, predicted_scales = _quantize_mxfp8_activation(prediction, scale_alg=0)
+            payload_vs_golden = (predicted_payload.view(torch.uint8) != golden_payload.view(torch.uint8)).reshape(72, -1)
+            payload_vs_actual = (predicted_payload.view(torch.uint8) != actual_payload.view(torch.uint8)).reshape(72, -1)
+            scale_vs_golden = predicted_scales != golden_scales
+            scale_vs_actual = predicted_scales != actual_scales
+            all_row_statistics[name] = {
+                "rows": 72, "mean_abs_error_vs_independent": sum(abs(error) for error in errors) / 72,
+                "max_abs_error_vs_independent": abs(errors[worst_row]), "worst_mean_row": worst_row,
+                "correctly_rounded_mean_rows": sum(ulp == 0 for ulp in ulps),
+                "max_mean_ulp_distance": max(abs(ulp) for ulp in ulps),
+                "mean_ulp_deltas_by_row": ulps,
+                "row3_mean_bits": f"0x{fp32_bits(float(model_means[3, 0])):08x}",
+                "row3_inverse_bits": f"0x{fp32_bits(float(model_inverse[3, 0])):08x}",
+                "inverse_contract": "RNE FP32 sqrt followed by RNE FP32 reciprocal; two FP32 output multiplies",
+                "bf16_differences_vs_golden": int(against_golden.sum()),
+                "bf16_differences_vs_actual": int(against_actual.sum()),
+                "bf16_differences_vs_golden_by_row": against_golden.sum(dim=1).tolist(),
+                "bf16_existing_differences_resolved": int((bit_diff & ~against_golden).sum()),
+                "bf16_new_differences_vs_golden": int((~bit_diff & against_golden).sum()),
+                "host_OCP_payload_differences_vs_golden": int(payload_vs_golden.sum()),
+                "host_OCP_payload_differences_vs_actual": int(payload_vs_actual.sum()),
+                "host_OCP_scale_differences_vs_golden": int(scale_vs_golden.sum()),
+                "host_OCP_scale_differences_vs_actual": int(scale_vs_actual.sum()),
+                "host_OCP_payload_differences_vs_golden_by_row": payload_vs_golden.sum(dim=1).tolist(),
+                "row3_host_OCP_bad_columns_vs_golden": payload_vs_golden[3].nonzero().flatten()[:32].tolist(),
+                "device_projection_quantizer_executed": False,
+            }
     matching = [{"mean_method": item["mean_method"], "inverse_method": item["inverse_method"]}
                 for item in variants if item["row_differences_vs_actual"] == 0]
     result = {
@@ -225,14 +296,17 @@ def main():
         "original_mean_bits": f"0x{fp32_bits(float(full_mean[row, 0])):08x}",
         "original_inverse_bits": f"0x{fp32_bits(float(full_inverse[row, 0])):08x}",
         "independent": independent, "focus_independent_reference": truth, "variants": variants,
-        "collapse_fp64_vs_pairwise_bf16_differences": int(collapse_differences.sum()),
-        "collapse_fp64_vs_pairwise_first_columns": collapse_differences.nonzero().flatten()[:32].tolist(),
+        "all_72_row_compensation_statistics": all_row_statistics,
+        "compensation_scope": "Existing Kahan recurrence across the same ten 512-column partials only; no changes within each partial.",
+        "collapse_fp64_torch_cast_vs_pairwise_bf16_differences": int(collapse_differences.sum()),
+        "collapse_fp64_torch_cast_vs_pairwise_first_columns": collapse_differences.nonzero().flatten()[:32].tolist(),
         "RMS_models_reconstructing_entire_actual_row": matching,
         "attribution": ("At least one RMS model reconstructs the whole observed row from the original host collapse. "
                         "This supports an RMS boundary explanation but does not measure native collapse."
                         if matching else "No tested RMS model reconstructs the whole observed row; collapse versus RMS remains unresolved."),
         "limitations": ["Native collapse, mean, and inverse were not captured by the HC probe.",
                         "Modeled vcadd lane order is not assumed to be a hardware identity.",
+                        "Whole-row FP64 collapse uses Torch's BF16 cast, which may double-round; focus nearest BF16 uses Decimal distances.",
                         "An independent real-valued reference does not replace the specified FP32 operation contract.",
                         "No device, production math, original Golden, or acceptance threshold is changed."],
     }
