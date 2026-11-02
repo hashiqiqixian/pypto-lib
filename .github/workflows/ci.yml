@@ -210,7 +210,7 @@ jobs:
       fail-fast: false
       matrix:
         platform: ${{ fromJSON(needs.detect-changes.outputs.device_matrix) }}
-    runs-on: ${{ fromJSON(matrix.platform == 'a5' && '["self-hosted", "linux", "npu-a5"]' || '["self-hosted", "linux", "npu", "a3"]') }}
+    runs-on: ${{ fromJSON(matrix.platform == 'a5' && '["self-hosted", "linux", "npu-a5", "X64"]' || '["self-hosted", "linux", "npu", "a3"]') }}
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
     # --max-time 600 run), or the job dies before task-submit's own timeout can
     # ever fire — and the first queued case would eat the whole job budget.
@@ -263,6 +263,12 @@ jobs:
           failed=()
           for f in $CI_ENTRIES; do
             echo "::group::$f"
+            entry_command="python $f"
+            case "$f" in
+              models/deepseek_v4_1_flash/decode_c1a_full.py|models/deepseek_v4_1_flash/prefill_c1a_full.py)
+                entry_command="python tools/pr1541_c1a_ci_probe.py $f"
+                ;;
+            esac
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
             ndev=${ndev:-1}
             device_flags=()
@@ -270,7 +276,7 @@ jobs:
               device_flags+=(--device-num "$ndev" --ignore-whitelist)
             fi
             if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 600 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE"; then
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout $entry_command -p $CI_PLATFORM -d \$TASK_DEVICE"; then
               status=pass
             else
               status=fail
@@ -296,6 +302,9 @@ jobs:
           path: |
             checkout/build_output/**/report/codegen_errors.txt
             checkout/build_output/**/*.pto
+            checkout/build_output/pr1541_c1a_ci_probe/**/*.json
+            checkout/build_output/pr1541_c1a_ci_probe/**/*.pt
+            checkout/build_output/pr1541_c1a_ci_probe/**/*.log
 
       - name: Kill orphaned task-submit tasks
         if: always()
