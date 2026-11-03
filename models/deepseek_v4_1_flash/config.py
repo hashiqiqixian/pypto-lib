@@ -191,7 +191,7 @@ FLASH = DeepSeekV41Config(
     o_lora_rank=1024,
     o_groups=8,
     sliding_window=128,
-    rms_norm_eps=1e-6,
+    rms_norm_eps=1e-20,
     max_position_embeddings=1048576,
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
@@ -237,7 +237,6 @@ FLASH = DeepSeekV41Config(
 
 
 BLOCK_SIZE = 128
-STATE_CAPACITY = 4
 MAX_BATCH_PER_DP = 12
 DSPARK_SPEC_TOKENS = 5
 DSPARK_DRAFT_LAYERS = 3
@@ -246,6 +245,8 @@ DSPARK_SWA_INDEX_WIDTH = (FLASH.sliding_window + DSPARK_QUERY_WIDTH + 63) // 64 
 DSPARK_MARKOV_RANK = 256
 DSPARK_NOISE_TOKEN_ID = 128799
 DECODE_ROWS_PER_REQUEST = DSPARK_SPEC_TOKENS + 1
+# Retain every verified row until acceptance selects the next decode position.
+STATE_CAPACITY = (DECODE_ROWS_PER_REQUEST + 7) // 8 * 8
 DECODE_MAX_TOKENS = MAX_BATCH_PER_DP * DECODE_ROWS_PER_REQUEST
 PREFILL_MAX_TOKENS = 8192
 WINDOW_CACHE_GROUP = 32

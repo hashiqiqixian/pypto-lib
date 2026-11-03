@@ -15,7 +15,7 @@ from config import (
     WINDOW_CACHE_GROUP,
 )
 from hc import hc_head_norm, hc_project, hc_sinkhorn, hc_post
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import projection_padded_rows, quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from sparse_attention import attend_packed
 from o_proj import o_proj
 
@@ -80,12 +80,15 @@ def decode_c2a_reuse(
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
-    q_proj_rope(
+    proj_rows = projection_padded_rows(pl.tensor.dim(x_norm, 0))
+    qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+    q_proj_result = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
-        qr, query,
+        qr, query, qb_payload, qb_scales,
         num_tokens,
     )
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
@@ -106,7 +109,7 @@ def decode_c2a_reuse(
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    o_proj(
+    o_proj_result = o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         attn_out, num_tokens,
     )
