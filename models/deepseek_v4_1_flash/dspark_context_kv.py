@@ -11,13 +11,14 @@
 import pypto.language as pl
 import torch
 
-from config import DSPARK_QUERY_WIDTH, FLASH, ORI_BLOCKS_DYN, T_DYN
+from config import DSPARK_QUERY_WIDTH, FLASH, ORI_BLOCKS_DYN
 from qkv_proj_rope import golden_rope_interleave, quantize_projection_input, kv_proj, window_publish
 from gemm import golden_mxfp8_linear_grouped_sum
 from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm
 
 
+T_DYN = pl.dynamic("V41_DSPARK_CONTEXT_T_DYN")
 D = FLASH.hidden_size
 HEAD_DIM = FLASH.head_dim
 ROPE_DIM = FLASH.qk_rope_head_dim
