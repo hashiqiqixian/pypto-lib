@@ -63,7 +63,7 @@ __tf__ __aicore__ inline void postprocess(
             }
             sum += partial[0];
         }
-        float inv = 1.0f / std::sqrt(sum / 512.0f + 1.0e-20f);
+        float inv = 1.0f / std::sqrt(sum / 512.0f + 1.0e-6f);
         for (int lane = 0; lane < 512; ++lane) {
             values[lane] = static_cast<float>(static_cast<bfloat16_t>(
                 static_cast<float>(src[row * 512 + lane]) * inv * static_cast<float>(gamma[lane])));
@@ -113,7 +113,7 @@ __tf__ __aicore__ inline void postprocess(
                 vadd(sum, sum, square, full, MODE_ZEROING);
             }
             vmuls(inverse, sum, 1.0f / 512.0f, full, MODE_ZEROING);
-            vadds(inverse, inverse, 1.0e-20f, full, MODE_ZEROING);
+            vadds(inverse, inverse, 1.0e-6f, full, MODE_ZEROING);
             SqrtFloatImpl<float, RegTensor<float>>(square, inverse, full);
             vdup(one, 1.0f, full, MODE_ZEROING);
             DivIEEE754FloatImpl<float, RegTensor<float>>(inverse, one, square, full);

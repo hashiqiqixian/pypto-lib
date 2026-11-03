@@ -46,7 +46,7 @@ __tf__ __aicore__ inline void pool_rows(
             rounded[col] = v;
             square += v * v;
         }
-        float inv = 1.0f / std::sqrt(square / 512.0f + 1.0e-20f);
+        float inv = 1.0f / std::sqrt(square / 512.0f + 1.0e-6f);
         for (int col = 0; col < 512; ++col)
             dst[row * 512 + col] = static_cast<bfloat16_t>(rounded[col] * inv * static_cast<float>(gamma[col]));
     }
@@ -91,7 +91,7 @@ __tf__ __aicore__ inline void pool_rows(
             }
             vcadd(sum, sum, full, MODE_ZEROING);
             vmuls(sum, sum, 1.0f / 512.0f, full, MODE_ZEROING);
-            vadds(sum, sum, 1.0e-20f, full, MODE_ZEROING);
+            vadds(sum, sum, 1.0e-6f, full, MODE_ZEROING);
             RegTensor<float> one, inv, root;
             vdup(one, 1.0f, full, MODE_ZEROING);
             vsqrt(root, sum, full, MODE_ZEROING);

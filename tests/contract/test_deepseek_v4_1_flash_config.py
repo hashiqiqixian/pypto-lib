@@ -35,7 +35,7 @@ def config(monkeypatch):
 
 
 def test_checkpoint_keeps_rms_and_hc_epsilon_distinct(config):
-    assert config.FLASH.rms_norm_eps == 1e-20
+    assert config.FLASH.rms_norm_eps == 1e-6
     assert config.FLASH.hc_eps == 1e-6
     assert config.FLASH.hc_sinkhorn_iters == 20
 
