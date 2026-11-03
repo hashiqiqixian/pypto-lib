@@ -61,7 +61,7 @@ __tf__ __aicore__ inline void postprocess(
                 partial[lane] = partial[lane * 2] + partial[lane * 2 + 1];
             }
         }
-        float inv = 1.0f / std::sqrt(partial[0] / 512.0f + 1.0e-6f);
+        float inv = 1.0f / std::sqrt(partial[0] / 512.0f + 1.0e-20f);
         for (int lane = 0; lane < 512; ++lane) {
             values[lane] = static_cast<float>(static_cast<bfloat16_t>(
                 static_cast<float>(src[row * 512 + lane]) * inv * static_cast<float>(gamma[lane])));
@@ -110,7 +110,7 @@ __tf__ __aicore__ inline void postprocess(
             }
             vcadd(sum, sum, full, MODE_ZEROING);
             vmuls(inverse, sum, 1.0f / 512.0f, full, MODE_ZEROING);
-            vadds(inverse, inverse, 1.0e-6f, full, MODE_ZEROING);
+            vadds(inverse, inverse, 1.0e-20f, full, MODE_ZEROING);
             vsqrt(inverse, inverse, full, MODE_ZEROING);
             vdup(one, 1.0f, full, MODE_ZEROING);
             vdiv(inverse, one, inverse, full, MODE_ZEROING);

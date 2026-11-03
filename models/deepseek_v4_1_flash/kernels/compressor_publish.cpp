@@ -29,7 +29,7 @@ __tf__ __aicore__ inline void normalize(
             float value = static_cast<float>(src[row * 512 + col]);
             square += value * value;
         }
-        float inv = 1.0f / std::sqrt(square / 512.0f + 1.0e-6f);
+        float inv = 1.0f / std::sqrt(square / 512.0f + 1.0e-20f);
         for (int col = 0; col < 512; ++col)
             dst[row * 512 + col] = static_cast<bfloat16_t>(static_cast<float>(src[row * 512 + col]) * inv * static_cast<float>(gamma[col]));
     }
@@ -48,7 +48,7 @@ __tf__ __aicore__ inline void normalize(
             }
             vcadd(sum, sum, full, MODE_ZEROING);
             vmuls(inv, sum, 1.0f / 512.0f, full, MODE_ZEROING);
-            vadds(inv, inv, 1.0e-6f, full, MODE_ZEROING);
+            vadds(inv, inv, 1.0e-20f, full, MODE_ZEROING);
             vsqrt(inv, inv, full, MODE_ZEROING);
             vdup(one, 1.0f, full, MODE_ZEROING);
             vdiv(inv, one, inv, full, MODE_ZEROING);
