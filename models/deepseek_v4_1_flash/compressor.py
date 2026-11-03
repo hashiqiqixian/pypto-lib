@@ -241,11 +241,12 @@ def c2a_compressor_publish(
                             pl.write(mapped_requests, [token], count)
                     count = pl.cast(count + 1, pl.INT32)
     workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
+    native_count = pl.cast(native_blocks, pl.INT32)
     with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
         _c2a_compress(
             kv_proj, score_proj, native_state, position_ids, norm_weight, latent,
             mapped_starts, mapped_requests, mapped_blocks,
-            slots, cosine, sine, cache, scales, active_tokens, pl.cast(native_blocks, pl.INT32),
+            slots, cosine, sine, cache, scales, active_tokens, native_count,
         )
     return completed
 
