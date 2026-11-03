@@ -324,9 +324,19 @@ def window_publish(
 ):
     """Fuse RMSNorm, RoPE, group-32 FP8 quantization, and window cache publication."""
     workers = pl.max(1, pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE))
+    blocks = pl.tensor.dim(cache_scale, 0)
+    local_scales = pl.create_tensor([blocks, 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
     with pl.spmd(workers, name_hint="norm_rope_pub_win", deps=[cache_ready]) as published:
-        cache = _norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, cache_scale, num_tokens)
-    return published
+        cache = _norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, local_scales, num_tokens)
+    local_rows = pl.reshape(local_scales, [blocks * 128, HEAD_DIM // 32])
+    output_rows = pl.reshape(cache_scale, [blocks * 128, HEAD_DIM // 32])
+    with pl.spmd(1, name_hint="publish_window_scales", deps=[published]) as completed:
+        for token in pl.range(num_tokens):
+            slot = pl.read(slots, [token])
+            if slot >= 0 and slot < blocks * 128:
+                scale = pl.load(local_rows, [slot, 0], [1, HEAD_DIM // 32])
+                pl.store(scale, [slot, 0], output_rows)
+    return completed
 
 
 def golden_rope_interleave(

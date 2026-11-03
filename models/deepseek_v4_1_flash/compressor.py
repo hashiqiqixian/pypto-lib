@@ -201,12 +201,49 @@ def c2a_compressor_publish(
     """Pool and publish rows with state reads and writes owned by physical block."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
     blocks = pl.cast(pl.tensor.dim(state_cache, 0), pl.INT32)
+    requests = pl.tensor.dim(state_block_table, 0)
+    tokens = pl.tensor.dim(kv_proj, 0)
+    groups = (tokens + 3) // 4 + requests
+    mapped_starts = pl.create_tensor([groups + 1], dtype=pl.INT32)
+    mapped_requests = pl.create_tensor([tokens], dtype=pl.INT32)
+    mapped_blocks = pl.create_tensor([groups, 1], dtype=pl.INT32)
+    native_state = pl.reshape(state_cache, [blocks * (STATE_CAPACITY // 4), 4, STATE_WIDTH])
+    with pl.spmd(1, name_hint="c2a_four_slot_requests", deps=[state_ready]) as mapped:
+        for row in pl.range(tokens):
+            pl.write(mapped_requests, [row], pl.cast(-1, pl.INT32))
+        for group in pl.range(groups):
+            pl.write(mapped_starts, [group], active_tokens)
+            pl.write(mapped_blocks, [group, 0], pl.cast(-1, pl.INT32))
+        pl.write(mapped_starts, [groups], active_tokens)
+        count = pl.cast(0, pl.INT32)
+        for request in pl.range(requests):
+            start = pl.max(pl.min(pl.read(query_start_loc, [request]), active_tokens), 0)
+            end = pl.max(pl.min(pl.read(query_start_loc, [request + 1]), active_tokens), start)
+            if start < end:
+                first_position = pl.max(pl.read(position_ids, [start]), 0)
+                offset = first_position % 4
+                chunks = (end - start + offset + 3) // 4
+                block = pl.read(state_block_table, [request, 0])
+                for chunk in pl.range(chunks):
+                    begin = start + pl.max(chunk * 4 - offset, 0)
+                    limit = pl.min(start + (chunk + 1) * 4 - offset, end)
+                    position = first_position + begin - start
+                    native_block = pl.cast(-1, pl.INT32)
+                    if block >= 0 and block < blocks:
+                        native_block = block * (STATE_CAPACITY // 4) + position // 4 % (STATE_CAPACITY // 4)
+                    pl.write(mapped_starts, [count], pl.cast(begin, pl.INT32))
+                    pl.write(mapped_starts, [count + 1], pl.cast(limit, pl.INT32))
+                    pl.write(mapped_blocks, [count, 0], native_block)
+                    for token in pl.range(begin, limit):
+                        if pl.read(token_to_req_indices, [token]) == request:
+                            pl.write(mapped_requests, [token], count)
+                    count = count + 1
     workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
-    with pl.spmd(workers, name_hint="c2a_compress", deps=[state_ready]) as completed:
+    with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
         _c2a_compress(
-            kv_proj, score_proj, state_cache, position_ids, norm_weight, latent,
-            query_start_loc, token_to_req_indices, state_block_table,
-            slots, cosine, sine, cache, scales, active_tokens, blocks,
+            kv_proj, score_proj, native_state, position_ids, norm_weight, latent,
+            mapped_starts, mapped_requests, mapped_blocks,
+            slots, cosine, sine, cache, scales, active_tokens, blocks * (STATE_CAPACITY // 4),
         )
     return completed
 
@@ -229,12 +266,12 @@ def c2a_state_feedback_test(
     """Validate the ring retained after a six-row speculative verification window."""
     cache = pl.create_tensor([1, 128, 1, HEAD_DIM // 2], dtype=pl.UINT8)
     scales = pl.create_tensor([1, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], dtype=pl.BF16)
-    with pl.spmd(1, name_hint="c2a_feedback_state"):
-        _c2a_compress(
-            kv, score, state_cache, positions, norm_weight, latent,
-            query_starts, request_ids, state_blocks, slots, cosine, sine, cache, scales,
-            pl.cast(6, pl.INT32), pl.cast(3, pl.INT32),
-        )
+    state_ready = pl.system.task_dummy(deps=[])
+    c2a_compressor_publish(
+        kv, score, query_starts, positions, request_ids, pl.reshape(state_blocks, [8, 1]),
+        state_cache, norm_weight, latent, pl.cast(6, pl.INT32), state_ready,
+        cosine, sine, slots, cache, scales,
+    )
     return state_cache, latent
 
 
