@@ -285,7 +285,7 @@ def _norm_rope_publish(
     num_tokens: pl.Scalar[pl.INT32],
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Normalize and rotate BF16 rows, then quantize and publish group-32 FP8 cache pages."""
-    ...
+    return cache, scales
 
 
 @pl.jit.inline(auto_scope=False)
