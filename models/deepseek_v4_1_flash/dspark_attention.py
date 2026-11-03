@@ -34,8 +34,8 @@ SOFTMAX_SCALE = HEAD_DIM**-0.5
 def gather_dspark_window(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
-    selected: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
+    indices: pl.Tensor,
+    selected: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     cache_rows = pl.tensor.dim(cache, 0) * 128
@@ -60,11 +60,11 @@ def gather_dspark_window(
 
 @pl.jit.inline
 def attend_dspark_window(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    selected: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    query: pl.Tensor,
+    selected: pl.Tensor,
+    indices: pl.Tensor,
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(query, 0)
