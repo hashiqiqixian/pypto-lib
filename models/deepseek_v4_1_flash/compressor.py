@@ -268,8 +268,9 @@ def c2a_state_feedback_test(
     cache = pl.create_tensor([1, 128, 1, HEAD_DIM // 2], dtype=pl.UINT8)
     scales = pl.create_tensor([1, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], dtype=pl.BF16)
     state_ready = pl.system.task_dummy(deps=[])
+    state_table = pl.reshape(state_blocks, [8, 1])
     c2a_compressor_publish(
-        kv, score, query_starts, positions, request_ids, pl.reshape(state_blocks, [8, 1]),
+        kv, score, query_starts, positions, request_ids, state_table,
         state_cache, norm_weight, latent, pl.cast(6, pl.INT32), state_ready,
         cosine, sine, slots, cache, scales,
     )
