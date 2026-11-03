@@ -12,7 +12,7 @@
 import pypto.language as pl
 from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from sparse_attention import swa_attention_partial
-from qkv_proj_rope import projection_padded_rows, quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj
 from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding, hc_post
 
@@ -79,15 +79,12 @@ def decode_swa(
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
-    proj_rows = projection_padded_rows(pl.tensor.dim(x_norm, 0))
-    qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
-    qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
-    qr, q, qb_payload, qb_scales = q_proj_rope(
+    q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
-        qr, q, qb_payload, qb_scales,
+        qr, q,
         num_tokens,
     )
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
@@ -100,7 +97,7 @@ def decode_swa(
     swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
-    attention_output = o_proj(
+    o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         attention_output, num_tokens,
     )

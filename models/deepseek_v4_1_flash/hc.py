@@ -210,7 +210,6 @@ def hc_head_norm(
         pre3 = pl.set_validshape(pre3, valid_rows, 1)
         collapsed = pl.create_tensor([D // PRE_NORM_D_TILE * PRE_NORM_T_TILE, PRE_NORM_D_TILE], dtype=pl.BF16)
         sq_sum = pl.full([1, PRE_NORM_T_TILE], dtype=pl.FP32, value=0.0)
-        compensation = pl.full([1, PRE_NORM_T_TILE], dtype=pl.FP32, value=0.0)
         for d0 in pl.pipeline(0, D, PRE_NORM_D_TILE, stage=2):
             x0 = pl.slice(x_flat, [PRE_NORM_T_TILE, PRE_NORM_D_TILE], [t0, d0], valid_shape=[valid_rows, PRE_NORM_D_TILE])
             x1 = pl.slice(x_flat, [PRE_NORM_T_TILE, PRE_NORM_D_TILE], [t0, D + d0], valid_shape=[valid_rows, PRE_NORM_D_TILE])
@@ -231,10 +230,7 @@ def hc_head_norm(
             value = pl.cast(padded, target_type=pl.FP32)
             squared = pl.mul(value, value)
             partial = pl.reshape(pl.row_sum(squared), [1, PRE_NORM_T_TILE])
-            delta = pl.sub(partial, compensation)
-            next_sum = pl.add(sq_sum, delta)
-            compensation = pl.sub(pl.sub(next_sum, sq_sum), delta)
-            sq_sum = next_sum
+            sq_sum[0:1, 0:PRE_NORM_T_TILE] = pl.add(sq_sum, partial)
         rms_arg = pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)
         inverse = pl.rsqrt(rms_arg, high_precision=True)
         inverse = pl.reshape(inverse, [PRE_NORM_T_TILE, 1])
