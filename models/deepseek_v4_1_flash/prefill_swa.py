@@ -119,6 +119,9 @@ def prefill_swa_attention(
     chunk_indices = pl.create_tensor([QUERY_TILE, 128], dtype=pl.INT32)
     qr = pl.create_tensor([QUERY_TILE, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    proj_rows = ((QUERY_TILE + 79) // 80) * 80
+    qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     descriptors = pl.create_tensor([QUERY_TILE, RUN_PARTS, RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
     attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
@@ -136,12 +139,12 @@ def prefill_swa_attention(
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
         q_input_payload, q_input_scales = quantize_projection_input(chunk_x, active)
-        q_proj_rope(
+        q_proj_result = q_proj_rope(
             q_input_payload, q_input_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             chunk_cos, chunk_sin,
-            qr, q,
+            qr, q, qb_payload, qb_scales,
             active,
         )
         index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
@@ -150,7 +153,7 @@ def prefill_swa_attention(
             descriptors, chunk_indices, attn_sink,
             attended, active, decoded_ready, index_ready,
         )
-        o_proj(
+        o_proj_result = o_proj(
             attended, wo_a, wo_a_scale, wo_b,
             wo_b_scale, chunk_cos, chunk_sin,
             chunk_partial, active,
