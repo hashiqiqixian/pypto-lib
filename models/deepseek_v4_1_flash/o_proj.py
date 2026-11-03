@@ -56,9 +56,9 @@ D_TILE = 512
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_rope_quant_vf.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _rope_quant_o_vf(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    attended: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
     payload: pl.Out[pl.Tensor[[LOCAL_O_GROUPS * 80, O_GROUP_IN], pl.FP8E4M3FN]],
     scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], pl.FP8E8M0]],
     active_rows: pl.Scalar[pl.INT32],
