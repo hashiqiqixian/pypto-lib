@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, ORI_BLOCKS_DYN, TP_SIZE, T_DYN
+from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN, TP_SIZE, T_DYN
 from o_proj import o_proj
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 
@@ -34,8 +34,8 @@ SOFTMAX_SCALE = HEAD_DIM**-0.5
 def gather_dspark_window(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    indices: pl.Tensor,
-    selected: pl.Tensor,
+    indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
+    selected: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     cache_rows = pl.tensor.dim(cache, 0) * 128
@@ -60,11 +60,11 @@ def gather_dspark_window(
 
 @pl.jit.inline
 def attend_dspark_window(
-    query: pl.Tensor,
-    selected: pl.Tensor,
-    indices: pl.Tensor,
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    selected: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor,
+    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(query, 0)
@@ -116,7 +116,7 @@ def attend_dspark_window(
 
 @pl.jit.inline(auto_scope=False)
 def dspark_attention(
-    x: pl.Tensor,
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
@@ -130,16 +130,16 @@ def dspark_attention(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor,
-    rope_sin: pl.Tensor,
-    window_slots: pl.Tensor,
-    window_indices: pl.Tensor,
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    output: pl.Tensor,
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    tokens = pl.tensor.dim(x, 0)
+    tokens = MOE_TOKENS
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
@@ -229,6 +229,12 @@ def make_attention_inputs(seed: int = 43):
         128, 130 + DSPARK_QUERY_WIDTH, dtype=torch.int32
     )
     values["window_indices"] = indices
+    for name in ("x", "rope_cos", "rope_sin", "window_slots", "window_indices"):
+        current = values[name]
+        fill = -1 if name in ("window_slots", "window_indices") else 0
+        padded = torch.full((MOE_TOKENS, *current.shape[1:]), fill, dtype=current.dtype)
+        padded[:DSPARK_QUERY_WIDTH] = current
+        values[name] = padded
     return values
 
 
@@ -249,8 +255,14 @@ if __name__ == "__main__":
     values = make_attention_inputs()
 
     def golden(tensors):
-        output, cache, cache_scale = swa_official_reference(tensors, key_tile=64)
-        tensors["output"].copy_(output)
+        row_inputs = ("x", "rope_cos", "rope_sin", "window_slots", "window_indices")
+        reference_inputs = {
+            name: tensors[name][:DSPARK_QUERY_WIDTH] if name in row_inputs else tensors[name]
+            for name in SWA_INPUT_NAMES
+        }
+        output, cache, cache_scale = swa_official_reference(reference_inputs, key_tile=64)
+        tensors["output"].zero_()
+        tensors["output"][:DSPARK_QUERY_WIDTH].copy_(output)
         tensors["window_cache"].copy_(cache)
         tensors["window_cache_scale"].copy_(cache_scale)
 
@@ -260,7 +272,7 @@ if __name__ == "__main__":
     specs = [TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=values[name])
              for name in SWA_INPUT_NAMES]
     specs += [
-        TensorSpec("output", [DSPARK_QUERY_WIDTH, D], torch.bfloat16),
+        TensorSpec("output", [MOE_TOKENS, D], torch.bfloat16),
         ScalarSpec("num_tokens", torch.int32, DSPARK_QUERY_WIDTH, compile_runtime=True),
     ]
     result = run(
