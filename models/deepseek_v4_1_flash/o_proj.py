@@ -154,7 +154,7 @@ def o_proj(
         # O-B projection.
         capacity = pl.tensor.dim(output_group, 0)
         with pl.spmd(D // O_B_N_TILE, name_hint="proj_o_b"):
-            output_group = _o_proj_b(
+            output_group_result = _o_proj_b(
                 payload, wo_b, activation_scale_backing, wo_b_scale, output_group, capacity, LOCAL_O_WIDTH,
             )
     return output
