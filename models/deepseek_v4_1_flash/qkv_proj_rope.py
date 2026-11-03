@@ -283,7 +283,7 @@ def _norm_rope_publish(
     cache: pl.InOut[pl.Tensor],
     scales: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
+) -> tuple[pl.Tensor, pl.Tensor]:
     """Normalize and rotate BF16 rows, then quantize and publish group-32 FP8 cache pages."""
     ...
 
@@ -327,7 +327,7 @@ def window_publish(
     blocks = pl.tensor.dim(cache_scale, 0)
     local_scales = pl.create_tensor([blocks, 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
     with pl.spmd(workers, name_hint="norm_rope_pub_win", deps=[cache_ready]) as published:
-        cache = _norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, local_scales, num_tokens)
+        cache, local_scales = _norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, local_scales, num_tokens)
     local_rows = pl.reshape(local_scales, [blocks * 128, HEAD_DIM // 32])
     output_rows = pl.reshape(cache_scale, [blocks * 128, HEAD_DIM // 32])
     with pl.spmd(1, name_hint="publish_window_scales", deps=[published]) as completed:
