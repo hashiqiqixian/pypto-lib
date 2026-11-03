@@ -232,20 +232,20 @@ def c2a_compressor_publish(
                     position = first_position + begin - start
                     native_block = pl.cast(-1, pl.INT32)
                     if block >= 0 and block < blocks:
-                        native_block = block * (STATE_CAPACITY // 4) + position // 4 % (STATE_CAPACITY // 4)
+                        native_block = pl.cast(block * (STATE_CAPACITY // 4) + position // 4 % (STATE_CAPACITY // 4), pl.INT32)
                     pl.write(mapped_starts, [count], pl.cast(begin, pl.INT32))
                     pl.write(mapped_starts, [count + 1], pl.cast(limit, pl.INT32))
                     pl.write(mapped_blocks, [count, 0], native_block)
                     for token in pl.range(begin, limit):
                         if pl.read(token_to_req_indices, [token]) == request:
                             pl.write(mapped_requests, [token], count)
-                    count = count + 1
+                    count = pl.cast(count + 1, pl.INT32)
     workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
     with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
         _c2a_compress(
             kv_proj, score_proj, native_state, position_ids, norm_weight, latent,
             mapped_starts, mapped_requests, mapped_blocks,
-            slots, cosine, sine, cache, scales, active_tokens, blocks * (STATE_CAPACITY // 4),
+            slots, cosine, sine, cache, scales, active_tokens, pl.cast(native_blocks, pl.INT32),
         )
     return completed
 
