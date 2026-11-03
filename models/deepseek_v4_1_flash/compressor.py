@@ -210,7 +210,8 @@ def c2a_compressor_publish(
     native_blocks = pl.tensor.dim(state_cache, 0) * (STATE_CAPACITY // 4)
     native_state = pl.reshape(state_cache, [native_blocks, 4, STATE_WIDTH])
     with pl.spmd(1, name_hint="c2a_four_slot_requests", deps=[state_ready]) as mapped:
-        for row in pl.range(tokens):
+        worker = pl.tile.get_block_idx()
+        for row in pl.range(worker, tokens):
             pl.write(mapped_requests, [row], pl.cast(-1, pl.INT32))
         for group in pl.range(groups):
             pl.write(mapped_starts, [group], active_tokens)

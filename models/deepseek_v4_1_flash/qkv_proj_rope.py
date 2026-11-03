@@ -331,7 +331,8 @@ def window_publish(
     local_rows = pl.reshape(local_scales, [blocks * 128, HEAD_DIM // 32])
     output_rows = pl.reshape(cache_scale, [blocks * 128, HEAD_DIM // 32])
     with pl.spmd(1, name_hint="publish_window_scales", deps=[published]) as completed:
-        for token in pl.range(num_tokens):
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens):
             slot = pl.read(slots, [token])
             if slot >= 0 and slot < blocks * 128:
                 scale = pl.load(local_rows, [slot, 0], [1, HEAD_DIM // 32])
