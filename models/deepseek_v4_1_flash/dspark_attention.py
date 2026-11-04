@@ -12,7 +12,7 @@ import pypto.language as pl
 
 from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN, TP_SIZE
 from o_proj import o_proj
-from qkv_proj_rope import projection_padded_rows, quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 
 
 D = FLASH.hidden_size
@@ -142,15 +142,12 @@ def dspark_attention(
     qr = pl.create_tensor([MOE_TOKENS, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-    proj_rows = projection_padded_rows(MOE_TOKENS)
-    qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
-    qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     q_proj_result = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
-        qr, q, qb_payload, qb_scales,
+        qr, q,
         num_tokens,
     )
     kv_projection = pl.create_tensor([MOE_TOKENS, HEAD_DIM], dtype=pl.BF16)

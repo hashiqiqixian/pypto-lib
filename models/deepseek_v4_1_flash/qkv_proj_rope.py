@@ -38,12 +38,6 @@ PROJ_M_TILE = 80
 WINDOW_PUBLISH_WORKER_TILE = 12
 
 
-@pl.jit.inline(auto_scope=False)
-def projection_padded_rows(capacity: pl.Scalar[pl.INDEX]):
-    """Return the physical M80 row capacity used by Q/KV input quantization."""
-    return ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
-
-
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _proj_q_a(
@@ -125,7 +119,7 @@ def quantize_projection_input(
 ):
     """Quantize shared Q/KV input into M80-padded payload and M16-packed scales."""
     capacity = pl.tensor.dim(x, 0)
-    padded_rows = projection_padded_rows(capacity)
+    padded_rows = ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
     payload = pl.create_tensor([padded_rows, D], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, padded_rows * (D // 32)], dtype=pl.FP8E8M0)
     quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
@@ -148,11 +142,12 @@ def q_proj_rope(
     rope_sin: pl.Tensor,
     query_latent: pl.Tensor,
     query: pl.Tensor,
-    qb_payload: pl.Tensor,
-    qb_scales: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Project NZ QA/QB weights, rotate Q, and retain M80 QB input for Index-Q."""
+    payload_rows = pl.tensor.dim(payload, 0)
+    qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
         group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
         group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])

@@ -240,6 +240,7 @@ def prefill_moe(
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
             data_arrived, num_tokens, ep_rank, moe_epoch,
+            local_experts=N_LOCAL_EXPERTS, topk=TOPK,
         )
 
         scatter_done = expert_routed_scatter(
@@ -555,6 +556,7 @@ def prefill_moe_sublayer(
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
             data_arrived, local_num_tokens, ep_rank, moe_epoch,
+            local_experts=N_LOCAL_EXPERTS, topk=TOPK,
         )
 
         scatter_done = expert_routed_scatter(

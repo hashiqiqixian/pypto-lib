@@ -246,7 +246,7 @@ def dispatch(
     _push_tid = push_dispatch_payload(
         indices, x_norm_mx, x_norm_scale, weights,
         recv_x, recv_scale, recv_weights, recv_routes,
-        num_tokens, my_rank, stage_anchor,
+        num_tokens, my_rank, stage_anchor, local_experts=local_experts, topk=topk,
     )
     # Publish one epoch only after every local payload store completes.
     with pl.at(
