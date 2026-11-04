@@ -125,7 +125,7 @@ def prefill_swa_attention(
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
         q_input_payload, q_input_scales = quantize_projection_input(chunk_x, active)
-        q_proj_result = q_proj_rope(
+        q_proj_rope(
             q_input_payload, q_input_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,

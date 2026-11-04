@@ -21,7 +21,6 @@ with it.
 """
 
 import argparse
-import functools
 import math
 import os
 import pypto.language as pl
@@ -141,7 +140,7 @@ def prefill_c2a_full_attention(
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-    q_proj_result = q_proj_rope(
+    q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -930,30 +929,25 @@ class StagedAttentionReference:
         return staged
 
 
-def make_compare(mode, world_size, tokens, initial_state, *, reference=golden_reference_c2a):
-    """Check window publication on the device input and other outputs end to end."""
-    attention = StagedAttentionReference(
-        mode, initial_state,
-        attention_reference=functools.partial(reference_attention, reference=reference),
-        state_names=("window_cache", "window_cache_scale"),
-    )
+def make_compare(mode, world_size, tokens):
+    """Compare the final outputs and published state with the default comparators."""
     compare = {
         "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
         "attn_output": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         "x_hc_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
-        "window_cache": attention.compare("window_cache", mapped_pool_ratio_allclose(
+        "window_cache": mapped_pool_ratio_allclose(
             "window_slots", pool_name="window_cache",
             mapping_shape=(world_size, tokens),
             block_size=BLOCK_SIZE, leading_rank_axis=True,
             atol=0.0, rtol=0.0, max_error_ratio=0.01,
-        )),
-        "window_cache_scale": attention.compare("window_cache_scale", mapped_pool_ratio_allclose(
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
             "window_slots", pool_name="window_cache_scale",
             mapping_shape=(world_size, tokens),
             block_size=BLOCK_SIZE, leading_rank_axis=True,
             atol=0.0, rtol=0.0, max_error_ratio=0.0,
-        )),
+        ),
     }
     if mode == "full":
         compare["topk_indices"] = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02)
@@ -1354,7 +1348,7 @@ if __name__ == "__main__":
             # Full retains the K-chunk products for both compressor projections.
             ring_heap=PREFILL_C2A_FULL_RING_HEAP,
         ),
-        compare_fn=make_compare("full", len(devices), args.tokens, initial_state),
+        compare_fn=make_compare("full", len(devices), args.tokens),
     )
     if args.compile_only and result.passed:
         print("[C2A-HC] Compilation passed; device accuracy was NOT validated.")
