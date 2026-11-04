@@ -99,7 +99,7 @@ def prefill_c2a_reuse_attention(
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-    q_proj_rope(
+    q_proj_result = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -588,7 +588,9 @@ if __name__ == "__main__":
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
             ring_heap=PREFILL_ATTN_RING_HEAP,
         ),
-        compare_fn=make_compare("reuse", len(devices), args.tokens),
+        compare_fn=make_compare(
+            "reuse", len(devices), args.tokens, initial_state, reference=golden_reference_c2a_reuse,
+        ),
     )
     if args.compile_only and result.passed:
         print("[C2A-HC] Compilation passed; device accuracy was NOT validated.")
