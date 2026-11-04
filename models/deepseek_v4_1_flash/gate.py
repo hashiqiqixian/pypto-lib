@@ -20,7 +20,7 @@ from config import FLASH as M
 from config import MOE_TOKENS, EP_SIZE, N_LOCAL_EXPERTS
 
 
-from rmsnorm import rms_norm_bf16
+from rmsnorm import rms_norm_tiled
 
 
 # model config
@@ -35,7 +35,6 @@ N_HASH_LAYERS = 0
 # tiling
 GATE_T_TILE = 8
 GATE_INPUT_TILE = 8
-GATE_NORM_TILE = 2
 assert T % GATE_T_TILE == 0
 GATE_M_TILE = 16
 GATE_N_TILE = 16
@@ -311,9 +310,19 @@ def gate(
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     active_tokens = pl.max(active_tokens, 0)
     active_tokens = pl.min(active_tokens, T)
+    padded = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
+    for block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="gate_input_padding"):
+        start = block * GATE_INPUT_TILE
+        valid_rows = pl.min(GATE_INPUT_TILE, pl.max(active_tokens - start, 0))
+        if valid_rows > 0:
+            source = pl.slice(x_mixed, [GATE_INPUT_TILE, D], [start, 0], valid_shape=[valid_rows, D], clamp=True)
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), GATE_INPUT_TILE, D)
+            padded[start : start + GATE_INPUT_TILE, :] = source
+        else:
+            padded[start : start + GATE_INPUT_TILE, :] = pl.full([GATE_INPUT_TILE, D], dtype=pl.BF16, value=0.0)
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
-    with pl.spmd(T_PAD // GATE_NORM_TILE, name_hint="rms_norm"):
-        xg_buf = rms_norm_bf16(x_mixed, norm_w, xg_buf, active_tokens)
+    for norm_block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="rms_norm"):
+        rms_norm_tiled(padded, norm_w, xg_buf, norm_block, pl.cast(T_PAD, pl.INT32), output_fp32=False)
     return gate_from_bf16(
         xg_buf, gate_w, gate_bias, num_tokens,
         x_norm_mx, x_norm_scale, indices, weights, n_experts=n_experts, topk=topk,
