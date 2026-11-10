@@ -690,6 +690,18 @@ def l2_decode_fwd_dspark(
     rank: pl.Scalar[pl.INT32],
 ):
     """Verify one rank's draft block and publish its next proposals."""
+    # Invocation-local target metadata and hidden buffers.
+    local_x_hc = pl.create_tensor([PADDED_ROWS, HC_MULT, D], dtype=pl.FP32)
+    local_pre_mix = pl.create_tensor([PADDED_ROWS, HC_MULT], dtype=pl.FP32)
+    local_position_ids = pl.create_tensor([PADDED_ROWS], dtype=pl.INT32)
+    local_request_ids = pl.create_tensor([PADDED_ROWS], dtype=pl.INT32)
+    local_window_slots = pl.create_tensor([PADDED_ROWS], dtype=pl.INT64)
+    local_window_indices = pl.create_tensor([PADDED_ROWS, WINDOW], dtype=pl.INT32)
+    local_c2a_slots = pl.create_tensor([PADDED_ROWS], dtype=pl.INT64)
+    local_c1a_slots = pl.create_tensor([PADDED_ROWS], dtype=pl.INT64)
+    local_query_starts = pl.create_tensor([BATCH + 1], dtype=pl.INT32)
+    local_target_hidden_padded = pl.create_tensor([PADDED_ROWS, TARGET_FWD_DSPARK_MAIN_IN], dtype=pl.BF16)
+
     target_embedding_weight.bind_dynamic(0, VOCAB_DYN)
     target_window_table.bind_dynamic(1, WINDOW_TABLE_DYN)
     target_c2a_table.bind_dynamic(1, FWD_C2A_TABLE_DYN)
@@ -727,24 +739,24 @@ def l2_decode_fwd_dspark(
     # Prepare target decode.
     prepare_target_decode(
         input_ids, target_positions, active_widths, target_embedding_weight,
-        target_window_table, target_c2a_table, target_c1a_table, x_hc,
-        pre_mix, position_ids, request_ids, window_slots, window_indices,
-        c2a_slots, c1a_slots, query_starts,
+        target_window_table, target_c2a_table, target_c1a_table, local_x_hc,
+        local_pre_mix, local_position_ids, local_request_ids, local_window_slots, local_window_indices,
+        local_c2a_slots, local_c1a_slots, local_query_starts,
     )
 
     # Decode fwd.
     decode_fwd(
-        engram_lookup, engram_wkv, engram_wkv_scale, engram_weight, x_hc,
-        pre_mix, target_hidden_padded, hc_attn_fn, hc_attn_scale,
+        engram_lookup, engram_wkv, engram_wkv_scale, engram_weight, local_x_hc,
+        local_pre_mix, local_target_hidden_padded, hc_attn_fn, hc_attn_scale,
         hc_attn_base, attn_norm_weight, wq_a, q_norm_weight, wq_b,
         wkv, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b,
-        freqs_cos, freqs_sin, window_slots, window_indices,
+        freqs_cos, freqs_sin, local_window_slots, local_window_indices,
         window_cache_pool, window_cache_scale_pool, compressed_cache_pool,
-        compressed_cache_scale_pool, request_ids, position_ids, index_cache_pool,
+        compressed_cache_scale_pool, local_request_ids, local_position_ids, index_cache_pool,
         index_cache_scale_pool, c2a_index_block_table, c1a_index_block_table,
         c2a_compressor_wkv, c2a_compressor_wgate, c1a_compressor_wkv,
-        query_starts, state_block_table, state_cache_pool,
-        compressor_norm_weight, c2a_slots, c1a_slots, index_wk,
+        local_query_starts, state_block_table, state_cache_pool,
+        compressor_norm_weight, local_c2a_slots, local_c1a_slots, index_wk,
         index_norm_weight, index_wq_b, index_weights_proj, hc_ffn_fn,
         hc_ffn_scale, hc_ffn_base, ffn_norm_weight, gate_weight,
         correction_bias, routed_w1, routed_w2, routed_w3, shared_w1,
@@ -761,7 +773,7 @@ def l2_decode_fwd_dspark(
 
     # Sample target.
     sample_target(
-        x_hc, pre_mix, final_norm_weight, lm_head_weight, active_widths,
+        local_x_hc, local_pre_mix, final_norm_weight, lm_head_weight, active_widths,
         target_sampled_ids, sampling_hidden_window, sampling_hidden_done, sampling_logits_window,
         sampling_logits_done, rank,
     )
@@ -775,7 +787,7 @@ def l2_decode_fwd_dspark(
     )
 
     # Copy target hidden.
-    copy_target_hidden(target_hidden_padded, target_hidden)
+    copy_target_hidden(local_target_hidden_padded, target_hidden)
 
     # Prepare drafter geometry.
     prepare_drafter_geometry(
