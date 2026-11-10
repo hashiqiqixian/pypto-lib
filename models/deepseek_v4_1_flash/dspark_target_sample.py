@@ -37,6 +37,8 @@ def sample_target(
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     active_widths: pl.Tensor[[MAX_BATCH_PER_DP], pl.INT32],
     sampled_ids: pl.Out[pl.Tensor[[ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    collapsed: pl.Tensor,
+    normalized: pl.Tensor,
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
@@ -44,9 +46,7 @@ def sample_target(
     rank: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x_hc, 0)
-    collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
-    normalized = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd((tokens + 7) // 8, name_hint="dspark_target_final_norm") as ready:
         block = pl.tile.get_block_idx()
         rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, block, tokens)
@@ -97,7 +97,11 @@ def sample_target_rank(
 ):
     x_hc.bind_dynamic(0, TARGET_T_DYN)
     pre_mix.bind_dynamic(0, TARGET_T_DYN)
+    tokens = pl.tensor.dim(x_hc, 0)
+    collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    normalized = pl.create_tensor([tokens, D], dtype=pl.BF16)
     return sample_target(
         x_hc, pre_mix, final_norm_weight, lm_head_weight, active_widths, sampled_ids,
+        collapsed, normalized,
         hidden_window, hidden_done, logits_window, logits_done, rank,
     )
