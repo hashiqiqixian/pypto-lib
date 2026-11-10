@@ -29,7 +29,7 @@ if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
 
 
 from config import (
-    FLASH as M, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, COMPRESSED_CACHE_GROUP,
+    FLASH as M, TP_SIZE, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, COMPRESSED_CACHE_GROUP,
     DECODE_MAX_TOKENS, DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
     MOE_TOKENS, DSPARK_DRAFT_LAYERS, DSPARK_LAST_TARGET_LAYER, DSPARK_TARGET_LAYER_IDS,
 )
@@ -212,7 +212,7 @@ def decode_encoder(
     position_ids.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(1, ROPE_ROWS_DYN)
-    global_tokens = tokens * C.TP_SIZE
+    global_tokens = tokens * TP_SIZE
     compressed_token_rope_cos = pl.slice(token_rope_cos, [global_tokens, ROPE_DIM // 2], [0, 0])
     compressed_token_rope_sin = pl.slice(token_rope_sin, [global_tokens, ROPE_DIM // 2], [0, 0])
     base_rope_cos = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
@@ -506,7 +506,7 @@ def decode_decoder(
     state_cache_pool.bind_dynamic(0, FWD_STATE_BLOCKS_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
     position_ids.bind_dynamic(0, T_DYN)
-    global_tokens = tokens * C.TP_SIZE
+    global_tokens = tokens * TP_SIZE
     compressed_token_rope_cos = pl.slice(token_rope_cos, [global_tokens, ROPE_DIM // 2], [0, 0])
     compressed_token_rope_sin = pl.slice(token_rope_sin, [global_tokens, ROPE_DIM // 2], [0, 0])
     c1a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
