@@ -45,9 +45,9 @@ def _sample_target_rank(
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
-    collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    collapsed: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16] = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
-    normalized = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    normalized: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16] = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd((tokens + 7) // 8, name_hint="dspark_target_final_norm") as ready:
         block = pl.tile.get_block_idx()
         rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, block, tokens)
