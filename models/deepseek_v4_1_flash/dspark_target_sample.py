@@ -50,6 +50,7 @@ def sample_target(
     with pl.spmd((tokens + 7) // 8, name_hint="dspark_target_final_norm") as ready:
         block = pl.tile.get_block_idx()
         rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, block, tokens)
+    lm_hidden = pl.reshape(normalized, [tokens, D])
     row_indices = pl.create_tensor([MAX_LOGIT_ROWS], dtype=pl.INT32)
     logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
     chunk_ids = pl.create_tensor([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32)
@@ -67,7 +68,7 @@ def sample_target(
                         selected = pl.cast(global_row, pl.INT32)
                 pl.write(row_indices, [row], selected)
         lm_head_with_sampling(
-            normalized, lm_head_weight, row_indices, logits, chunk_ids,
+            lm_hidden, lm_head_weight, row_indices, logits, chunk_ids,
             hidden_window, hidden_done, logits_window, logits_done,
             rank, pl.cast(0, pl.INT32), pl.cast(chunk + 1, pl.INT32), pl.cast(CHUNKS, pl.INT32),
         )
