@@ -11,7 +11,7 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from config import DECODE_ROWS_PER_REQUEST, FLASH, MAX_BATCH_PER_DP, TP_SIZE
+from config import DECODE_ROWS_PER_REQUEST, FLASH, MAX_BATCH_PER_DP, TP_SIZE, LOCAL_T_DYN
 from hc import hc_head
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, lm_head_with_sampling
 from rmsnorm import rms_norm_tiled_compensated
@@ -21,7 +21,7 @@ D = FLASH.hidden_size
 HC_MULT = FLASH.hc_mult
 ROWS = MAX_BATCH_PER_DP * DECODE_ROWS_PER_REQUEST
 CHUNKS = (ROWS + MAX_LOGIT_ROWS - 1) // MAX_LOGIT_ROWS
-TARGET_T_DYN = pl.dynamic("V41_DSPARK_TARGET_T_DYN")
+TARGET_T_DYN = LOCAL_T_DYN
 
 assert CHUNKS == 5
 
@@ -30,8 +30,8 @@ if TP_SIZE != 1:
 
 
 def _sample_target_rank(
-    x_hc: pl.Tensor[[TARGET_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[TARGET_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     active_widths: pl.Tensor[[MAX_BATCH_PER_DP], pl.INT32],
@@ -42,6 +42,8 @@ def _sample_target_rank(
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
 ):
+    x_hc.bind_dynamic(0, LOCAL_T_DYN)
+    pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
     collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
