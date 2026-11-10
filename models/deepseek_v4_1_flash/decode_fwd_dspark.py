@@ -44,11 +44,11 @@ import dspark_drafter as draft
 import dspark_markov as markov
 import dspark_state as state_ops
 import dspark_target_sample as sampling
-from dspark_state import accept_target_rank, commit_drafts_rank, prepare_drafter_geometry_rank, prepare_target_rank
-from decode_fwd import l2_decode_fwd
-from dspark_target_sample import sample_target_rank
-from dspark_drafter import l2_dspark_drafter
-from dspark_markov import l2_markov_sample_from_hidden
+from dspark_state import accept_target, commit_drafts, prepare_drafter_geometry, prepare_target
+from decode_fwd import decode_fwd
+from dspark_target_sample import sample_target
+from dspark_drafter import dspark_drafter
+from dspark_markov import markov_sample_from_hidden
 from input_pack import VOCAB_DYN, pack_x_hc
 
 
@@ -66,8 +66,7 @@ if TP_SIZE != 1:
     raise ValueError("V4.1 DSpark recurrent entry currently requires TP1")
 
 
-@pl.jit
-def prepare_target_decode_rank(
+def _prepare_target_decode_rank(
     input_ids: pl.Tensor[[BATCH, ROWS], pl.INT64],
     positions: pl.Tensor[[BATCH, ROWS], pl.INT32],
     active_widths: pl.Tensor[[BATCH], pl.INT32],
@@ -152,6 +151,9 @@ def prepare_target_decode_rank(
     pack_x_hc(padded_ids, embedding_weight, x_hc, hidden_tile=512)
     return x_hc, pre_mix
 
+prepare_target_decode = pl.jit.inline(auto_scope=False)(_prepare_target_decode_rank)
+prepare_target_decode_rank = pl.jit(auto_scope=False)(_prepare_target_decode_rank)
+
 
 @pl.jit.host
 def l3_prepare_target_decode(
@@ -185,14 +187,16 @@ def l3_prepare_target_decode(
         )
 
 
-@pl.jit
-def copy_target_hidden_rank(
+def _copy_target_hidden_rank(
     padded: pl.Tensor[[PADDED_ROWS, MAIN_IN], pl.BF16],
     compact: pl.Out[pl.Tensor[[TARGET_ROWS, MAIN_IN], pl.BF16]],
 ):
     for row in pl.spmd(TARGET_ROWS, name_hint="dspark_compact_target_hidden"):
         compact[row : row + 1, :] = padded[row : row + 1, :]
     return compact
+
+copy_target_hidden = pl.jit.inline(auto_scope=False)(_copy_target_hidden_rank)
+copy_target_hidden_rank = pl.jit(auto_scope=False)(_copy_target_hidden_rank)
 
 
 @pl.jit.host
@@ -717,13 +721,13 @@ def l2_decode_fwd_dspark(
     confidences.bind_dynamic(0, MARKOV_B_DYN)
 
     # Prepare target.
-    prepare_target_rank(
+    prepare_target(
         slot_ids, generations, state_tokens, state_meta, input_ids,
         target_positions, active_widths,
     )
 
     # Prepare target decode.
-    prepare_target_decode_rank(
+    prepare_target_decode(
         input_ids, target_positions, active_widths, target_embedding_weight,
         target_window_table, target_c2a_table, target_c1a_table, x_hc,
         pre_mix, position_ids, request_ids, window_slots, window_indices,
@@ -731,7 +735,7 @@ def l2_decode_fwd_dspark(
     )
 
     # Decode fwd.
-    l2_decode_fwd(
+    decode_fwd(
         engram_lookup, engram_wkv, engram_wkv_scale, engram_weight, x_hc,
         pre_mix, target_hidden_padded, hc_attn_fn, hc_attn_scale,
         hc_attn_base, attn_norm_weight, wq_a, q_norm_weight, wq_b,
@@ -758,14 +762,14 @@ def l2_decode_fwd_dspark(
     )
 
     # Sample target.
-    sample_target_rank(
+    sample_target(
         x_hc, pre_mix, final_norm_weight, lm_head_weight, active_widths,
         target_sampled_ids, sampling_hidden_window, sampling_hidden_done, sampling_logits_window,
         sampling_logits_done, rank,
     )
 
     # Accept target.
-    accept_target_rank(
+    accept_target(
         slot_ids, generations, active_widths, target_sampled_ids,
         state_tokens, state_meta, accepted_ids, accepted_counts,
         context_valid, context_positions, num_sampled, last_sampled,
@@ -773,17 +777,17 @@ def l2_decode_fwd_dspark(
     )
 
     # Copy target hidden.
-    copy_target_hidden_rank(target_hidden_padded, target_hidden)
+    copy_target_hidden(target_hidden_padded, target_hidden)
 
     # Prepare drafter geometry.
-    prepare_drafter_geometry_rank(
+    prepare_drafter_geometry(
         context_valid, context_positions, first_query_positions, draft_table,
         draft_cos, draft_sin, context_slots, context_rope_cos,
         context_rope_sin, query_rope_cos, query_rope_sin,
     )
 
     # Dspark drafter.
-    l2_dspark_drafter(
+    dspark_drafter(
         target_hidden, draft_main_proj_weight, draft_main_norm_weight,
         num_sampled, last_sampled, zero_prefill_tokens, anchor_ids,
         first_query_positions, draft_table, context_slots, context_rope_cos,
@@ -806,7 +810,7 @@ def l2_decode_fwd_dspark(
     )
 
     # Markov sample from hidden.
-    l2_markov_sample_from_hidden(
+    markov_sample_from_hidden(
         draft_head_hidden, markov_final_norm_weight, markov_lm_head_weight,
         num_sampled, last_sampled, zero_prefill_tokens, anchor_ids,
         markov_markov_w1, markov_markov_w2, markov_confidence_weight, draft_ids,
@@ -815,7 +819,7 @@ def l2_decode_fwd_dspark(
     )
 
     # Commit drafts.
-    commit_drafts_rank(
+    commit_drafts(
         slot_ids, generations, draft_ids, state_tokens, state_meta,
         committed,
     )

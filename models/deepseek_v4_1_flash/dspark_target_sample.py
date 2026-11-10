@@ -29,8 +29,7 @@ if TP_SIZE != 1:
     raise ValueError("DSpark target row sampling currently requires TP1")
 
 
-@pl.jit
-def sample_target_rank(
+def _sample_target_rank(
     x_hc: pl.Tensor[[TARGET_T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[TARGET_T_DYN, HC_MULT], pl.FP32],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
@@ -81,3 +80,6 @@ def sample_target_rank(
             sampled_ids[global_row : global_row + 1, :] = chunk_ids[row : row + 1, :]
         ready = published
     return sampled_ids
+
+sample_target = pl.jit.inline(auto_scope=False)(_sample_target_rank)
+sample_target_rank = pl.jit(auto_scope=False)(_sample_target_rank)
