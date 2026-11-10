@@ -509,20 +509,20 @@ def l2_decode_fwd_dspark(
     target_window_table: pl.Tensor[[BATCH, WINDOW_TABLE_DYN], pl.INT32],
     target_c2a_table: pl.Tensor[[BATCH, FWD_C2A_TABLE_DYN], pl.INT32],
     target_c1a_table: pl.Tensor[[BATCH, FWD_C1A_TABLE_DYN], pl.INT32],
-    x_hc: pl.Out[pl.Tensor[[TARGET_FWD_LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    pre_mix: pl.Out[pl.Tensor[[TARGET_FWD_LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    position_ids: pl.Out[pl.Tensor[[TARGET_FWD_LOCAL_T_DYN], pl.INT32]],
-    request_ids: pl.Out[pl.Tensor[[TARGET_FWD_LOCAL_T_DYN], pl.INT32]],
-    window_slots: pl.Out[pl.Tensor[[TARGET_FWD_LOCAL_T_DYN], pl.INT64]],
-    window_indices: pl.Out[pl.Tensor[[TARGET_FWD_LOCAL_T_DYN, WINDOW], pl.INT32]],
-    c2a_slots: pl.Out[pl.Tensor[[TARGET_FWD_LOCAL_T_DYN], pl.INT64]],
-    c1a_slots: pl.Out[pl.Tensor[[TARGET_FWD_LOCAL_T_DYN], pl.INT64]],
+    x_hc: pl.Out[pl.Tensor[[PADDED_ROWS, HC_MULT, D], pl.FP32]],
+    pre_mix: pl.Out[pl.Tensor[[PADDED_ROWS, HC_MULT], pl.FP32]],
+    position_ids: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT32]],
+    request_ids: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT32]],
+    window_slots: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT64]],
+    window_indices: pl.Out[pl.Tensor[[PADDED_ROWS, WINDOW], pl.INT32]],
+    c2a_slots: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT64]],
+    c1a_slots: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT64]],
     query_starts: pl.Out[pl.Tensor[[BATCH + 1], pl.INT32]],
-    engram_lookup: pl.Tensor[[2, TARGET_FWD_LOCAL_T_DYN, TARGET_FWD_ENGRAM_K], pl.BF16],
+    engram_lookup: pl.Tensor[[2, PADDED_ROWS, TARGET_FWD_ENGRAM_K], pl.BF16],
     engram_wkv: pl.Tensor[[2, TARGET_FWD_ENGRAM_K, TARGET_FWD_KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (TARGET_FWD_ENGRAM_K // 32), TARGET_FWD_KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
-    target_hidden_padded: pl.Out[pl.Tensor[[TARGET_FWD_LOCAL_T_DYN, TARGET_FWD_DSPARK_MAIN_IN], pl.BF16]],
+    target_hidden_padded: pl.Out[pl.Tensor[[PADDED_ROWS, TARGET_FWD_DSPARK_MAIN_IN], pl.BF16]],
     hc_attn_fn: pl.Tensor[[TARGET_FWD_WEIGHT_BANK_SIZE * TARGET_FWD_MIX_HC, TARGET_FWD_HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[TARGET_FWD_WEIGHT_BANK_SIZE * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[TARGET_FWD_WEIGHT_BANK_SIZE * TARGET_FWD_MIX_HC], pl.FP32],
@@ -690,20 +690,10 @@ def l2_decode_fwd_dspark(
     rank: pl.Scalar[pl.INT32],
 ):
     """Verify one rank's draft block and publish its next proposals."""
-    x_hc.bind_dynamic(0, TARGET_FWD_LOCAL_T_DYN)
-    pre_mix.bind_dynamic(0, TARGET_FWD_LOCAL_T_DYN)
-    position_ids.bind_dynamic(0, TARGET_FWD_LOCAL_T_DYN)
-    request_ids.bind_dynamic(0, TARGET_FWD_LOCAL_T_DYN)
-    window_slots.bind_dynamic(0, TARGET_FWD_LOCAL_T_DYN)
-    window_indices.bind_dynamic(0, TARGET_FWD_LOCAL_T_DYN)
-    c2a_slots.bind_dynamic(0, TARGET_FWD_LOCAL_T_DYN)
-    c1a_slots.bind_dynamic(0, TARGET_FWD_LOCAL_T_DYN)
     target_embedding_weight.bind_dynamic(0, VOCAB_DYN)
     target_window_table.bind_dynamic(1, WINDOW_TABLE_DYN)
     target_c2a_table.bind_dynamic(1, FWD_C2A_TABLE_DYN)
     target_c1a_table.bind_dynamic(1, FWD_C1A_TABLE_DYN)
-    engram_lookup.bind_dynamic(1, TARGET_FWD_LOCAL_T_DYN)
-    target_hidden_padded.bind_dynamic(0, TARGET_FWD_LOCAL_T_DYN)
     freqs_cos.bind_dynamic(1, TARGET_FWD_ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(1, TARGET_FWD_ROPE_ROWS_DYN)
     window_cache_pool.bind_dynamic(0, TARGET_FWD_FWD_ORI_BLOCKS_DYN)
