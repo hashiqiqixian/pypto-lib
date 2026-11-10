@@ -42,8 +42,6 @@ def _sample_target_rank(
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(0, TARGET_T_DYN)
-    pre_mix.bind_dynamic(0, TARGET_T_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
     collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
