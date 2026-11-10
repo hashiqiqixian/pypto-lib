@@ -772,8 +772,10 @@ def l2_decode_fwd_dspark(
     )
 
     # Sample target.
+    sample_hidden = pl.reshape(local_x_hc, [PADDED_ROWS, HC_MULT, D])
+    sample_pre_mix = pl.reshape(local_pre_mix, [PADDED_ROWS, HC_MULT])
     sample_target(
-        local_x_hc, local_pre_mix, final_norm_weight, lm_head_weight, active_widths,
+        sample_hidden, sample_pre_mix, final_norm_weight, lm_head_weight, active_widths,
         target_sampled_ids, sampling_hidden_window, sampling_hidden_done, sampling_logits_window,
         sampling_logits_done, rank,
     )
