@@ -212,7 +212,7 @@ def decode_encoder(
     position_ids.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(1, ROPE_ROWS_DYN)
-    global_tokens = pl.tensor.dim(position_ids, 0)
+    global_tokens = tokens * C.TP_SIZE
     compressed_token_rope_cos = pl.slice(token_rope_cos, [global_tokens, ROPE_DIM // 2], [0, 0])
     compressed_token_rope_sin = pl.slice(token_rope_sin, [global_tokens, ROPE_DIM // 2], [0, 0])
     base_rope_cos = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
@@ -506,7 +506,7 @@ def decode_decoder(
     state_cache_pool.bind_dynamic(0, FWD_STATE_BLOCKS_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
     position_ids.bind_dynamic(0, T_DYN)
-    global_tokens = pl.tensor.dim(position_ids, 0)
+    global_tokens = tokens * C.TP_SIZE
     compressed_token_rope_cos = pl.slice(token_rope_cos, [global_tokens, ROPE_DIM // 2], [0, 0])
     compressed_token_rope_sin = pl.slice(token_rope_sin, [global_tokens, ROPE_DIM // 2], [0, 0])
     c1a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
