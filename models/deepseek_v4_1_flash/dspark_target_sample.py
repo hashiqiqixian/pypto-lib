@@ -29,9 +29,10 @@ if TP_SIZE != 1:
     raise ValueError("DSpark target row sampling currently requires TP1")
 
 
-def _sample_target_rank(
-    x_hc: pl.Tensor[[TARGET_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[TARGET_T_DYN, HC_MULT], pl.FP32],
+@pl.jit.inline(auto_scope=False)
+def sample_target(
+    x_hc: pl.Tensor,
+    pre_mix: pl.Tensor,
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     active_widths: pl.Tensor[[MAX_BATCH_PER_DP], pl.INT32],
@@ -80,5 +81,23 @@ def _sample_target_rank(
     return sampled_ids
 
 
-sample_target = pl.jit.inline(auto_scope=False)(_sample_target_rank)
-sample_target_rank = pl.jit(auto_scope=False)(_sample_target_rank)
+@pl.jit(auto_scope=False)
+def sample_target_rank(
+    x_hc: pl.Tensor[[TARGET_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[TARGET_T_DYN, HC_MULT], pl.FP32],
+    final_norm_weight: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    active_widths: pl.Tensor[[MAX_BATCH_PER_DP], pl.INT32],
+    sampled_ids: pl.Out[pl.Tensor[[ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+):
+    x_hc.bind_dynamic(0, TARGET_T_DYN)
+    pre_mix.bind_dynamic(0, TARGET_T_DYN)
+    return sample_target(
+        x_hc, pre_mix, final_norm_weight, lm_head_weight, active_widths, sampled_ids,
+        hidden_window, hidden_done, logits_window, logits_done, rank,
+    )
