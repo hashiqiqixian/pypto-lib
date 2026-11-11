@@ -79,10 +79,13 @@ def hc_sinkhorn(
     """Normalize six independent HC matrices per vector worker."""
     tokens = pl.tensor.dim(pre_mix, 0)
     padded_rows = pl.tensor.dim(inv_rms, 0)
+    pre_view = pl.reshape(pre_mix, [tokens, HC_MULT])
+    post_view = pl.reshape(post_mix, [tokens, HC_MULT])
+    residual_view = pl.reshape(residual_mix, [tokens, HC_MULT, HC_MULT])
     blocks = (tokens + SINKHORN_T_TILE - 1) // SINKHORN_T_TILE
     workers = pl.min(blocks, SINKHORN_WORKER_TILE)
     with pl.spmd(workers, name_hint="mhc_sinkhorn") as ready:
-        _hc_sinkhorn(partials, inv_rms, scale, base, pre_mix, post_mix, residual_mix,
+        _hc_sinkhorn(partials, inv_rms, scale, base, pre_view, post_view, residual_view,
                      tokens, padded_rows, HC_EPS, HC_SINKHORN_ITER)
     return ready
 
