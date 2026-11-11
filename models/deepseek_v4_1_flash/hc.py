@@ -184,9 +184,12 @@ def hc_head_norm(
 ):
     """Collapse eight HC rows and normalize their rounded BF16 values."""
     tokens = pl.tensor.dim(x_hc, 0)
+    x_view = pl.reshape(x_hc, [tokens, HC_MULT, D])
+    pre_view = pl.reshape(pre_mix, [tokens, HC_MULT])
+    output_view = pl.reshape(output, [tokens, D])
     workers = pl.min((tokens + PRE_NORM_T_TILE - 1) // PRE_NORM_T_TILE, worker_limit)
     with pl.spmd(workers, name_hint="hc_collapse_norm") as ready:
-        hc_collapse_norm(x_hc, pre_mix, norm_weight, output, tokens)
+        hc_collapse_norm(x_view, pre_view, norm_weight, output_view, tokens)
     return ready
 
 
