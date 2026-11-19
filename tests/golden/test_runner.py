@@ -1921,6 +1921,12 @@ class TestGeneratedCppCache:
         expected = [] if selected_state == "fresh" else [cpp]
         assert _stale_cpps(tmp_path, platform=platform) == expected
 
+    def test_vpto_helper_is_validated_by_runtime_cache(self, tmp_path):
+        kernel = self._kernel(tmp_path)
+        kernel["vpto_sources"] = ["helper.vpto"]
+        self._config(tmp_path, [kernel])
+        assert _stale_cpps(tmp_path, platform="a5") == []
+
     def test_sidecar_stays_beside_registered_symlink(self, tmp_path):
         kernel = self._kernel(tmp_path)
         cpp = Path(kernel["source"])

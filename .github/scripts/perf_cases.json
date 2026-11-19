@@ -417,33 +417,179 @@
       ]
     },
     {
-      "case_id": "dsv4.1-flash-decode-moe-ep8-b12-eplb",
+      "case_id": "dsv4.1-flash-decode-moe-b12-8k-ep16-ep4-proxy",
       "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
       "platform": "a5",
-      "device_count": 8,
+      "device_count": 4,
+      "target_ep": 16,
+      "batch_per_rank": 12,
+      "context_length": 8192,
+      "runtime_config": {
+        "ring_heap": 2147483648
+      },
       "arguments": [
         "--ep",
-        "8",
+        "4",
+        "--num-tokens",
+        "72",
+        "--experts-per-rank",
+        "24",
+        "--balanced-routing",
+        "--host-build-graph"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-moe-b12-8k-ep32-ep4-proxy",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
+      "platform": "a5",
+      "device_count": 4,
+      "target_ep": 32,
+      "batch_per_rank": 12,
+      "context_length": 8192,
+      "runtime_config": {
+        "ring_heap": 2147483648
+      },
+      "arguments": [
+        "--ep",
+        "4",
         "--num-tokens",
         "72",
         "--experts-per-rank",
         "12",
-        "--balanced-routing"
+        "--balanced-routing",
+        "--host-build-graph"
       ]
     },
     {
-      "case_id": "dsv4.1-flash-decode-moe-ep8-b64-eplb",
+      "case_id": "dsv4.1-flash-decode-moe-b12-128k-ep16-ep4-proxy",
       "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
       "platform": "a5",
-      "device_count": 8,
+      "device_count": 4,
+      "target_ep": 16,
+      "batch_per_rank": 12,
+      "context_length": 131072,
+      "runtime_config": {
+        "ring_heap": 2147483648
+      },
       "arguments": [
         "--ep",
-        "8",
+        "4",
+        "--num-tokens",
+        "72",
+        "--experts-per-rank",
+        "24",
+        "--balanced-routing",
+        "--host-build-graph"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-moe-b12-128k-ep32-ep4-proxy",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
+      "platform": "a5",
+      "device_count": 4,
+      "target_ep": 32,
+      "batch_per_rank": 12,
+      "context_length": 131072,
+      "runtime_config": {
+        "ring_heap": 2147483648
+      },
+      "arguments": [
+        "--ep",
+        "4",
+        "--num-tokens",
+        "72",
+        "--experts-per-rank",
+        "12",
+        "--balanced-routing",
+        "--host-build-graph"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-moe-b64-8k-ep16-ep4-proxy",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
+      "platform": "a5",
+      "device_count": 4,
+      "target_ep": 16,
+      "batch_per_rank": 64,
+      "context_length": 8192,
+      "runtime_config": {
+        "ring_heap": 2147483648
+      },
+      "arguments": [
+        "--ep",
+        "4",
+        "--num-tokens",
+        "384",
+        "--experts-per-rank",
+        "24",
+        "--balanced-routing",
+        "--host-build-graph"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-moe-b64-8k-ep32-ep4-proxy",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
+      "platform": "a5",
+      "device_count": 4,
+      "target_ep": 32,
+      "batch_per_rank": 64,
+      "context_length": 8192,
+      "runtime_config": {
+        "ring_heap": 2147483648
+      },
+      "arguments": [
+        "--ep",
+        "4",
         "--num-tokens",
         "384",
         "--experts-per-rank",
         "12",
-        "--balanced-routing"
+        "--balanced-routing",
+        "--host-build-graph"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-moe-b64-128k-ep16-ep4-proxy",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
+      "platform": "a5",
+      "device_count": 4,
+      "target_ep": 16,
+      "batch_per_rank": 64,
+      "context_length": 131072,
+      "runtime_config": {
+        "ring_heap": 2147483648
+      },
+      "arguments": [
+        "--ep",
+        "4",
+        "--num-tokens",
+        "384",
+        "--experts-per-rank",
+        "24",
+        "--balanced-routing",
+        "--host-build-graph"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-moe-b64-128k-ep32-ep4-proxy",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
+      "platform": "a5",
+      "device_count": 4,
+      "target_ep": 32,
+      "batch_per_rank": 64,
+      "context_length": 131072,
+      "runtime_config": {
+        "ring_heap": 2147483648
+      },
+      "arguments": [
+        "--ep",
+        "4",
+        "--num-tokens",
+        "384",
+        "--experts-per-rank",
+        "12",
+        "--balanced-routing",
+        "--host-build-graph"
       ]
     },
     {
@@ -553,29 +699,6 @@
         "--case",
         "normal"
       ]
-    },
-    {
-      "case_id": "dsv4.1-flash-prefill-moe-dp8-cp1-ep8-t1024-e48",
-      "entrypoint": "models/deepseek_v4_1_flash/prefill_moe.py",
-      "platform": "a5",
-      "device_count": 8,
-      "arguments": [
-        "--ep",
-        "8",
-        "--entry",
-        "slabs",
-        "--tokens",
-        "1024",
-        "--slab-capacity",
-        "1024",
-        "--num-tokens",
-        "1024",
-        "--experts-per-rank",
-        "48"
-      ],
-      "runtime_config": {
-        "ring_heap": 2147483648
-      }
     },
     {
       "case_id": "glm5.3-flash-a3-v1-kda-verify-b32q6",

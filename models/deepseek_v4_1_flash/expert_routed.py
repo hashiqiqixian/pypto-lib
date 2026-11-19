@@ -1421,7 +1421,7 @@ def validation_counts(case="bounds", *, tail_offset=0):
     return torch.tensor(values, dtype=torch.int32).reshape(N_LOCAL_EXPERTS, 1)
 
 
-def build_tensor_specs(case="bounds", *, tail_offset=0):
+def build_tensor_specs(case="bounds", *, tail_offset=0, seed=20261028):
     """Build local compute tensors with poisoned inactive capacity and lazy packed weights."""
     from functools import cache
 
@@ -1432,7 +1432,7 @@ def build_tensor_specs(case="bounds", *, tail_offset=0):
 
     @cache
     def receive_inputs():
-        generator = torch.Generator().manual_seed(20261028)
+        generator = torch.Generator().manual_seed(seed)
         source = torch.randn(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16, generator=generator)
         payload, codes = quantize_mxfp8_upward_e8m0(source.reshape(-1, D).float())
         payload = payload.reshape(N_LOCAL_EXPERTS, RECV_MAX, D)

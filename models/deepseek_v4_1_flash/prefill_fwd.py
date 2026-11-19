@@ -22,10 +22,12 @@ from numbers import Integral
 from typing import Mapping, Sequence
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import importlib.util
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 
 
@@ -83,8 +85,11 @@ from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_ro
 from utils import paged_slots, window_metadata
 from engram import ENGRAM_K, KV_OUT, HostEngram, engram_from_rows
 from lm_head import MAX_LOGIT_ROWS, lm_head, greedy_sample
-from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, clear_moe_signals
-from prefill_moe import prefill_moe_slabs
+from prefill_moe import (
+    clear_moe_signals, prefill_moe_slabs, RECV_X_DTYPE, RECV_META_SHAPE, RECV_X_SHAPE,
+    RECV_SCALE_SHAPE, RECV_WEIGHTS_SHAPE, RECV_ROUTES_SHAPE, ARRIVED_SHAPE, EXPERT_SIGNAL_SHAPE,
+    ROUTED_OUTPUT_SHAPE,
+)
 from compressor import STATE_WIDTH
 from prefill_c1a_full import prefill_publish_decoder, prefill_c1a_full, prefill_c1a_full_cp
 from prefill_swa import prefill_swa, prefill_swa_cp
@@ -534,15 +539,15 @@ def l2_prefill_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
     logits: pl.Out[pl.Tensor[[16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[16, 8], pl.INT32]],
-    recv_meta: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D // 32], pl.UINT8],
-    recv_weights: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
-    recv_routes: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[RANKS, 128], pl.INT32],
-    data_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
-    routed_output: pld.DistributedTensor[[MOE_TOKENS * TOPK, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
+    recv_meta: pld.DistributedTensor,
+    recv_x: pld.DistributedTensor,
+    recv_scale: pld.DistributedTensor,
+    recv_weights: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    arrived: pld.DistributedTensor,
+    data_arrived: pld.DistributedTensor,
+    routed_output: pld.DistributedTensor,
+    combine_arrived: pld.DistributedTensor,
     attention_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
     attention_arrived: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     hc_window: pld.DistributedTensor[[LOCAL_CAPACITY, HC_DIM + 16], pl.FP32],
@@ -1042,15 +1047,15 @@ def l3_prefill_fwd(
     c1a_index_block_table.bind_dynamic(1, B_DYN)
     c1a_index_block_table.bind_dynamic(2, C1A_TABLE_DYN)
     query_start_loc.bind_dynamic(2, Q_START_DYN)
-    recv_meta_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
-    recv_weights_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-    recv_routes_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    arrived_buffer = pld.alloc_window_buffer([RANKS, 128], dtype=pl.INT32)
-    data_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-    routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
+    recv_x_buffer = pld.alloc_window_buffer(RECV_X_SHAPE, dtype=RECV_X_DTYPE)
+    recv_meta_buffer = pld.alloc_window_buffer(RECV_META_SHAPE, dtype=pl.INT32)
+    recv_scale_buffer = pld.alloc_window_buffer(RECV_SCALE_SHAPE, dtype=pl.UINT8)
+    recv_weights_buffer = pld.alloc_window_buffer(RECV_WEIGHTS_SHAPE, dtype=pl.FP32)
+    recv_routes_buffer = pld.alloc_window_buffer(RECV_ROUTES_SHAPE, dtype=pl.INT32)
+    arrived_buffer = pld.alloc_window_buffer(ARRIVED_SHAPE, dtype=pl.INT32)
+    data_arrived_buffer = pld.alloc_window_buffer(EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
+    routed_output_buffer = pld.alloc_window_buffer(ROUTED_OUTPUT_SHAPE, dtype=pl.BF16)
+    combine_arrived_buffer = pld.alloc_window_buffer(EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
     attention_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     attention_arrived_buffer = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     hc_window_buffer = pld.alloc_window_buffer([LOCAL_CAPACITY, HC_DIM + 16], dtype=pl.FP32)
@@ -1060,15 +1065,15 @@ def l3_prefill_fwd(
     head_logits_buffer = pld.alloc_window_buffer([16, VOCAB], dtype=pl.BF16)
     head_logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buffer, [RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buffer, [LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-        recv_scale = pld.window(recv_scale_buffer, [LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
-        recv_weights = pld.window(recv_weights_buffer, [LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-        recv_routes = pld.window(recv_routes_buffer, [LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        arrived = pld.window(arrived_buffer, [RANKS, 128], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buffer, RECV_X_SHAPE, dtype=RECV_X_DTYPE)
+        recv_meta = pld.window(recv_meta_buffer, RECV_META_SHAPE, dtype=pl.INT32)
+        recv_scale = pld.window(recv_scale_buffer, RECV_SCALE_SHAPE, dtype=pl.UINT8)
+        recv_weights = pld.window(recv_weights_buffer, RECV_WEIGHTS_SHAPE, dtype=pl.FP32)
+        recv_routes = pld.window(recv_routes_buffer, RECV_ROUTES_SHAPE, dtype=pl.INT32)
+        arrived = pld.window(arrived_buffer, ARRIVED_SHAPE, dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buffer, EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
+        routed_output = pld.window(routed_output_buffer, ROUTED_OUTPUT_SHAPE, dtype=pl.BF16)
+        combine_arrived = pld.window(combine_arrived_buffer, EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
         attention_window = pld.window(attention_window_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         attention_arrived = pld.window(attention_arrived_buffer, [CP_SIZE, 1], dtype=pl.INT32)
         hc_window = pld.window(hc_window_buffer, [LOCAL_CAPACITY, HC_DIM + 16], dtype=pl.FP32)
@@ -2070,6 +2075,16 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     }
 
 
+def _zero_packed_weight(shape):
+    """Map an independent sparse file for a read-only smoke weight shared with forked ranks."""
+    # The three packed weights total 84 GiB at the default EP2 smoke shape.
+    # Prefer the build workspace because the system temporary directory may be tmpfs.
+    directory = "." if os.access(".", os.W_OK) else None
+    with tempfile.NamedTemporaryFile(dir=directory) as backing:
+        tensor = torch.from_file(backing.name, shared=True, size=math.prod(shape), dtype=torch.uint8)
+    return tensor.view(shape)
+
+
 def build_tensor_specs(args=None):
     """Build independent per-DP batches for a checkpoint-free, 40-layer CED smoke fixture."""
     from golden import TensorSpec
@@ -2116,7 +2131,9 @@ def build_tensor_specs(args=None):
             rank_shape, dtype = weight_layouts[name]
             shape = [RANKS, *rank_shape]
             value = 1.0 if dtype == torch.float8_e8m0fnu or name == "final_norm_weight" else 0.0
-            if name == "correction_bias":
+            if name in ("routed_w1", "routed_w2", "routed_w3"):
+                value = partial(_zero_packed_weight, shape)
+            elif name == "correction_bias":
                 value = _route_bias().repeat(RANKS, N_LAYERS)
         elif name in outputs:
             shape, dtype = outputs[name]

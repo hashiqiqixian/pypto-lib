@@ -46,12 +46,13 @@ def rope(
             # lower half: x_lo * cos_lo - x_hi * sin_lo
             lo_cos = pl.col_expand_mul(x_lo, cos_lo)
             lo_sin = pl.col_expand_mul(x_hi, sin_lo)
-            y[base : base + NUM_HEADS, 0:HALF_DIM] = pl.sub(lo_cos, lo_sin)
+            y_lo = pl.sub(lo_cos, lo_sin)
 
             # upper half: x_hi * cos_hi + x_lo * sin_hi
             hi_cos = pl.col_expand_mul(x_hi, cos_hi)
             hi_sin = pl.col_expand_mul(x_lo, sin_hi)
-            y[base : base + NUM_HEADS, HALF_DIM:HEAD_DIM] = pl.add(hi_cos, hi_sin)
+            y_hi = pl.add(hi_cos, hi_sin)
+            y[base : base + NUM_HEADS, :] = pl.concat(y_lo, y_hi)
     return y
 
 

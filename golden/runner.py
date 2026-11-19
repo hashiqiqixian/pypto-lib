@@ -243,8 +243,8 @@ def _stale_cpps(work_dir: Path, *, platform: str) -> list[Path]:
             for kernel in read_kernel_config(config_path).KERNELS:
                 source = Path(kernel["source"])
                 expected = sidecars.setdefault(source.resolve(), set())
-                if kernel.get("external", False) or kernel.get("builtin", False):
-                    # These never have source-adjacent binaries; their content
+                if kernel.get("external") or kernel.get("builtin") or kernel.get("vpto_sources"):
+                    # External, builtin and VF-helper builds have no sidecars; their content
                     # and include closure are checked by the runtime cache.
                     continue
                 stem = source.stem

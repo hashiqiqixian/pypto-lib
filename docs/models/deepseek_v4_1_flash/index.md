@@ -75,6 +75,12 @@ Attention entries own chunk scheduling and dependencies around that shared
 implementation. MoE dispatches local token rows to EP expert owners and combines
 the results back into the local HC state.
 
+Decode, prefill and DSpark use MegaMoE by default. A persistent mixed-core
+kernel runs dispatch, shared and routed experts, and combine. Set
+`PYPTO_V41_MOE_BACKEND=split` before launching the model to compile the
+separate dispatch, expert and combine tasks. When replaying a precompiled
+runtime directory, use the directory built for the desired backend.
+
 ## Parallel configuration
 
 | Component | Contract |
@@ -86,6 +92,14 @@ the results back into the local HC state.
 | Decode attention | Independent requests and local KV/cache state per rank; no decode CP partitioning |
 | Decode MoE | EP dispatch/combine across ranks, while attention retains local request ownership |
 | LM-head TP | Independent `--lm-head-tp 1/2/4/8`, subject to the rank-group constraints checked by the entry |
+
+The standalone MoE performance matrix uses host-built task graphs and pairs batches of 12 and 64 requests per
+rank with 8K and 128K histories and target EP16 and EP32. Six decode positions
+per request give 72 or 384 active rows per rank. The EP4 proxy keeps 24 or 12
+routed experts per rank respectively, with balanced top-6 routing and one shared
+expert. Four physical ranks cover 96 or 48 router logits and four communication
+peers including the local rank. The history length labels the surrounding decode
+workload. The MoE entry has no KV-cache input.
 
 For prefill, at CP1, each DP group may pack multiple independent requests. At CP>1, each DP
 group supports one request. Different DP groups own independent requests and

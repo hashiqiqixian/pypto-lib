@@ -27,9 +27,9 @@ runs:
         source activate.sh
         case "$PLATFORM" in a2a3sim|a5sim) ;; *) exit 1 ;; esac
         export PTO_CPU_SIM_ARCH="${PLATFORM%sim}"
-        # CPU simulation needs a longer no-progress window than device execution.
-        # Both budgets apply to every entry on both CPU architectures.
-        export SIMPLER_SCHEDULER_TIMEOUT_MS=120000
+        # A single Engram projection can run for over two minutes on a CPU
+        # simulator before reporting task completion. Keep the outer case limit at 600s.
+        export SIMPLER_SCHEDULER_TIMEOUT_MS=300000
         result_dir="sim-results-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PLATFORM}"
         mkdir "$result_dir"
         echo "result_dir=$result_dir" >> "$GITHUB_OUTPUT"

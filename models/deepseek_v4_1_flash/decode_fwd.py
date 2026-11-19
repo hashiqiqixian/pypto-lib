@@ -34,7 +34,7 @@ if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
 
 from config import COMPRESSED_POOL_UNIT_ROWS, C2A_STORAGE_ROWS, C1A_STORAGE_ROWS
 from config import (
-    FLASH as M, LM_HEAD_TP_SIZE, B_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, DECODE_MAX_TOKENS,
+    FLASH as M, LM_HEAD_TP_SIZE, B_DYN, Q_START_DYN, T_DYN, BLOCK_SIZE, DECODE_MAX_TOKENS,
     DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, MOE_TOKENS, DSPARK_DRAFT_LAYERS,
     DSPARK_LAST_TARGET_LAYER, DSPARK_TARGET_LAYER_IDS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
@@ -50,7 +50,9 @@ from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from engram import ENGRAM_K, KV_OUT, engram_from_rows
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from decode_moe import (
-    BALANCED_ROUTING, initialize_balanced_routes, moe, SIGNAL_PAD, clear_moe_signals, DISPATCH_PACKET_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH,
+    BALANCED_ROUTING, initialize_balanced_routes, moe, clear_moe_signals, EP_SIZE,
+    N_LOCAL_EXPERTS, RECV_X_DTYPE, RECV_META_SHAPE, RECV_X_SHAPE, RECV_ROUTES_SHAPE,
+    EXPERT_SIGNAL_SHAPE, ROUTED_OUTPUT_SHAPE,
 )
 
 
@@ -162,16 +164,12 @@ def decode_encoder(
     shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    recv_meta: pld.DistributedTensor,
+    recv_x: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    data_arrived: pld.DistributedTensor,
+    routed_output: pld.DistributedTensor,
+    combine_arrived: pld.DistributedTensor,
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -447,16 +445,12 @@ def decode_decoder(
     shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    recv_meta: pld.DistributedTensor,
+    recv_x: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    data_arrived: pld.DistributedTensor,
+    routed_output: pld.DistributedTensor,
+    combine_arrived: pld.DistributedTensor,
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -732,16 +726,12 @@ def _l2_decode_fwd(
     shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    recv_meta: pld.DistributedTensor,
+    recv_x: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    data_arrived: pld.DistributedTensor,
+    routed_output: pld.DistributedTensor,
+    combine_arrived: pld.DistributedTensor,
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -993,31 +983,31 @@ def l3_decode_fwd(
     position_ids.bind_dynamic(1, T_DYN)
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
-    recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-    recv_routes_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
+    recv_x_buffer = pld.alloc_window_buffer(RECV_X_SHAPE, dtype=RECV_X_DTYPE)
+    recv_meta_buffer = pld.alloc_window_buffer(RECV_META_SHAPE, dtype=pl.INT32)
+    recv_routes_buffer = pld.alloc_window_buffer(RECV_ROUTES_SHAPE, dtype=pl.INT32)
     data_arrived_buffer = pld.alloc_window_buffer(
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
+        EXPERT_SIGNAL_SHAPE, dtype=pl.INT32
     )
-    routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
+    routed_output_buffer = pld.alloc_window_buffer(ROUTED_OUTPUT_SHAPE, dtype=pl.BF16)
     combine_arrived_buffer = pld.alloc_window_buffer(
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
+        EXPERT_SIGNAL_SHAPE, dtype=pl.INT32
     )
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
+        recv_x = pld.window(recv_x_buffer, RECV_X_SHAPE, dtype=RECV_X_DTYPE)
+        recv_meta = pld.window(recv_meta_buffer, RECV_META_SHAPE, dtype=pl.INT32)
         recv_routes = pld.window(
-            recv_routes_buffer, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32
+            recv_routes_buffer, RECV_ROUTES_SHAPE, dtype=pl.INT32
         )
         data_arrived = pld.window(
             data_arrived_buffer,
-            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
+            EXPERT_SIGNAL_SHAPE,
             dtype=pl.INT32,
         )
-        routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
+        routed_output = pld.window(routed_output_buffer, ROUTED_OUTPUT_SHAPE, dtype=pl.BF16)
         combine_arrived = pld.window(
             combine_arrived_buffer,
-            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
+            EXPERT_SIGNAL_SHAPE,
             dtype=pl.INT32,
         )
         l2_decode_fwd(

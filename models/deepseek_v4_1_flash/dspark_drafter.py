@@ -23,15 +23,17 @@ import torch
 import config as C
 from config import (
     BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, TABLE_DYN, WINDOW_CACHE_BYTES,
-    DSPARK_DRAFT_LAYERS, DSPARK_N_ROUTED_EXPERTS, DSPARK_NUM_EXPERTS_PER_TOK,
+    DSPARK_DRAFT_LAYERS, dspark_local_experts, DSPARK_NUM_EXPERTS_PER_TOK,
     DSPARK_NOISE_TOKEN_ID, DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH,
 )
 from rmsnorm import rms_norm
+from moe_workspace import model_window_shapes
+from config import USE_MEGAMOE
 from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
 )
 from input_pack import pack_x_hc
-from decode_moe import BALANCED_ROUTING, initialize_balanced_routes, DISPATCH_PACKET_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
+from decode_moe import BALANCED_ROUTING, initialize_balanced_routes, DISPATCH_PACKET_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, moe
 
 from dspark_attn import dspark_attn, dspark_context_kv
 from qkv_proj_rope import quantize_projection_input
@@ -40,13 +42,6 @@ from qkv_proj_rope import quantize_projection_input
 # Dynamic shape variables.
 T_DYN = pl.dynamic("DSPARK_CONTEXT_T_DYN")
 DSPARK_QUERY_T_DYN = pl.dynamic("DSPARK_QUERY_T_DYN")
-
-_shape_parser = argparse.ArgumentParser(add_help=False)
-_shape_parser.add_argument("--draft-experts-per-rank", type=int, default=DSPARK_N_ROUTED_EXPERTS // EP_SIZE)
-_shape_options = _shape_parser.parse_known_args()[0]
-if _shape_options.draft_experts_per_rank <= 0 or EP_SIZE * _shape_options.draft_experts_per_rank < DSPARK_NUM_EXPERTS_PER_TOK:
-    _shape_parser.error("--draft-experts-per-rank must give at least draft TopK routed experts")
-
 
 # model config
 D = FLASH.hidden_size
@@ -62,7 +57,7 @@ O_LORA = FLASH.o_lora_rank
 O_GROUP_IN = FLASH.num_attention_heads * HEAD_DIM // FLASH.o_groups
 LOCAL_O_WIDTH = LOCAL_O_GROUPS * O_LORA
 VOCAB = FLASH.vocab_size
-N_LOCAL_EXPERTS = _shape_options.draft_experts_per_rank
+N_LOCAL_EXPERTS = dspark_local_experts(EP_SIZE)
 N_EXPERTS = EP_SIZE * N_LOCAL_EXPERTS
 MOE_INTER = FLASH.moe_intermediate_size
 MX_GROUP = FLASH.weight_block_size[0]
@@ -78,6 +73,12 @@ PROJ_N_TILE = 160
 PROJ_K_TILE = 384
 QUANT_M_TILE = 16
 QUANT_K_TILE = 1280
+
+
+RECV_X_DTYPE = pl.UINT8 if USE_MEGAMOE else pl.INT8
+RECV_X_SHAPE, RECV_META_SHAPE, RECV_ROUTES_SHAPE, EXPERT_SIGNAL_SHAPE, ROUTED_OUTPUT_SHAPE = model_window_shapes(
+    N_LOCAL_EXPERTS, TOPK, DISPATCH_PACKET_WIDTH, ROUTE_WIDTH, SIGNAL_PAD,
+)
 
 
 @pl.jit.extern(
@@ -331,12 +332,12 @@ def _dspark_drafter(
     shared_w3_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     draft_x_hc: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
     draft_pre_mix: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    recv_meta: pld.DistributedTensor,
+    recv_x: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    data_arrived: pld.DistributedTensor,
     routed_output: pld.DistributedTensor,
-    combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    combine_arrived: pld.DistributedTensor,
     rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
@@ -514,19 +515,19 @@ def l3_dspark_drafter(
     block_tables.bind_dynamic(3, TABLE_DYN)
     window_cache.bind_dynamic(2, C.ORI_BLOCKS_DYN)
 
-    recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-    recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-    routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer(RECV_X_SHAPE, dtype=RECV_X_DTYPE)
+    recv_meta_buf = pld.alloc_window_buffer(RECV_META_SHAPE, dtype=pl.INT32)
+    recv_routes_buf = pld.alloc_window_buffer(RECV_ROUTES_SHAPE, dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer(EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
+    routed_output_buf = pld.alloc_window_buffer(ROUTED_OUTPUT_SHAPE, dtype=pl.BF16)
+    combine_arrived_buf = pld.alloc_window_buffer(EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-        recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, RECV_X_SHAPE, dtype=RECV_X_DTYPE)
+        recv_meta = pld.window(recv_meta_buf, RECV_META_SHAPE, dtype=pl.INT32)
+        recv_routes = pld.window(recv_routes_buf, RECV_ROUTES_SHAPE, dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
+        routed_output = pld.window(routed_output_buf, ROUTED_OUTPUT_SHAPE, dtype=pl.BF16)
+        combine_arrived = pld.window(combine_arrived_buf, EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
         l2_dspark_drafter(
             target_hidden[rank], main_proj_weight[rank], main_proj_scale[rank], main_norm_weight[rank],
             num_sampled[rank], last_sampled[rank], next_prefill_tokens[rank],

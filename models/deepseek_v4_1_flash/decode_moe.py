@@ -45,9 +45,11 @@ config.FLASH = replace(config.FLASH, n_routed_experts=_test_experts)
 config.N_LOCAL_EXPERTS = _experts_per_rank
 
 
-from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, T_DYN, ROUTE_T_DYN
+from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, T_DYN
+from config import USE_MEGAMOE
 from gate import gate_from_bf16
 from expert_shared import expert_shared
+from moe_workspace import model_window_shapes
 from expert_routed import (
     dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
@@ -82,6 +84,12 @@ SIGNAL_PAD = 128  # 512-byte padded monotonic counter lane
 
 # tiling
 COMBINE_T_TILE = 2
+
+
+RECV_X_DTYPE = pl.UINT8 if USE_MEGAMOE else pl.INT8
+RECV_X_SHAPE, RECV_META_SHAPE, RECV_ROUTES_SHAPE, EXPERT_SIGNAL_SHAPE, ROUTED_OUTPUT_SHAPE = model_window_shapes(
+    N_LOCAL_EXPERTS, TOPK, DISPATCH_PACKET_WIDTH, ROUTE_WIDTH, SIGNAL_PAD,
+)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -119,13 +127,14 @@ def clear_moe_signals(
     anchor_indices: pl.constexpr,
 ):
     """Clear a completed entry's MoE arrival signals."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear", allow_early_resolve=False):
-        anchor = pl.read(completion_anchor, anchor_indices)
-        zero = pl.cast(0, pl.INT32)
-        for peer in pl.range(EP_SIZE):
-            pl.write(data_arrived, [peer, 0, 0], zero)
-            pl.write(combine_arrived, [peer, 0, 0], zero)
-        pl.write(completion_anchor, anchor_indices, anchor)
+    if not USE_MEGAMOE:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear", allow_early_resolve=False):
+            anchor = pl.read(completion_anchor, anchor_indices)
+            zero = pl.cast(0, pl.INT32)
+            for peer in pl.range(EP_SIZE):
+                pl.write(data_arrived, [peer, 0, 0], zero)
+                pl.write(combine_arrived, [peer, 0, 0], zero)
+            pl.write(completion_anchor, anchor_indices, anchor)
     return completion_anchor
 
 
@@ -174,6 +183,90 @@ def combine_scattered(
             result_valid = pl.set_validshape(result, rows, D)
             ffn_out = pl.store(result_valid, [t, 0], ffn_out)
     return _reduce_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _split_experts(
+    dispatch_indices: pl.Tensor,
+    x_norm_mx: pl.Tensor,
+    x_norm_scale: pl.Tensor,
+    weights: pl.Tensor,
+    sublayer: pl.Tensor,
+    routed_w1: pl.Tensor,
+    routed_w1_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3: pl.Tensor,
+    routed_w3_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+    routed_w2: pl.Tensor,
+    routed_w2_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+    shared_w1: pl.Tensor,
+    shared_w1_scale: pl.Tensor,
+    shared_w3: pl.Tensor,
+    shared_w3_scale: pl.Tensor,
+    shared_w2: pl.Tensor,
+    shared_w2_scale: pl.Tensor,
+    recv_x: pld.DistributedTensor,
+    recv_meta: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    data_arrived: pld.DistributedTensor,
+    routed_output: pld.DistributedTensor,
+    combine_arrived: pld.DistributedTensor,
+    recv_scale: pld.DistributedTensor,
+    recv_weights: pld.DistributedTensor,
+    arrived: pld.DistributedTensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ep_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+    local_experts: pl.constexpr = N_LOCAL_EXPERTS,
+    topk: pl.constexpr = TOPK,
+    dispatch_worker_limit: pl.constexpr = 0,
+):
+    t = MOE_TOKENS
+    shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
+    shared_result = expert_shared(
+        x_norm_mx, x_norm_scale,
+        shared_w1, shared_w1_scale,
+        shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        shared_output,
+    )
+
+    recv_x_local = pl.create_tensor([local_experts, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    # Contiguous ND backing for the routed-expert MX_A_ZZ view.
+    recv_scale_local_backing = pl.create_tensor([1, local_experts * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
+    recv_weight_local = pl.create_tensor([local_experts, RECV_MAX], dtype=pl.FP32)
+    recv_route_local = pl.create_tensor([local_experts, RECV_MAX], dtype=pl.INT32)
+    recv_count_local = pl.create_tensor([local_experts, 1], dtype=pl.INT32)
+    recv_meta_local = pl.create_tensor([EP_SIZE, local_experts], dtype=pl.INT32)
+    input_ready = dispatch(
+        dispatch_indices, x_norm_mx, x_norm_scale, weights,
+        recv_x_local, recv_scale_local_backing,
+        recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
+        recv_meta, recv_x, recv_routes,
+        data_arrived, num_tokens, ep_rank, moe_epoch,
+        local_experts=local_experts, topk=topk, dispatch_worker_limit=dispatch_worker_limit,
+    )
+
+    scatter_done = expert_routed_scatter(
+        recv_x_local, recv_scale_local_backing,
+        recv_weight_local, recv_count_local,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        recv_route_local, recv_meta_local,
+        routed_output, input_ready, local_experts=local_experts, topk=topk,
+    )
+    output_ready = combine_scattered(
+        shared_result, sublayer,
+        routed_output, combine_arrived,
+        scatter_done,
+        num_tokens, ep_rank, moe_epoch, topk=topk,
+    )
+    return output_ready
+
+
+if USE_MEGAMOE:
+    from mega_moe import run_megamoe as run_experts
+else:
+    run_experts = _split_experts
 
 
 @pl.jit.inline(auto_scope=False)
@@ -239,45 +332,14 @@ def moe(
         else:
             dispatch_indices = indices
 
-        shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
-        shared_result = expert_shared(
-            x_norm_mx, x_norm_scale,
-            shared_w1, shared_w1_scale,
-            shared_w3, shared_w3_scale,
-            shared_w2, shared_w2_scale,
-            shared_output,
-        )
-
-        recv_x_local = pl.create_tensor([local_experts, RECV_MAX, D], dtype=pl.FP8E4M3FN)
-        # Contiguous ND backing for the routed-expert MX_A_ZZ view.
-        recv_scale_local_backing = pl.create_tensor([1, local_experts * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
-        recv_weight_local = pl.create_tensor([local_experts, RECV_MAX], dtype=pl.FP32)
-        recv_route_local = pl.create_tensor([local_experts, RECV_MAX], dtype=pl.INT32)
-        recv_count_local = pl.create_tensor([local_experts, 1], dtype=pl.INT32)
-        recv_meta_local = pl.create_tensor([EP_SIZE, local_experts], dtype=pl.INT32)
-        input_ready = dispatch(
-            dispatch_indices, x_norm_mx, x_norm_scale, weights,
-            recv_x_local, recv_scale_local_backing,
-            recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
-            recv_meta, recv_x, recv_routes,
-            data_arrived, num_tokens, ep_rank, moe_epoch,
-            local_experts=local_experts, topk=topk, dispatch_worker_limit=dispatch_worker_limit,
-        )
-
-        scatter_done = expert_routed_scatter(
-            recv_x_local, recv_scale_local_backing,
-            recv_weight_local, recv_count_local,
-            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-            routed_w2, routed_w2_scale,
-            recv_route_local, recv_meta_local,
-            routed_output, input_ready, local_experts=local_experts, topk=topk,
-        )
         sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
-        output_ready = combine_scattered(
-            shared_result, sublayer,
-            routed_output, combine_arrived,
-            scatter_done,
-            num_tokens, ep_rank, moe_epoch, topk=topk,
+        output_ready = run_experts(
+            dispatch_indices, x_norm_mx, x_norm_scale, weights, sublayer,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+            recv_x, recv_meta, recv_routes, data_arrived, routed_output, combine_arrived,
+            recv_x, recv_x, recv_x, num_tokens, ep_rank, moe_epoch,
+            local_experts=local_experts, topk=topk, dispatch_worker_limit=dispatch_worker_limit,
         )
         hc_post_deps = pl.array.create(2, pl.TASK_ID)
         hc_post_deps[0] = output_ready
@@ -311,12 +373,12 @@ def l2_moe(
     next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    recv_meta: pld.DistributedTensor,
+    recv_x: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    data_arrived: pld.DistributedTensor,
+    routed_output: pld.DistributedTensor,
+    combine_arrived: pld.DistributedTensor,
     num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -374,21 +436,21 @@ def l3_moe(
     force_topk: pl.Tensor[[EP_SIZE, MOE_TOKENS, TOPK], pl.INT32],
 ):
     """EP host driver for the HC-wrapped Flash MoE block."""
-    recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-    recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-    routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer(RECV_X_SHAPE, dtype=RECV_X_DTYPE)
+    recv_meta_buf = pld.alloc_window_buffer(RECV_META_SHAPE, dtype=pl.INT32)
+    recv_routes_buf = pld.alloc_window_buffer(RECV_ROUTES_SHAPE, dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer(EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
+    routed_output_buf = pld.alloc_window_buffer(ROUTED_OUTPUT_SHAPE, dtype=pl.BF16)
+    combine_arrived_buf = pld.alloc_window_buffer(EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
 
     rank_count = pld.world_size()
     for r in pl.range(rank_count):
-        recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-        recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, RECV_X_SHAPE, dtype=RECV_X_DTYPE)
+        recv_meta = pld.window(recv_meta_buf, RECV_META_SHAPE, dtype=pl.INT32)
+        recv_routes = pld.window(recv_routes_buf, RECV_ROUTES_SHAPE, dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
+        routed_output = pld.window(routed_output_buf, ROUTED_OUTPUT_SHAPE, dtype=pl.BF16)
+        combine_arrived = pld.window(combine_arrived_buf, EXPERT_SIGNAL_SHAPE, dtype=pl.INT32)
         # Per-rank MX_B_NN scale views.
         routed_w1_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = routed_w1_scale[r]
         routed_w2_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = routed_w2_scale[r]
@@ -778,6 +840,8 @@ if __name__ == "__main__":
     from config import SUPPORTED_EP_SIZES
 
     import argparse
+    from contextlib import nullcontext
+    from pypto.pypto_core import passes
 
     from golden import ratio_allclose, run
 
@@ -791,6 +855,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-tokens", type=int, default=MOE_TOKENS)
     parser.add_argument('--num-tokens-per-rank', type=str, default=None, help='comma-separated local counts (overrides --num-tokens)')
     parser.add_argument("--moe-epoch", type=int, default=1)
+    parser.add_argument("--host-build-graph", action="store_true", help="build the chip task graph on the host")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -832,31 +897,33 @@ if __name__ == "__main__":
         "x_next": _local_hc_compare(counts),
     }
 
-    result = run(
-        fn=entry,
-        specs=specs,
-        golden_fn=golden_fn,
-        golden_data=args.golden_data,
-        save_data=args.save_data,
-        compile_only=args.compile_only,
-        runtime_dir=args.runtime_dir,
-        config=dict(
-            dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids,
-                num_sub_workers=0,
+    context = passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH) if args.host_build_graph else nullcontext()
+    with context:
+        result = run(
+            fn=entry,
+            specs=specs,
+            golden_fn=golden_fn,
+            golden_data=args.golden_data,
+            save_data=args.save_data,
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+            config=dict(
+                dump_passes=args.dump_passes,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids,
+                    num_sub_workers=0,
+                ),
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                enable_dep_gen=args.enable_dep_gen,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                # Resident MoE heap capacity.
+                ring_heap=2 * 1024**3,
+                log_level=args.log_level,
             ),
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            enable_dep_gen=args.enable_dep_gen,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            # Resident MoE heap capacity.
-            ring_heap=2 * 1024**3,
-            log_level=args.log_level,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn=compare_fn,
-    )
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn=compare_fn,
+        )
     if not result.passed:
         raise SystemExit(result.error or 1)
