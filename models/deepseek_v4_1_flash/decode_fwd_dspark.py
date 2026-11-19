@@ -738,6 +738,69 @@ def l3_decode_fwd_dspark(
         )
 
 
+def decode_fwd_dspark(
+    runner,
+    state,
+    workspace,
+    target_model,
+    draft_model,
+    markov_model,
+    cache_tables,
+    rope_tables,
+    *,
+    moe_epoch: int,
+    logits_epoch: int,
+):
+    """Compatibility orchestrator for Serving's resident stage runner.
+
+    Current Lib owns the complete recurrent round in ``l3_decode_fwd_dspark``.
+    The wrapper only assembles the caller-owned state, workspace, weights and
+    tables into that L3 ABI, so Serving does not reconstruct model operators.
+    """
+    arguments = {}
+    arguments.update(target_model)
+    arguments.update(workspace)
+
+    # The fused L3 uses explicit target/draft/Markov namespaces.  The serving
+    # payloads intentionally keep the smaller stage-local names, so bind the
+    # namespace boundary here instead of duplicating weights in Serving.
+    if "target_embedding_weight" not in arguments:
+        arguments["target_embedding_weight"] = target_model["embedding_weight"]
+    arguments["target_window_table"] = cache_tables["target_window"]
+    arguments["target_c2a_table"] = cache_tables["target_c2a"]
+    arguments["target_c1a_table"] = cache_tables["target_c1a"]
+    arguments["request_ids"] = workspace.get("request_ids", workspace.get("token_to_req_indices"))
+    arguments["query_starts"] = workspace.get("query_starts", workspace.get("query_start_loc"))
+
+    for name, value in draft_model.items():
+        if name == "window_cache":
+            arguments["draft_window_cache"] = value
+        elif name in {"embedding_weight", "main_proj_weight", "main_proj_scale", "main_norm_weight"}:
+            arguments["draft_" + name] = value
+        else:
+            arguments["draft_" + name] = value
+    for name, value in markov_model.items():
+        arguments["markov_" + name] = value
+
+    arguments.update(
+        slot_ids=state.slot_ids,
+        generations=state.generations,
+        state_tokens=state.tokens,
+        state_meta=state.meta,
+        draft_table=cache_tables["draft"],
+        draft_cos=rope_tables["draft_cos"],
+        draft_sin=rope_tables["draft_sin"],
+        moe_epoch=moe_epoch,
+        logits_epoch=logits_epoch,
+    )
+    arguments = {
+        name: arguments[name]
+        for name in l3_decode_fwd_dspark.param_names
+        if name in arguments
+    }
+    runner(l3_decode_fwd_dspark, arguments)
+
+
 def build_tensor_specs():
     """Build a bounded single-dispatch DSpark decode fixture."""
     import inspect

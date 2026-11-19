@@ -334,3 +334,27 @@ def dspark_init(
         sampled_rows=workspace["sampled_rows"], sampled_ids=workspace["prefill_sampled_ids"],
         draft_ids=workspace["draft_ids"], state_tokens=state.tokens, state_meta=state.meta,
     ))
+
+
+def prefill_bootstrap_dspark(
+    runner: StageRunner,
+    state: DSparkState,
+    workspace: Mapping[str, Any],
+    draft_model: Mapping[str, Any],
+    markov_model: Mapping[str, Any],
+    cache_tables: Mapping[str, Any],
+    rope_tables: Mapping[str, Any],
+    *,
+    moe_epoch: int,
+    logits_epoch: int,
+) -> None:
+    """Compatibility entry for Serving revisions using the old name.
+
+    The implementation remains owned by the current initialization sequence.
+    Keeping this small alias lets a Serving checkout update its Lib pin before
+    migrating the surrounding runtime code.
+    """
+    dspark_init(
+        runner, state, workspace, draft_model, markov_model, cache_tables,
+        rope_tables, moe_epoch=moe_epoch, logits_epoch=logits_epoch,
+    )
