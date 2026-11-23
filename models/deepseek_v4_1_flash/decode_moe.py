@@ -212,14 +212,15 @@ def moe(
         else:
             dispatch_indices = indices
 
-        shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
-        shared_result = expert_shared(
-            x_norm_mx, x_norm_scale,
-            shared_w1, shared_w1_scale,
-            shared_w3, shared_w3_scale,
-            shared_w2, shared_w2_scale,
-            shared_output,
-        )
+        shared_result = pl.create_tensor([t, D], dtype=pl.BF16)
+        if num_tokens > 0:
+            shared_result = expert_shared(
+                x_norm_mx, x_norm_scale,
+                shared_w1, shared_w1_scale,
+                shared_w3, shared_w3_scale,
+                shared_w2, shared_w2_scale,
+                shared_result,
+            )
 
         recv_x_local = pl.create_tensor([local_experts, RECV_MAX, D], dtype=pl.FP8E4M3FN)
         # Contiguous ND backing for the routed-expert MX_A_ZZ view.
