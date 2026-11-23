@@ -261,7 +261,7 @@ def push_dispatch_payload(
                 pld.tile.remote_store(tail_payload, target=recv_x, peer=peer, offsets=[tail_base, 0])
             route_valid = pl.set_validshape(route_lane, pl.max(sent_rows, 1), 8)
             pld.tile.remote_store(route_valid, target=recv_routes, peer=peer, offsets=[base, 0])
-    return ready
+    return ready, scale_ready
 
 
 @pl.jit.inline(auto_scope=False)
@@ -408,8 +408,9 @@ def dispatch(
             num_tokens, my_rank, stage_anchor, local_experts=local_experts, topk=topk,
             dispatch_worker_limit=dispatch_worker_limit,
         )
+        wait_start = _push_tid
     else:
-        _push_tid = push_dispatch_payload(
+        _push_tid, wait_start = push_dispatch_payload(
             indices, x_norm_mx, x_norm_scale, weights,
             recv_x, recv_routes,
             num_tokens, my_rank, stage_anchor, local_experts=local_experts, topk=topk,
@@ -423,7 +424,9 @@ def dispatch(
 
     peer_waits = pl.array.create(EP_WORLD_SIZE, pl.TASK_ID)
     for src in pl.range(EP_WORLD_SIZE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_push_tid], no_dep_args=[data_arrived]) as peer_wait:
+        # The local stores guard publication and gather. Peer signals can be
+        # observed as soon as this layer's input scales have been unpacked.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[wait_start], no_dep_args=[data_arrived]) as peer_wait:
             if src != my_rank:
                 pld.system.defer_wait(signal=data_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
         peer_waits[src] = peer_wait
