@@ -119,13 +119,10 @@ def combine_scattered(
         if peer != my_rank:
             pld.system.notify(target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
-    peer_waits = pl.array.create(N_RANKS, pl.TASK_ID)
-    for src in pl.range(N_RANKS):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[scatter_done], no_dep_args=[combine_arrived]) as peer_wait:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[scatter_done], no_dep_args=[combine_arrived]) as _cwait_tid:
+        for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.defer_wait(signal=combine_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
-        peer_waits[src] = peer_wait
-    _cwait_tid = pl.system.task_dummy(deps=[peer_waits])
 
     # Wait for local and peer routed-output stores.
     routed_rows = pl.tensor.view(routed_output, [T, topk * D])

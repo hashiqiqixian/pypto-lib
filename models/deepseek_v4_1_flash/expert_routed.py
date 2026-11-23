@@ -421,13 +421,10 @@ def dispatch(
         if dst != my_rank:
             pld.system.notify(target=data_arrived, peer=dst, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
-    peer_waits = pl.array.create(EP_WORLD_SIZE, pl.TASK_ID)
-    for src in pl.range(EP_WORLD_SIZE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_push_tid], no_dep_args=[data_arrived]) as peer_wait:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_push_tid], no_dep_args=[data_arrived]) as _wait_tid:
+        for src in pl.range(EP_WORLD_SIZE):
             if src != my_rank:
                 pld.system.defer_wait(signal=data_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
-        peer_waits[src] = peer_wait
-    _wait_tid = pl.system.task_dummy(deps=[peer_waits])
 
     return gather_routed_inputs(
         recv_x, recv_routes, recv_meta_local, recv_meta, recv_count_out,
