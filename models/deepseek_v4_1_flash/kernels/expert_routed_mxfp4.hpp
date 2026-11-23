@@ -80,7 +80,11 @@ struct Chunk {
 AICORE inline int64_t acquireCount(__gm__ int32_t* counts, int64_t expert)
 {
     auto* count = counts + expert;
-    dcci(count, SINGLE_CACHE_LINE);
+    // Both projections scan immutable counts in order after dispatch completes.
+    constexpr uint64_t cacheLineBytes = 64;
+    if (expert == 0 || reinterpret_cast<uint64_t>(count) % cacheLineBytes == 0) {
+        dcci(count, SINGLE_CACHE_LINE);
+    }
     return *count;
 }
 
